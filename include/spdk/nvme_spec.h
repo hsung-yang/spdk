@@ -1431,6 +1431,59 @@ struct spdk_nvme_cmd {
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_cmd) == 64, "Incorrect size");
 
+/**
+ * SLM Memory Copy - Source Range Entry (Descriptor Format 4h)
+ */
+struct spdk_nvme_slm_copy_desc_format_4 {
+	uint32_t	snsid;
+	uint32_t	reserved0;
+	uint64_t	saddr;
+	uint32_t	nbyte;
+	uint16_t	reserved1;
+	uint16_t	sopt;
+	uint32_t	reserved3;
+	uint32_t	reserved4;
+} __attribute__((packed));
+
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_slm_copy_desc_format_4) == 32,
+		   "Incorrect size");
+
+#define SPDK_NVME_SLM_COPY_DESC_SOPT_FCO	(1u << 15)
+
+/**
+ * SLM Memory Copy - Source Range Entry (Descriptor Format 2h/3h)
+ * Source data is described using LBAs.
+ */
+struct spdk_nvme_slm_copy_desc_format_2_3 {
+	uint32_t	snsid;
+	uint32_t	reserved0;
+	uint64_t	slba;
+	uint16_t	nlb;
+	uint16_t	reserved1;
+	uint32_t	reserved2;
+	uint32_t	eilbrt;
+	uint16_t	elbat;
+	uint16_t	elbatm;
+} __attribute__((packed));
+
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_slm_copy_desc_format_2_3) == 32,
+		   "Incorrect size");
+
+/**
+ * SLM Memory Copy descriptor formats (CDW12 bits 11:8).
+ */
+enum spdk_nvme_slm_copy_desc_fmt {
+	SPDK_NVME_SLM_COPY_DESC_FMT_NONE			= 0x0,
+	SPDK_NVME_SLM_COPY_DESC_FMT_2H			= 0x2,
+	SPDK_NVME_SLM_COPY_DESC_FMT_3H			= 0x3,
+	SPDK_NVME_SLM_COPY_DESC_FMT_4H			= 0x4,
+};
+
+#define SPDK_NVME_SLM_COPY_DESC_FMT_SHIFT	8
+#define SPDK_NVME_SLM_COPY_DESC_FMT_MASK	0xFu
+#define SPDK_NVME_SLM_COPY_DESC_FMT_FROM_CDW12(cdw12)	\
+	(((cdw12) >> SPDK_NVME_SLM_COPY_DESC_FMT_SHIFT) & SPDK_NVME_SLM_COPY_DESC_FMT_MASK)
+
 struct spdk_nvme_status {
 	uint16_t p	:  1;	/* phase tag */
 	uint16_t sc	:  8;	/* status code */
@@ -1641,6 +1694,15 @@ enum spdk_nvme_command_specific_status_code {
 	SPDK_NVME_SC_INVALID_ZONE_STATE_TRANSITION	= 0xbf,
 };
 
+/* SLM command set specific status codes (SCT = Command Specific) */
+enum spdk_nvme_slm_command_specific_status_code {
+	SPDK_NVME_SLM_SC_CMD_SIZE_LIMIT_EXCEEDED		= 0x83,
+	SPDK_NVME_SLM_SC_INCOMPATIBLE_NAMESPACE_OR_FORMAT	= 0x85,
+	SPDK_NVME_SLM_SC_FAST_COPY_NOT_POSSIBLE		= 0x86,
+	SPDK_NVME_SLM_SC_OVERLAPPING_IO_RANGE		= 0x87,
+	SPDK_NVME_SLM_SC_NAMESPACE_NOT_REACHABLE		= 0x88,
+};
+
 /**
  * Media error status codes
  */
@@ -1754,6 +1816,17 @@ enum spdk_nvme_zns_opcode {
 	SPDK_NVME_OPC_ZONE_MGMT_SEND			= 0x79,
 	SPDK_NVME_OPC_ZONE_MGMT_RECV			= 0x7a,
 	SPDK_NVME_OPC_ZONE_APPEND			= 0x7d,
+};
+
+/**
+ * Subsystem Local Memory command set opcodes
+ */
+enum spdk_nvme_slm_opcode {
+	/* SLM command set opcodes (CSI 0x03) */
+	SPDK_NVME_SLM_OPC_MEMORY_COPY			= 0x01,
+	SPDK_NVME_SLM_OPC_MEMORY_READ			= 0x02,
+	SPDK_NVME_SLM_OPC_MEMORY_FILL			= 0x04,
+	SPDK_NVME_SLM_OPC_MEMORY_WRITE			= 0x05,
 };
 
 /**
@@ -4069,6 +4142,7 @@ enum spdk_nvme_csi {
 	SPDK_NVME_CSI_NVM	= 0x0,
 	SPDK_NVME_CSI_KV	= 0x1,
 	SPDK_NVME_CSI_ZNS	= 0x2,
+	SPDK_NVME_CSI_SLM	= 0x3,
 };
 
 enum spdk_nvme_secure_erase_setting {
