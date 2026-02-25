@@ -24,6 +24,8 @@
 #include "spdk/log.h"
 #include "spdk_internal/usdt.h"
 
+#include "cpcs/cpcs_cmd.h"
+#include "cpcs/nvmf_cpcs.h"
 #include "slm/slm_cmd.h"
 
 #define NVMF_CC_RESET_SHN_TIMEOUT_IN_MS	10000
@@ -239,6 +241,8 @@ nvmf_ctrlr_send_connect_rsp(void *ctx)
 	struct spdk_nvmf_qpair *qpair = req->qpair;
 	struct spdk_nvmf_ctrlr *ctrlr = qpair->ctrlr;
 	struct spdk_nvmf_fabric_connect_rsp *rsp = &req->rsp->connect_rsp;
+	int rc;
+
 	/* The qpair might have been disconnected in the meantime */
 	assert(qpair->state == SPDK_NVMF_QPAIR_CONNECTING ||
 	       qpair->state == SPDK_NVMF_QPAIR_DEACTIVATING);
@@ -402,7 +406,9 @@ nvmf_ctrlr_cdata_init(struct spdk_nvmf_transport *transport, struct spdk_nvmf_su
 
 static bool
 nvmf_subsystem_has_zns_iocs(struct spdk_nvmf_subsystem *subsystem)
-{	uint32_t i;
+{
+	struct spdk_nvmf_ns *ns;
+	uint32_t i;
 
 	for (i = 0; i < subsystem->max_nsid; i++) {
 		ns = subsystem->ns[i];
@@ -1921,7 +1927,7 @@ nvmf_ctrlr_get_features_reservation_notification_mask(struct spdk_nvmf_request *
 	}
 
 	ns = nvmf_ctrlr_get_ns(ctrlr, cmd->nsid);
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		SPDK_ERRLOG("get Features - Invalid Namespace ID\n");
 		rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1951,7 +1957,7 @@ nvmf_ctrlr_set_features_reservation_notification_mask(struct spdk_nvmf_request *
 	}
 
 	ns = nvmf_ctrlr_get_ns(ctrlr, cmd->nsid);
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		SPDK_ERRLOG("Set Features - Invalid Namespace ID\n");
 		rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1973,7 +1979,7 @@ nvmf_ctrlr_get_features_reservation_persistence(struct spdk_nvmf_request *req)
 
 	ns = nvmf_ctrlr_get_ns(ctrlr, cmd->nsid);
 	/* NSID with SPDK_NVME_GLOBAL_NS_TAG (=0xffffffff) also included */
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		SPDK_ERRLOG("Get Features - Invalid Namespace ID\n");
 		response->status.sct = SPDK_NVME_SCT_GENERIC;
 		response->status.sc = SPDK_NVME_SC_INVALID_FIELD;
@@ -2420,7 +2426,7 @@ nvmf_ctrlr_get_ana_state_from_nsid(struct spdk_nvmf_ctrlr *ctrlr, uint32_t nsid)
 	 * the optimized state.
 	 */
 	ns = nvmf_ctrlr_get_ns(ctrlr, nsid);
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		return SPDK_NVME_ANA_OPTIMIZED_STATE;
 	}
 
@@ -2949,7 +2955,7 @@ nvmf_ctrlr_identify_ns(struct spdk_nvmf_ctrlr *ctrlr,
 	enum spdk_nvme_ana_state ana_state;
 
 	ns = _nvmf_ctrlr_get_ns_safe(ctrlr, nsid, rsp);
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		return;
 	}
 
@@ -3251,12 +3257,33 @@ spdk_nvmf_ns_identify_iocs_specific(struct spdk_nvmf_ctrlr *ctrlr,
 				    size_t nsdata_size)
 {
 	uint8_t csi = cmd->cdw11_bits.identify.csi;
-	struct spdk_nvmf_ns *ns = _nvmf_ctrlr_get_ns_safe(ctrlr, cmd->nsid, rsp);
+	struct spdk_nvmf_ns *ns;
+	int rc;
 
 	memset(nsdata, 0, nsdata_size);
 
+	if (csi == SPDK_NVME_CSI_CPCS) {
+		ns = nvmf_ctrlr_get_ns(ctrlr, cmd->nsid);
+		if (ns == NULL || ns->csi != SPDK_NVME_CSI_CPCS || ns->cpcs_ns == NULL) {
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
 
-	if (ns == NULL || ns->bdev == NULL) {
+		rc = spdk_nvmf_cpcs_ns_identify(ns->cpcs_ns, nsdata);
+		if (rc != 0) {
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+
+		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+		rsp->status.sc = SPDK_NVME_SC_SUCCESS;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	ns = _nvmf_ctrlr_get_ns_safe(ctrlr, cmd->nsid, rsp);
+	if (ns == NULL) {
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 		rsp->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -3436,7 +3463,7 @@ nvmf_ctrlr_identify_ns_id_descriptor_list(
 	}
 
 	ns = nvmf_ctrlr_get_ns(ctrlr, nsid);
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		SPDK_ERRLOG("Identify Namespace Identification Descriptor list with inactive NSID %u\n", nsid);
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 		rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
@@ -4090,6 +4117,40 @@ is_cmd_ctrlr_specific(struct spdk_nvme_cmd *cmd)
 	}
 }
 
+static int
+nvmf_ctrlr_process_cpcs_admin_cmd(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
+	struct spdk_nvmf_ns *ns;
+	int rc;
+
+	if (req == NULL || req->qpair == NULL || req->qpair->ctrlr == NULL) {
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+		response->status.dnr = 1;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	ns = nvmf_ctrlr_get_ns(req->qpair->ctrlr, req->cmd->nvme_cmd.nsid);
+	if (ns == NULL || ns->csi != SPDK_NVME_CSI_CPCS) {
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+		response->status.dnr = 1;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	rc = cpcs_handle_admin_cmd(req);
+	if (rc == -ENOTSUP) {
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_INVALID_OPCODE;
+		response->status.dnr = 1;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	/* CPCS handler owns completion and may complete synchronously or asynchronously. */
+	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+}
+
 int
 nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 {
@@ -4179,6 +4240,11 @@ nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 		return nvmf_ctrlr_async_event_request(req);
 	case SPDK_NVME_OPC_KEEP_ALIVE:
 		return nvmf_ctrlr_keep_alive(req);
+	case SPDK_NVME_OPC_CPCS_LOAD_PROGRAM:
+	case SPDK_NVME_OPC_CPCS_MRS_MANAGEMENT:
+	case SPDK_NVME_OPC_CPCS_PROGRAM_ACTIVATION:
+		return nvmf_ctrlr_process_cpcs_admin_cmd(req);
+
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
 	case SPDK_NVME_OPC_CREATE_IO_CQ:
 	case SPDK_NVME_OPC_DELETE_IO_SQ:
@@ -5021,7 +5087,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 
 	ns = nvmf_ctrlr_get_ns(ctrlr, nsid);
 	if (spdk_unlikely(ns == NULL ||
-			  ns->bdev == NULL)) {
+			  (ns->bdev == NULL && ns->csi != SPDK_NVME_CSI_CPCS))) {
 		SPDK_DEBUGLOG(nvmf, "Unsuccessful query for nsid %u\n", cmd->nsid);
 		response->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
 		response->status.dnr = 1;
@@ -5051,6 +5117,15 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 		SPDK_DEBUGLOG(nvmf, "Reservation Conflict for nsid %u, opcode %u\n",
 			      cmd->nsid, cmd->opc);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	if (ns->csi == SPDK_NVME_CSI_CPCS) {
+		rc = cpcs_handle_io_cmd(req);
+		if (rc != -ENOTSUP) {
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+		}
+
+		goto invalid_opcode;
 	}
 
 	bdev = ns->bdev;
@@ -5364,6 +5439,18 @@ nvmf_check_subsystem_active(struct spdk_nvmf_request *req)
 		}
 
 		ns_info = &sgroup->ns_info[nsid - 1];
+		ns = nvmf_ctrlr_get_ns(qpair->ctrlr, nsid);
+		if (ns != NULL && ns->csi == SPDK_NVME_CSI_CPCS) {
+			if (spdk_unlikely(ns_info->state != SPDK_NVMF_SUBSYSTEM_ACTIVE)) {
+				/* The namespace is not currently active. Queue this request. */
+				TAILQ_INSERT_TAIL(&sgroup->queued, req, link);
+				return false;
+			}
+
+			ns_info->io_outstanding++;
+			return true;
+		}
+
 		if (spdk_unlikely(ns_info->channel == NULL)) {
 			/* This can can happen if host sends I/O to a namespace that is
 			 * in the process of being added, but before the full addition
@@ -5589,7 +5676,7 @@ nvmf_passthru_admin_cmd_for_ctrlr(struct spdk_nvmf_request *req, struct spdk_nvm
 	struct spdk_nvmf_ns *ns;
 
 	ns = spdk_nvmf_subsystem_get_first_ns(ctrlr->subsys);
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		/* Is there a better sc to use here? */
 		response->status.sct = SPDK_NVME_SCT_GENERIC;
 		response->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;

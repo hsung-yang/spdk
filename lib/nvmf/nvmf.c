@@ -1492,9 +1492,12 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 
 	/* Detect bdevs that were added or removed */
 	for (i = 0; i < sgroup->num_ns; i++) {
+		bool has_io_channel;
+
 		ns = subsystem->ns[i];
 		ns_info = &sgroup->ns_info[i];
 		ch = ns_info->channel;
+		has_io_channel = (ns != NULL && ns->bdev != NULL);
 
 		if (ns == NULL && ch == NULL) {
 			/* Both NULL. Leave empty */
@@ -1503,7 +1506,12 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 			ns_changed = true;
 			spdk_put_io_channel(ch);
 			ns_info->channel = NULL;
-		} else if (ns != NULL && ch == NULL) {
+		} else if (!has_io_channel && ch != NULL) {
+			/* Namespace exists but no I/O channel is needed. */
+			ns_changed = true;
+			spdk_put_io_channel(ch);
+			ns_info->channel = NULL;
+		} else if (has_io_channel && ch == NULL) {
 			/* A namespace appeared but there is no channel yet */
 			ns_changed = true;
 			ch = spdk_bdev_get_io_channel(ns->desc);
@@ -1512,7 +1520,8 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 				return -ENOMEM;
 			}
 			ns_info->channel = ch;
-		} else if (spdk_uuid_compare(&ns_info->uuid, spdk_bdev_get_uuid(ns->bdev)) != 0) {
+		} else if (has_io_channel &&
+			   spdk_uuid_compare(&ns_info->uuid, spdk_bdev_get_uuid(ns->bdev)) != 0) {
 			/* A namespace was here before, but was replaced by a new one. */
 			ns_changed = true;
 			spdk_put_io_channel(ns_info->channel);
@@ -1524,7 +1533,7 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 				return -ENOMEM;
 			}
 			ns_info->channel = ch;
-		} else if (ns_info->num_blocks != spdk_bdev_get_num_blocks(ns->bdev)) {
+		} else if (has_io_channel && ns_info->num_blocks != spdk_bdev_get_num_blocks(ns->bdev)) {
 			/* Namespace is still there but size has changed */
 			SPDK_DEBUGLOG(nvmf, "Namespace resized: subsystem_id %u,"
 				      " nsid %u, pg %p, old %" PRIu64 ", new %" PRIu64 "\n",
@@ -1549,8 +1558,13 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 		if (ns == NULL) {
 			memset(ns_info, 0, sizeof(*ns_info));
 		} else {
-			ns_info->uuid = *spdk_bdev_get_uuid(ns->bdev);
-			ns_info->num_blocks = spdk_bdev_get_num_blocks(ns->bdev);
+			if (has_io_channel) {
+				ns_info->uuid = *spdk_bdev_get_uuid(ns->bdev);
+				ns_info->num_blocks = spdk_bdev_get_num_blocks(ns->bdev);
+			} else {
+				memset(&ns_info->uuid, 0, sizeof(ns_info->uuid));
+				ns_info->num_blocks = 0;
+			}
 			ns_info->anagrpid = ns->anagrpid;
 			nvmf_subsystem_poll_group_update_ns_reservation(ns, ns_info);
 		}

@@ -384,6 +384,16 @@ ifeq ($(CONFIG_HAVE_KEYUTILS),y)
 SYS_LIBS += -lkeyutils
 endif
 
+UBPF_PKG := $(shell $(PKGCONF) --exists ubpf && echo y)
+UBPF_AVAILABLE := $(if $(UBPF_PKG),y,$(shell test -f /usr/local/include/ubpf.h -a \( -f /usr/local/lib/libubpf.a -o -f /usr/local/lib/libubpf.so -o -f /usr/local/lib64/libubpf.a -o -f /usr/local/lib64/libubpf.so \) && echo y))
+ifeq ($(UBPF_PKG),y)
+COMMON_CFLAGS += -DHAVE_UBPF $(shell $(PKGCONF) --cflags ubpf)
+SYS_LIBS += $(shell $(PKGCONF) --libs ubpf)
+else ifeq ($(UBPF_AVAILABLE),y)
+COMMON_CFLAGS += -DHAVE_UBPF
+SYS_LIBS += -L/usr/local/lib -L/usr/local/lib64 -lubpf
+endif
+
 MAKEFLAGS += --no-print-directory
 
 C_SRCS += $(C_SRCS-y)

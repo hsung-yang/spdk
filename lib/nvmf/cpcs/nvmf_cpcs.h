@@ -21,6 +21,7 @@ extern "C" {
 
 /* Forward declarations */
 struct spdk_nvmf_subsystem;
+struct spdk_nvmf_ns;
 struct cpcs_program;
 struct cpcs_memory_range_set;
 
@@ -36,6 +37,7 @@ struct spdk_nvmf_cpcs_ns {
 	/* Basic identification */
 	uint32_t nsid;
 	char *name;
+	struct spdk_nvmf_ns *ns;
 
 	/* Program Management */
 	struct cpcs_program *programs[CPCS_MAX_PROGRAMS_PER_NS];
@@ -60,8 +62,6 @@ struct spdk_nvmf_cpcs_ns {
 	/* Associated NVMf subsystem */
 	struct spdk_nvmf_subsystem *subsystem;
 	pthread_mutex_t lock;
-
-	TAILQ_ENTRY(spdk_nvmf_cpcs_ns) link;
 };
 
 /**
@@ -119,6 +119,13 @@ struct spdk_nvmf_cpcs_ns *spdk_nvmf_cpcs_ns_get_by_nsid(
  */
 int spdk_nvmf_cpcs_ns_identify(struct spdk_nvmf_cpcs_ns *ns,
 				struct spdk_nvme_cpcs_ns_data *ns_data);
+
+/**
+ * Release CPCS-specific resources for a namespace context.
+ *
+ * This does not remove the base namespace from the subsystem.
+ */
+void spdk_nvmf_cpcs_ns_fini(struct spdk_nvmf_cpcs_ns *ns);
 
 #ifdef __cplusplus
 }

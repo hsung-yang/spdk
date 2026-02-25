@@ -3,6 +3,7 @@
  */
 
 #include "nvmf_cpcs.h"
+#include "nvmf_internal.h"
 #include "memory_range_set.h"
 #include "program.h"
 #include "builtin_programs.h"
@@ -17,9 +18,17 @@ SPDK_LOG_REGISTER_COMPONENT(nvmf_cpcs);
 static bool g_runtime_initialized = false;
 static pthread_mutex_t g_runtime_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Global namespace list for lookups */
-static TAILQ_HEAD(, spdk_nvmf_cpcs_ns) g_cpcs_ns_list = TAILQ_HEAD_INITIALIZER(g_cpcs_ns_list);
-static pthread_mutex_t g_cpcs_ns_list_lock = PTHREAD_MUTEX_INITIALIZER;
+static void
+cpcs_ns_changed(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)
+{
+	struct spdk_nvmf_ctrlr *ctrlr;
+
+	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
+		if (nvmf_ctrlr_ns_is_visible(ctrlr, nsid)) {
+			nvmf_ctrlr_ns_changed(ctrlr, nsid);
+		}
+	}
+}
 
 void
 spdk_nvmf_cpcs_ns_opts_init(struct spdk_nvmf_cpcs_ns_opts *opts)
@@ -40,9 +49,42 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 			 struct spdk_nvmf_cpcs_ns **ns_out)
 {
 	struct spdk_nvmf_cpcs_ns *ns;
+	struct spdk_nvmf_ns *base_ns;
+	struct spdk_nvmf_ctrlr *ctrlr;
+	uint32_t nsid;
+	uint32_t anagrpid;
 	int rc;
 
 	if (!subsystem || !opts || !ns_out) {
+		return -EINVAL;
+	}
+
+	if (opts->nsid == SPDK_NVME_GLOBAL_NS_TAG) {
+		return -EINVAL;
+	}
+
+	nsid = opts->nsid;
+	if (nsid == 0) {
+		for (nsid = 1; nsid <= subsystem->max_nsid; nsid++) {
+			if (subsystem->ns[nsid - 1] == NULL) {
+				break;
+			}
+		}
+		if (nsid > subsystem->max_nsid) {
+			return -ENOSPC;
+		}
+	}
+
+	if (nsid > subsystem->max_nsid) {
+		return -EINVAL;
+	}
+
+	if (subsystem->ns[nsid - 1] != NULL) {
+		return -EEXIST;
+	}
+
+	anagrpid = nsid;
+	if (anagrpid == 0 || anagrpid > subsystem->max_nsid) {
 		return -EINVAL;
 	}
 
@@ -90,15 +132,44 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 
 	rc = pthread_mutex_init(&ns->lock, NULL);
 	if (rc != 0) {
-		SPDK_ERRLOG("Failed to initialize namespace mutex\n");		free(ns);
+		SPDK_ERRLOG("Failed to initialize namespace mutex\n");
+		free(ns);
 		return -rc;
 	}
 
-	/* Add to global namespace list */
-	pthread_mutex_lock(&g_cpcs_ns_list_lock);
-	TAILQ_INSERT_TAIL(&g_cpcs_ns_list, ns, link);
-	pthread_mutex_unlock(&g_cpcs_ns_list_lock);
+	base_ns = calloc(1, sizeof(*base_ns));
+	if (base_ns == NULL) {
+		pthread_mutex_destroy(&ns->lock);
+		free(ns);
+		return -ENOMEM;
+	}
 
+	TAILQ_INIT(&base_ns->hosts);
+	TAILQ_INIT(&base_ns->registrants);
+	STAILQ_INIT(&base_ns->reservations);
+
+	spdk_nvmf_ns_opts_get_defaults(&base_ns->opts, sizeof(base_ns->opts));
+	base_ns->opts.nsid = nsid;
+	base_ns->opts.anagrpid = anagrpid;
+	base_ns->nsid = nsid;
+	base_ns->anagrpid = anagrpid;
+	base_ns->subsystem = subsystem;
+	base_ns->always_visible = true;
+	base_ns->csi = SPDK_NVME_CSI_CPCS;
+	base_ns->cpcs_ns = ns;
+
+	subsystem->ns[nsid - 1] = base_ns;
+	subsystem->ana_group[anagrpid - 1]++;
+
+	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
+		nvmf_ctrlr_ns_set_visible(ctrlr, nsid, true);
+	}
+
+	cpcs_ns_changed(subsystem, nsid);
+
+	ns->nsid = nsid;
+	ns->subsystem = subsystem;
+	ns->ns = base_ns;
 	*ns_out = ns;
 
 	SPDK_NOTICELOG("Created compute namespace NSID=%u\n", ns->nsid);
@@ -106,16 +177,11 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 }
 
 void
-spdk_nvmf_cpcs_ns_destroy(struct spdk_nvmf_cpcs_ns *ns)
+spdk_nvmf_cpcs_ns_fini(struct spdk_nvmf_cpcs_ns *ns)
 {
 	if (!ns) {
 		return;
 	}
-
-	/* Remove from global namespace list */
-	pthread_mutex_lock(&g_cpcs_ns_list_lock);
-	TAILQ_REMOVE(&g_cpcs_ns_list, ns, link);
-	pthread_mutex_unlock(&g_cpcs_ns_list_lock);
 
 	/* Delete all Memory Range Sets */
 	cpcs_mrs_delete_all(ns);
@@ -125,26 +191,65 @@ spdk_nvmf_cpcs_ns_destroy(struct spdk_nvmf_cpcs_ns *ns)
 
 	pthread_mutex_destroy(&ns->lock);	free(ns->name);
 	free(ns);
+}
 
-	SPDK_NOTICELOG("Destroyed compute namespace\n");
+void
+spdk_nvmf_cpcs_ns_destroy(struct spdk_nvmf_cpcs_ns *ns)
+{
+	struct spdk_nvmf_subsystem *subsystem;
+	struct spdk_nvmf_ns *base_ns;
+	struct spdk_nvmf_ctrlr *ctrlr;
+	uint32_t nsid;
+
+	if (!ns || ns->subsystem == NULL) {
+		return;
+	}
+
+	subsystem = ns->subsystem;
+	base_ns = ns->ns;
+	nsid = ns->nsid;
+
+	if (spdk_nvmf_subsystem_remove_ns(subsystem, nsid) == 0) {
+		SPDK_NOTICELOG("Destroyed compute namespace NSID=%u\n", nsid);
+		return;
+	}
+
+	/* Fallback for callers that delete CPCS namespaces without pausing subsystem first. */
+	if (base_ns != NULL && nsid > 0 && nsid <= subsystem->max_nsid &&
+	    subsystem->ns[nsid - 1] == base_ns) {
+		subsystem->ns[nsid - 1] = NULL;
+		if (base_ns->anagrpid > 0 && base_ns->anagrpid <= subsystem->max_nsid &&
+		    subsystem->ana_group[base_ns->anagrpid - 1] > 0) {
+			subsystem->ana_group[base_ns->anagrpid - 1]--;
+		}
+
+		cpcs_ns_changed(subsystem, nsid);
+		TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
+			nvmf_ctrlr_ns_set_visible(ctrlr, nsid, false);
+		}
+	}
+
+	spdk_nvmf_cpcs_ns_fini(ns);
+	free(base_ns);
+
+	SPDK_NOTICELOG("Destroyed compute namespace NSID=%u (forced)\n", nsid);
 }
 
 struct spdk_nvmf_cpcs_ns *
 spdk_nvmf_cpcs_ns_get_by_nsid(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)
 {
-	struct spdk_nvmf_cpcs_ns *ns;
+	struct spdk_nvmf_ns *ns;
 
-	pthread_mutex_lock(&g_cpcs_ns_list_lock);
-
-	TAILQ_FOREACH(ns, &g_cpcs_ns_list, link) {
-		if (ns->nsid == nsid && ns->subsystem == subsystem) {
-			pthread_mutex_unlock(&g_cpcs_ns_list_lock);
-			return ns;
-		}
+	if (subsystem == NULL || nsid == 0 || nsid > subsystem->max_nsid) {
+		return NULL;
 	}
 
-	pthread_mutex_unlock(&g_cpcs_ns_list_lock);
-	return NULL;
+	ns = subsystem->ns[nsid - 1];
+	if (ns == NULL || ns->csi != SPDK_NVME_CSI_CPCS || ns->cpcs_ns == NULL) {
+		return NULL;
+	}
+
+	return ns->cpcs_ns;
 }
 
 int

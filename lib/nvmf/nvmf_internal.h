@@ -23,6 +23,8 @@
 #include "spdk/tree.h"
 #include "spdk/bit_array.h"
 
+struct spdk_nvmf_cpcs_ns;
+
 /* The spec reserves cntlid values in the range FFF0h to FFFFh. */
 #define NVMF_MIN_CNTLID 1
 #define NVMF_MAX_CNTLID 0xFFEF
@@ -196,6 +198,8 @@ struct spdk_nvmf_ns {
 	bool zcopy;
 	/* Command Set Identifier */
 	enum spdk_nvme_csi csi;
+	/* CPCS namespace context when csi == SPDK_NVME_CSI_CPCS. */
+	struct spdk_nvmf_cpcs_ns *cpcs_ns;
 	/* Make namespace visible to controllers of these hosts */
 	TAILQ_HEAD(, spdk_nvmf_host) hosts;
 	/* Namespace is always visible to all controllers */
