@@ -6,7 +6,11 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y = tcp.c ctrlr.c subsystem.c ctrlr_discovery.c ctrlr_bdev.c nvmf.c auth.c
+DIRS-y = tcp.c ctrlr.c subsystem.c ctrlr_discovery.c ctrlr_bdev.c nvmf.c auth.c cpcs.c
+
+UBPF_PKG := $(shell $(PKGCONF) --exists ubpf && echo y)
+UBPF_AVAILABLE := $(if $(UBPF_PKG),y,$(shell test -f /usr/local/include/ubpf.h -a \( -f /usr/local/lib/libubpf.a -o -f /usr/local/lib/libubpf.so -o -f /usr/local/lib64/libubpf.a -o -f /usr/local/lib64/libubpf.so \) && echo y))
+DIRS-$(UBPF_AVAILABLE) += cpcs_ebpf.c
 
 DIRS-$(CONFIG_RDMA) += rdma.c transport.c
 

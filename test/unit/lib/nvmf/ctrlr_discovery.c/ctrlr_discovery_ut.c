@@ -88,6 +88,7 @@ DEFINE_STUB(nvmf_auth_is_supported, bool, (void), false);
 DEFINE_STUB(spdk_bdev_get_nvme_ctratt, union spdk_bdev_nvme_ctratt,
 	    (struct spdk_bdev *bdev), {});
 DEFINE_STUB(nvmf_tgt_update_mdns_prr, int, (struct spdk_nvmf_tgt *tgt), 0);
+DEFINE_STUB_V(spdk_nvmf_cpcs_ns_fini, (struct spdk_nvmf_cpcs_ns *ns));
 
 const char *
 spdk_bdev_get_name(const struct spdk_bdev *bdev)
