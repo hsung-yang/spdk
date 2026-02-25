@@ -17,17 +17,6 @@
 
 SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
-struct spdk_bdev {
-	int ut_mock;
-	uint64_t blockcnt;
-	uint32_t blocklen;
-	bool zoned;
-	uint32_t zone_size;
-	uint32_t max_open_zones;
-	uint32_t max_active_zones;
-	enum spdk_dif_type dif_type;
-};
-
 #define MAX_OPEN_ZONES 12
 #define MAX_ACTIVE_ZONES 34
 #define ZONE_SIZE 56
@@ -65,6 +54,34 @@ DEFINE_STUB(spdk_nvmf_subsystem_host_allowed,
 	    (struct spdk_nvmf_subsystem *subsystem, const char *hostnqn),
 	    true);
 
+DEFINE_STUB(spdk_nvmf_cpcs_ns_get_by_nsid,
+	    struct spdk_nvmf_cpcs_ns *,
+	    (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid),
+	    NULL);
+
+DEFINE_STUB(spdk_nvmf_cpcs_ns_identify,
+	    int,
+	    (struct spdk_nvmf_cpcs_ns *ns, struct spdk_nvme_cpcs_ns_data *ns_data),
+	    -ENOTSUP);
+
+DEFINE_STUB(cpcs_handle_admin_cmd,
+	    int,
+	    (struct spdk_nvmf_request *req),
+	    -ENOTSUP);
+
+DEFINE_STUB(cpcs_handle_io_cmd,
+	    int,
+	    (struct spdk_nvmf_request *req),
+	    -ENOTSUP);
+
+DEFINE_STUB(nvmf_slm_parse_copy_lba_cmd,
+	    int,
+	    (struct spdk_nvmf_request *req, struct spdk_nvmf_ns *dest_ns,
+	     enum spdk_nvme_slm_copy_desc_fmt *desc_fmt_out, uint64_t *sdaddr,
+	     uint64_t *total_nbytes_out,
+	     struct nvmf_slm_copy_lba_range **ranges_out, uint32_t *range_count_out),
+	    -EINVAL);
+
 DEFINE_STUB(nvmf_subsystem_add_ctrlr,
 	    int,
 	    (struct spdk_nvmf_subsystem *subsystem, struct spdk_nvmf_ctrlr *ctrlr),
@@ -76,6 +93,20 @@ DEFINE_STUB(nvmf_subsystem_get_ctrlr,
 	    NULL);
 DEFINE_STUB(nvmf_subsystem_zone_append_supported, bool,
 	    (struct spdk_nvmf_subsystem *subsystem), false);
+
+DEFINE_STUB(spdk_bdev_get_block_size, uint32_t, (const struct spdk_bdev *bdev), 512);
+DEFINE_STUB(spdk_bdev_get_num_blocks, uint64_t, (const struct spdk_bdev *bdev), 0);
+DEFINE_STUB(spdk_bdev_readv_blocks, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+	     struct iovec *iov, int iovcnt, uint64_t offset_blocks,
+	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg),
+	    0);
+DEFINE_STUB(bdev_slm_get_buffer_ptr_by_bdev, int,
+	    (struct spdk_bdev *bdev, uint64_t offset, uint64_t length, void **ptr), 0);
+DEFINE_STUB(bdev_slm_read_by_bdev, int,
+	    (struct spdk_bdev *bdev, uint64_t offset, uint64_t length, void *buf), 0);
+DEFINE_STUB(bdev_slm_write_by_bdev, int,
+	    (struct spdk_bdev *bdev, uint64_t offset, uint64_t length, const void *buf), 0);
 DEFINE_STUB(nvmf_ctrlr_dsm_supported,
 	    bool,
 	    (struct spdk_nvmf_ctrlr *ctrlr),
@@ -209,6 +240,16 @@ DEFINE_STUB(spdk_bdev_reset, int, (struct spdk_bdev_desc *desc, struct spdk_io_c
 DEFINE_STUB(spdk_bdev_nvme_nssr, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 				       spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *bdev_io));
+DEFINE_STUB(spdk_bdev_nvme_iov_passthru_md, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+	     const struct spdk_nvme_cmd *cmd, struct iovec *iov, int iovcnt,
+	     size_t nbytes, void *md_buf, size_t md_len,
+	     spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_queue_io_wait, int,
+	    (struct spdk_bdev *bdev, struct spdk_io_channel *ch,
+	     struct spdk_bdev_io_wait_entry *entry), 0);
+DEFINE_STUB_V(spdk_bdev_io_get_nvme_status,
+	      (const struct spdk_bdev_io *bdev_io, uint32_t *cdw0, int *sct, int *sc));
 
 DEFINE_STUB(spdk_bdev_get_max_active_zones, uint32_t, (const struct spdk_bdev *bdev),
 	    MAX_ACTIVE_ZONES);
