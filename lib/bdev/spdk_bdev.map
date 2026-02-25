@@ -134,6 +134,10 @@
 	spdk_bdev_get_nvme_nsid;
 	spdk_bdev_get_io_type_name;
 	spdk_bdev_get_io_type;
+	bdev_slm_create;
+	bdev_slm_delete;
+	bdev_slm_get_buffer_ptr;
+	bdev_slm_get_buffer_ptr_by_nsid;
 
 	# Public functions in bdev_module.h
 	spdk_bdev_register;

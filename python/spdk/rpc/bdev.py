@@ -280,6 +280,34 @@ def bdev_malloc_delete(client, name):
 
 
 @deprecated_method
+def bdev_slm_create(client, name, nsid, size_mb, granularity=4):
+    """Construct an SLM block device.
+    Args:
+        name: name of SLM bdev
+        nsid: namespace ID
+        size_mb: size in MiB
+        granularity: granularity in MiB (optional)
+    """
+    params = dict()
+    params['name'] = name
+    params['nsid'] = nsid
+    params['size_mb'] = size_mb
+    params['granularity'] = granularity
+    return client.call('bdev_slm_create', params)
+
+
+@deprecated_method
+def bdev_slm_delete(client, name):
+    """Delete SLM block device.
+    Args:
+        name: name of SLM bdev to delete
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_slm_delete', params)
+
+
+@deprecated_method
 def bdev_null_create(client, num_blocks, block_size, name, physical_block_size=None, uuid=None, md_size=None,
                      dif_type=None, dif_is_head_of_md=None, dif_pi_format=None,
                      preferred_write_alignment=None, preferred_write_granularity=None, optimal_write_size=None,

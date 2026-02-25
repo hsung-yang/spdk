@@ -228,6 +228,27 @@ def add_parser(subparsers):
     p.add_argument('name', help='malloc bdev name')
     p.set_defaults(func=bdev_malloc_delete)
 
+    def bdev_slm_create(args):
+        print_json(args.client.bdev_slm_create(
+                                         name=args.name,
+                                         nsid=args.nsid,
+                                         size_mb=args.size_mb,
+                                         granularity=args.granularity))
+
+    p = subparsers.add_parser('bdev_slm_create', help='Create an SLM bdev')
+    p.add_argument('--name', help='Name of the SLM bdev', required=True)
+    p.add_argument('--nsid', help='Namespace ID for SLM', required=True, type=int)
+    p.add_argument('--size-mb', dest='size_mb', help='SLM size in MiB', required=True, type=int)
+    p.add_argument('--granularity', help='SLM granularity (MiB)', type=int, default=4)
+    p.set_defaults(func=bdev_slm_create)
+
+    def bdev_slm_delete(args):
+        args.client.bdev_slm_delete(name=args.name)
+
+    p = subparsers.add_parser('bdev_slm_delete', help='Delete an SLM bdev')
+    p.add_argument('--name', help='SLM bdev name', required=True)
+    p.set_defaults(func=bdev_slm_delete)
+
     def bdev_null_create(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
         if args.dif_type and not args.md_size:
