@@ -6,9 +6,132 @@
 #include "program.h"
 #include "runtime.h"
 #include "spdk/nvme_cpcs_spec.h"
+#include "spdk/bdev_vslm.h"
 #include "spdk/log.h"
 #include "spdk/nvmf_cmd.h"
 #include "spdk/nvmf_transport.h"
+
+static int
+cpcs_execute_acquire_vslm_range(struct cpcs_exec_context *ctx,
+				uint32_t mnsid, uint64_t starting_byte, uint64_t length)
+{
+	int rc;
+
+	rc = bdev_vslm_lease_acquire(ctx->vslm_lease_id, mnsid, starting_byte, length);
+	if (rc == -ENOENT) {
+		/* Not a vSLM namespace. */
+		return 0;
+	}
+	if (rc == -EAGAIN) {
+		return -SPDK_NVME_CPCS_SC_MEMORY_RANGE_SET_IN_USE;
+	}
+	if (rc != 0) {
+		return -SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+	}
+
+	ctx->vslm_lease_acquired = true;
+	return 0;
+}
+
+static int
+cpcs_execute_acquire_vslm_leases(struct cpcs_exec_context *ctx)
+{
+	uint32_t i;
+	int rc;
+
+	if (ctx == NULL) {
+		return -EINVAL;
+	}
+
+	ctx->vslm_lease_id = (uint64_t)(uintptr_t)ctx;
+	ctx->vslm_lease_acquired = false;
+
+	if (ctx->mrs != NULL) {
+		for (i = 0; i < ctx->mrs->range_count; i++) {
+			rc = cpcs_execute_acquire_vslm_range(ctx,
+							     ctx->mrs->ranges[i].mnsid,
+							     ctx->mrs->ranges[i].starting_byte,
+							     ctx->mrs->ranges[i].length);
+			if (rc != 0) {
+				bdev_vslm_lease_release(ctx->vslm_lease_id);
+				ctx->vslm_lease_acquired = false;
+				return rc;
+			}
+		}
+	} else if (ctx->inline_ranges != NULL) {
+		for (i = 0; i < ctx->inline_range_count; i++) {
+			rc = cpcs_execute_acquire_vslm_range(ctx,
+							     ctx->inline_ranges[i].mnsid,
+							     ctx->inline_ranges[i].starting_byte,
+							     ctx->inline_ranges[i].length);
+			if (rc != 0) {
+				bdev_vslm_lease_release(ctx->vslm_lease_id);
+				ctx->vslm_lease_acquired = false;
+				return rc;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static void
+cpcs_execute_release_vslm_leases(struct cpcs_exec_context *ctx)
+{
+	if (ctx == NULL || !ctx->vslm_lease_acquired) {
+		return;
+	}
+
+	bdev_vslm_lease_release(ctx->vslm_lease_id);
+	ctx->vslm_lease_acquired = false;
+}
+
+static int
+cpcs_execute_resolve_ranges(struct cpcs_exec_context *ctx)
+{
+	const struct cpcs_memory_range *ranges;
+	struct cpcs_exec_resolved_range *resolved_ranges;
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc;
+	struct spdk_io_channel *ch;
+	uint32_t range_count;
+	uint32_t i;
+	int rc;
+
+	if (ctx->mrs != NULL) {
+		range_count = ctx->mrs->range_count;
+		ranges = ctx->mrs->ranges;
+	} else if (ctx->inline_ranges != NULL && ctx->inline_range_count != 0) {
+		range_count = ctx->inline_range_count;
+		ranges = ctx->inline_ranges;
+	} else {
+		ctx->resolved_ranges = NULL;
+		ctx->resolved_range_count = 0;
+		return 0;
+	}
+
+	resolved_ranges = calloc(range_count, sizeof(*resolved_ranges));
+	if (resolved_ranges == NULL) {
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < range_count; i++) {
+		rc = spdk_nvmf_request_get_bdev(ranges[i].mnsid, ctx->req, &bdev, &desc, &ch);
+		if (rc != 0 || bdev == NULL) {
+			free(resolved_ranges);
+			return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+		}
+
+		resolved_ranges[i].bdev = bdev;
+		resolved_ranges[i].mnsid = ranges[i].mnsid;
+		resolved_ranges[i].starting_byte = ranges[i].starting_byte;
+		resolved_ranges[i].length = ranges[i].length;
+	}
+
+	ctx->resolved_ranges = resolved_ranges;
+	ctx->resolved_range_count = range_count;
+	return 0;
+}
 
 int
 cpcs_execute_program_cmd(struct spdk_nvmf_request *req)
@@ -31,6 +154,11 @@ cpcs_execute_program_cmd(struct spdk_nvmf_request *req)
 
 	/* Setup memory access */
 	rc = cpcs_execute_setup_memory(ctx);
+	if (rc != 0) {
+		goto error;
+	}
+
+	rc = cpcs_execute_acquire_vslm_leases(ctx);
 	if (rc != 0) {
 		goto error;
 	}
@@ -220,7 +348,7 @@ cpcs_execute_setup_memory(struct cpcs_exec_context *ctx)
 		SPDK_DEBUGLOG(nvmf_cpcs, "Parsed %u inline memory ranges\n", ctx->inline_range_count);
 	}
 
-	return 0;
+	return cpcs_execute_resolve_ranges(ctx);
 }
 
 int
@@ -285,6 +413,8 @@ cpcs_execute_complete(struct cpcs_exec_context *ctx, int status)
 		cpl->status.dnr = 1;
 	}
 
+	cpcs_execute_release_vslm_leases(ctx);
+
 	/* Release MRS if acquired */
 	if (ctx->mrs) {
 		cpcs_mrs_release(ctx->mrs);
@@ -294,6 +424,10 @@ cpcs_execute_complete(struct cpcs_exec_context *ctx, int status)
 	/* Free inline ranges if allocated */
 	if (ctx->inline_ranges) {
 		free(ctx->inline_ranges);
+	}
+
+	if (ctx->resolved_ranges) {
+		free(ctx->resolved_ranges);
 	}
 
 	if (ctx->data_buffer && ctx->data_buffer_owned) {

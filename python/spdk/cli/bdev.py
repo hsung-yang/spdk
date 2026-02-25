@@ -249,6 +249,137 @@ def add_parser(subparsers):
     p.add_argument('--name', help='SLM bdev name', required=True)
     p.set_defaults(func=bdev_slm_delete)
 
+    def bdev_vslm_create(args):
+        print_json(args.client.bdev_vslm_create(
+                                         name=args.name,
+                                         base_bdev_name=args.base_bdev_name,
+                                         sram_size_mb=args.sram_size_mb,
+                                         nsid=args.nsid,
+                                         semantics_mode=args.semantics_mode,
+                                         writeback_policy=args.writeback_policy,
+                                         admission_enabled=args.admission_enabled,
+                                         admission_faults_per_sec_threshold=args.admission_faults_per_sec_threshold,
+                                         fdp_mode_enabled=args.fdp_mode_enabled,
+                                         fdp_dspec=args.fdp_dspec))
+
+    p = subparsers.add_parser('bdev_vslm_create', help='Create a vSLM bdev')
+    p.add_argument('--name', help='Name of the vSLM bdev', required=True)
+    p.add_argument('--base-bdev-name', dest='base_bdev_name',
+                   help='Base backing bdev name', required=True)
+    p.add_argument('--sram-size-mb', dest='sram_size_mb',
+                   help='SRAM cache size in MiB', required=True, type=int)
+    p.add_argument('--nsid', help='Namespace ID for vSLM', type=int)
+    p.add_argument('--semantics-mode', dest='semantics_mode',
+                   choices=['lease', 'double_buffer'],
+                   help='vSLM semantics mode')
+    p.add_argument('--writeback-policy', dest='writeback_policy',
+                   choices=['on_evict', 'at_boundary', 'hybrid'],
+                   help='vSLM writeback policy')
+    admission_group = p.add_mutually_exclusive_group()
+    admission_group.add_argument('--admission-enabled', dest='admission_enabled',
+                                 help='Enable admission control', action='store_true')
+    admission_group.add_argument('--admission-disabled', dest='admission_enabled',
+                                 help='Disable admission control', action='store_false')
+    p.add_argument('--admission-faults-per-sec-threshold',
+                   dest='admission_faults_per_sec_threshold',
+                   help='Admission threshold in faults/sec', type=int)
+    p.add_argument('--fdp-mode-enabled', dest='fdp_mode_enabled',
+                   help='Enable FDP placement tagging at create time', action='store_true')
+    p.add_argument('--fdp-dspec', dest='fdp_dspec',
+                   help='FDP directive specific selector value', type=int)
+    p.set_defaults(fdp_mode_enabled=None)
+    p.set_defaults(admission_enabled=None)
+    p.set_defaults(func=bdev_vslm_create)
+
+    def bdev_vslm_delete(args):
+        args.client.bdev_vslm_delete(name=args.name)
+
+    p = subparsers.add_parser('bdev_vslm_delete', help='Delete a vSLM bdev')
+    p.add_argument('--name', help='vSLM bdev name', required=True)
+    p.set_defaults(func=bdev_vslm_delete)
+
+    def bdev_vslm_lease_acquire(args):
+        print_json(args.client.bdev_vslm_lease_acquire(
+                                         lease_id=args.lease_id,
+                                         nsid=args.nsid,
+                                         offset=args.offset,
+                                         length=args.length))
+
+    p = subparsers.add_parser('bdev_vslm_lease_acquire', help='Acquire a vSLM lease')
+    p.add_argument('--lease-id', dest='lease_id', type=int, required=True, help='Lease ID')
+    p.add_argument('--nsid', type=int, required=True, help='vSLM NSID')
+    p.add_argument('--offset', type=int, required=True, help='Byte offset')
+    p.add_argument('--length', type=int, required=True, help='Byte length')
+    p.set_defaults(func=bdev_vslm_lease_acquire)
+
+    def bdev_vslm_lease_release(args):
+        print_json(args.client.bdev_vslm_lease_release(lease_id=args.lease_id))
+
+    p = subparsers.add_parser('bdev_vslm_lease_release', help='Release a vSLM lease')
+    p.add_argument('--lease-id', dest='lease_id', type=int, required=True, help='Lease ID')
+    p.set_defaults(func=bdev_vslm_lease_release)
+
+    def bdev_vslm_set_fdp_mode(args):
+        print_json(args.client.bdev_vslm_set_fdp_mode(
+                                         name=args.name,
+                                         enabled=args.enabled,
+                                         dspec=args.dspec))
+
+    p = subparsers.add_parser('bdev_vslm_set_fdp_mode', help='Set vSLM FDP placement mode')
+    p.add_argument('--name', help='vSLM bdev name', required=True)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument('--enable', dest='enabled', help='Enable FDP mode', action='store_true')
+    group.add_argument('--disable', dest='enabled', help='Disable FDP mode', action='store_false')
+    p.add_argument('--dspec', help='FDP directive specific selector value', type=int)
+    p.set_defaults(func=bdev_vslm_set_fdp_mode)
+
+    def bdev_vslm_set_policy(args):
+        print_json(args.client.bdev_vslm_set_policy(
+                                         name=args.name,
+                                         semantics_mode=args.semantics_mode,
+                                         writeback_policy=args.writeback_policy,
+                                         admission_enabled=args.admission_enabled,
+                                         admission_faults_per_sec_threshold=args.admission_faults_per_sec_threshold))
+
+    p = subparsers.add_parser('bdev_vslm_set_policy', help='Set vSLM runtime policy')
+    p.add_argument('--name', help='vSLM bdev name', required=True)
+    p.add_argument('--semantics-mode', dest='semantics_mode',
+                   choices=['lease', 'double_buffer'], required=True,
+                   help='vSLM semantics mode')
+    p.add_argument('--writeback-policy', dest='writeback_policy',
+                   choices=['on_evict', 'at_boundary', 'hybrid'], required=True,
+                   help='vSLM writeback policy')
+    admission_group = p.add_mutually_exclusive_group(required=True)
+    admission_group.add_argument('--admission-enabled', dest='admission_enabled',
+                                 help='Enable admission control', action='store_true')
+    admission_group.add_argument('--admission-disabled', dest='admission_enabled',
+                                 help='Disable admission control', action='store_false')
+    p.add_argument('--admission-faults-per-sec-threshold',
+                   dest='admission_faults_per_sec_threshold',
+                   help='Admission threshold in faults/sec', type=int)
+    p.set_defaults(func=bdev_vslm_set_policy)
+
+    def bdev_vslm_get_policy(args):
+        print_dict(args.client.bdev_vslm_get_policy(name=args.name))
+
+    p = subparsers.add_parser('bdev_vslm_get_policy', help='Get vSLM runtime policy')
+    p.add_argument('--name', help='vSLM bdev name', required=True)
+    p.set_defaults(func=bdev_vslm_get_policy)
+
+    def bdev_vslm_get_stats(args):
+        print_dict(args.client.bdev_vslm_get_stats(name=args.name))
+
+    p = subparsers.add_parser('bdev_vslm_get_stats', help='Get vSLM statistics')
+    p.add_argument('--name', help='vSLM bdev name', required=True)
+    p.set_defaults(func=bdev_vslm_get_stats)
+
+    def bdev_vslm_reset_stats(args):
+        print_json(args.client.bdev_vslm_reset_stats(name=args.name))
+
+    p = subparsers.add_parser('bdev_vslm_reset_stats', help='Reset vSLM statistics')
+    p.add_argument('--name', help='vSLM bdev name', required=True)
+    p.set_defaults(func=bdev_vslm_reset_stats)
+
     def bdev_null_create(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
         if args.dif_type and not args.md_size:

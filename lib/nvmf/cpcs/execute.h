@@ -19,6 +19,15 @@
 extern "C" {
 #endif
 
+struct spdk_bdev;
+
+struct cpcs_exec_resolved_range {
+	struct spdk_bdev	*bdev;
+	uint32_t		mnsid;
+	uint64_t		starting_byte;
+	uint32_t		length;
+};
+
 /**
  * Execute Program context
  */
@@ -34,6 +43,8 @@ struct cpcs_exec_context {
 	/* Inline Memory Ranges (when RSID=0, NUMR>0) */
 	struct cpcs_memory_range       *inline_ranges;
 	uint32_t                        inline_range_count;
+	struct cpcs_exec_resolved_range *resolved_ranges;
+	uint32_t                        resolved_range_count;
 
 	/* Parameters from command */
 	uint64_t                        cparam1;    /* CDW10-11 */
@@ -49,6 +60,10 @@ struct cpcs_exec_context {
 
 	/* Request tracking */
 	struct spdk_nvmf_request       *req;
+
+	/* vSLM lease tracking */
+	uint64_t                        vslm_lease_id;
+	bool                            vslm_lease_acquired;
 };
 
 /**

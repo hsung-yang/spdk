@@ -74,7 +74,7 @@ DEPDIRS-nbd := log util thread $(JSON_LIBS) bdev
 ifeq ($(CONFIG_UBLK),y)
 DEPDIRS-ublk := log util thread $(JSON_LIBS) bdev
 endif
-DEPDIRS-nvmf := accel log sock util nvme thread $(JSON_LIBS) trace bdev keyring
+DEPDIRS-nvmf := accel log sock util nvme thread $(JSON_LIBS) trace bdev bdev_vslm keyring
 ifeq ($(CONFIG_RDMA),y)
 DEPDIRS-nvmf += rdma_provider rdma_utils
 endif
@@ -155,8 +155,10 @@ ifeq ($(CONFIG_RAID5F),y)
 DEPDIRS-bdev_raid += accel
 endif
 DEPDIRS-bdev_rbd := $(BDEV_DEPS_THREAD)
+DEPDIRS-bdev_slm := $(BDEV_DEPS_THREAD) bdev_vslm
 DEPDIRS-bdev_uring := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_virtio := $(BDEV_DEPS_THREAD) virtio
+DEPDIRS-bdev_vslm := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_zone_block := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_xnvme := $(BDEV_DEPS_THREAD)
 

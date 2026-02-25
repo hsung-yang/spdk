@@ -7,12 +7,27 @@
 #include "reachability.h"
 
 #include "spdk/log.h"
+#include "spdk/bdev.h"
 #include "spdk/nvme_spec.h"
 #include "spdk/bdev_slm.h"
 
 static int cpcs_mrs_validate_locked(struct spdk_nvmf_cpcs_ns *ns,
 				    const struct spdk_nvme_cpcs_memory_range_descriptor *ranges,
 				    uint8_t num_ranges);
+
+static struct spdk_bdev *
+cpcs_mrs_get_bdev_by_nsid(uint32_t mnsid)
+{
+	struct spdk_bdev *bdev;
+
+	for (bdev = spdk_bdev_first(); bdev != NULL; bdev = spdk_bdev_next(bdev)) {
+		if (spdk_bdev_get_nvme_nsid(bdev) == mnsid) {
+			return bdev;
+		}
+	}
+
+	return NULL;
+}
 
 int
 cpcs_mrs_create(struct spdk_nvmf_cpcs_ns *ns,
@@ -284,6 +299,7 @@ cpcs_mrs_get_buffer(struct cpcs_memory_range_set *mrs,
 		    void **ptr_out)
 {
 	struct cpcs_memory_range *mr;
+	struct spdk_bdev *bdev;
 	uint64_t range_idx;
 	int rc;
 
@@ -309,16 +325,19 @@ cpcs_mrs_get_buffer(struct cpcs_memory_range_set *mrs,
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	/* Get actual SLM memory buffer from memory namespace
-	 * The SLM bdev provides direct memory access for efficient data transfer
-	 */
-	rc = bdev_slm_get_buffer_ptr_by_nsid(mr->mnsid,
+	bdev = cpcs_mrs_get_bdev_by_nsid(mr->mnsid);
+	if (bdev == NULL) {
+		SPDK_ERRLOG("Memory namespace not found for MNSID=%u\n", mr->mnsid);
+		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+	}
+
+	rc = bdev_slm_get_buffer_ptr_by_bdev(bdev,
 					     mr->starting_byte + offset,
 					     len, ptr_out);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to get SLM buffer: MNSID=%u offset=%lu len=%lu rc=%d\n",
 			    mr->mnsid, mr->starting_byte + offset, len, rc);
-		if (rc == -ENOENT) {
+		if (rc == -ENOENT || rc == -ENOTSUP) {
 			return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 		}
 		return rc;

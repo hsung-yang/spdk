@@ -186,7 +186,7 @@ Returns:
 
 ## Status Codes
 
-CPCS-specific status codes (defined in `spdk/nvme_cpcs.h`):
+CPCS-specific status codes (defined in `spdk/nvme_spec.h`):
 
 - `INVALID_PROGRAM_INDEX`: Program index out of range
 - `NO_PROGRAM`: No program at specified index

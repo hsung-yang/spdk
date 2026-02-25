@@ -4910,7 +4910,7 @@ nvmf_ctrlr_slm_copy_lba_maybe_finish(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 	ctx->completed = true;
 
 	if (!ctx->failed && ctx->coalesced_len != 0) {
-		rc = bdev_slm_write_by_nsid(ctx->dest_ns->nsid, ctx->sdaddr,
+		rc = bdev_slm_write_by_bdev(ctx->dest_ns->bdev, ctx->sdaddr,
 					    ctx->coalesced_len, ctx->coalesced_buf);
 		if (rc != 0) {
 			nvmf_ctrlr_slm_copy_lba_fail_errno(ctx, rc);
@@ -4995,7 +4995,7 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 			}
 			break;
 		case SPDK_NVME_SLM_COPY_DESC_FMT_4H:
-			rc = bdev_slm_read_by_nsid(range->snsid, range->saddr, range->nbytes, dst);
+			rc = bdev_slm_read_by_bdev(range->src_bdev, range->saddr, range->nbytes, dst);
 			if (rc != 0) {
 				nvmf_ctrlr_slm_copy_lba_fail_errno(ctx, rc);
 			}

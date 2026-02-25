@@ -1,0 +1,37 @@
+@startuml
+skinparam componentStyle rectangle
+
+package "Consumers" {
+  component "lib/nvmf/ctrlr.c" as CTRLR
+}
+
+package "Public API" {
+  component "include/spdk/bdev_slm.h\nbdev_slm_*_by_bdev()" as BDEV_SLM_API
+}
+
+package "Dispatch Core" {
+  interface "spdk_vbdev_slm_ops\n(include/spdk_internal/vbdev_slm.h)" as MEM_OPS
+  component "module/bdev/slm/vbdev_slm.c\nprovider registry + NSID dispatch" as BDEV_MEM
+}
+
+package "Providers" {
+  component "module/bdev/slm/vbdev_pslm.c\ng_pslm_mem_ops" as SLM
+  component "module/bdev/vslm/vbdev_vslm.c\ng_vslm_mem_ops" as VSLM
+  component "vSLM MMU/page cache\nvslm_copy_range()" as VSLM_MMU
+  component "Base bdev (NVMe)\nspdk_bdev_read/write_blocks" as BASE_BDEV
+}
+
+CTRLR --> BDEV_SLM_API : bdev_slm_read/write_by_bdev
+
+BDEV_SLM_API --> BDEV_MEM : exported wrapper impl(vbdev_slm_read/write)
+
+BDEV_MEM ..> MEM_OPS : uses
+SLM ..|> MEM_OPS : register g_pslm_mem_ops
+VSLM ..|> MEM_OPS : register g_vslm_mem_ops
+
+BDEV_MEM --> SLM : if NSID claimed by pSLM
+BDEV_MEM --> VSLM : if NSID claimed by vSLM
+
+VSLM --> VSLM_MMU : bdev_vslm_read/write_by_nsid
+VSLM_MMU --> BASE_BDEV : page fault/writeback I/O
+@enduml

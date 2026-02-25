@@ -2279,12 +2279,8 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 		}
 
 		subsystem->max_zone_append_size_kib = max_zone_append_size_kib;
-	} else {
-		const char *bdev_module = spdk_bdev_get_module_name(ns->bdev);
-
-		if (bdev_module != NULL && strcmp(bdev_module, "slm") == 0) {
-			ns->csi = SPDK_NVME_CSI_SLM;
-		}
+	} else if (spdk_bdev_is_slm(ns->bdev)) {
+		ns->csi = SPDK_NVME_CSI_SLM;
 	}
 
 	first_ns = _nvmf_subsystem_get_first_bdev_ns(subsystem);

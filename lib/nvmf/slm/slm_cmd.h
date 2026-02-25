@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 struct spdk_bdev_desc;
+struct spdk_bdev;
 struct spdk_io_channel;
 struct spdk_nvmf_ns;
 struct spdk_nvmf_request;
@@ -26,6 +27,7 @@ struct nvmf_slm_copy_lba_range {
 	uint64_t		dest_offset;
 	uint32_t		snsid;
 	uint64_t		saddr;
+	struct spdk_bdev	*src_bdev;
 };
 
 int nvmf_slm_parse_copy_lba_cmd(struct spdk_nvmf_request *req,

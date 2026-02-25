@@ -13,6 +13,7 @@
 #include "program.h"
 #include "execute.h"
 #include "memory_range_set.h"
+#include "spdk/bdev_slm.h"
 #include "spdk/log.h"
 
 /* Check if uBPF library is available */
@@ -34,6 +35,45 @@ typedef uint64_t (*ubpf_jit_fn)(void *mem, size_t mem_len);
  * These are callable from eBPF programs
  */
 
+static int
+ebpf_resolve_exec_range(struct cpcs_exec_context *exec_ctx, uint64_t mr_id, uint64_t offset,
+			uint64_t len, struct spdk_bdev **bdev_out, uint64_t *absolute_offset_out)
+{
+	const struct cpcs_exec_resolved_range *mr;
+	uint64_t absolute_offset;
+
+	if (exec_ctx == NULL || bdev_out == NULL || absolute_offset_out == NULL) {
+		return -EINVAL;
+	}
+
+	if (exec_ctx->resolved_ranges == NULL || exec_ctx->resolved_range_count == 0) {
+		return -EINVAL;
+	}
+	if (mr_id == 0 || mr_id > exec_ctx->resolved_range_count) {
+		return -EINVAL;
+	}
+
+	mr = &exec_ctx->resolved_ranges[mr_id - 1];
+	if (mr->bdev == NULL) {
+		return -EINVAL;
+	}
+
+	if (offset > UINT64_MAX - len) {
+		return -EINVAL;
+	}
+	if (offset + len > mr->length) {
+		return -EINVAL;
+	}
+	if (mr->starting_byte > UINT64_MAX - offset) {
+		return -EINVAL;
+	}
+
+	absolute_offset = mr->starting_byte + offset;
+	*bdev_out = mr->bdev;
+	*absolute_offset_out = absolute_offset;
+	return 0;
+}
+
 /**
  * Helper: Read from SLM memory
  *
@@ -44,7 +84,8 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 		uint64_t len, uint64_t buf_ptr)
 {
 	struct cpcs_exec_context *exec_ctx = ctx;
-	void *ptr;
+	struct spdk_bdev *bdev;
+	uint64_t absolute_offset;
 	int rc;
 
 	if (mr_id == 0) {
@@ -58,15 +99,20 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 		return 0;
 	}
 
-	/* Read from Memory Range */
-	rc = cpcs_mrs_get_buffer(exec_ctx->mrs, mr_id, offset, len, &ptr);
+	rc = ebpf_resolve_exec_range(exec_ctx, mr_id, offset, len, &bdev, &absolute_offset);
 	if (rc != 0) {
-		SPDK_ERRLOG("Failed to get MRS buffer: mr_id=%lu offset=%lu len=%lu rc=%d\n",
+		SPDK_ERRLOG("Failed to resolve memory range: mr_id=%lu offset=%lu len=%lu rc=%d\n",
 			    mr_id, offset, len, rc);
 		return (uint64_t)-1;
 	}
 
-	memcpy((void *)buf_ptr, ptr, len);
+	rc = bdev_slm_read_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to read memory namespace: bdev=%p offset=%lu len=%lu rc=%d\n",
+			    bdev, absolute_offset, len, rc);
+		return (uint64_t)-1;
+	}
+
 	return 0;
 }
 
@@ -80,7 +126,8 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 		 uint64_t len, uint64_t buf_ptr)
 {
 	struct cpcs_exec_context *exec_ctx = ctx;
-	void *ptr;
+	struct spdk_bdev *bdev;
+	uint64_t absolute_offset;
 	int rc;
 
 	if (mr_id == 0) {
@@ -89,15 +136,20 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 		return (uint64_t)-1;
 	}
 
-	/* Write to Memory Range */
-	rc = cpcs_mrs_get_buffer(exec_ctx->mrs, mr_id, offset, len, &ptr);
+	rc = ebpf_resolve_exec_range(exec_ctx, mr_id, offset, len, &bdev, &absolute_offset);
 	if (rc != 0) {
-		SPDK_ERRLOG("Failed to get MRS buffer: mr_id=%lu offset=%lu len=%lu rc=%d\n",
+		SPDK_ERRLOG("Failed to resolve memory range: mr_id=%lu offset=%lu len=%lu rc=%d\n",
 			    mr_id, offset, len, rc);
 		return (uint64_t)-1;
 	}
 
-	memcpy(ptr, (void *)buf_ptr, len);
+	rc = bdev_slm_write_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to write memory namespace: bdev=%p offset=%lu len=%lu rc=%d\n",
+			    bdev, absolute_offset, len, rc);
+		return (uint64_t)-1;
+	}
+
 	return 0;
 }
 

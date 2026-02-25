@@ -36,14 +36,17 @@ struct cpcs_builtin_sum64_desc {
 	uint64_t len;
 };
 
-static int
-_cpcs_exec_get_buffer(const struct cpcs_exec_context *ctx,
-		      uint64_t mr_id, uint64_t off, uint64_t len, void **ptr_out)
-{
-	struct cpcs_memory_range inline_mr;
-	int rc;
+#define CPCS_BUILTIN_IO_CHUNK (64 * 1024)
 
-	if (ctx == NULL || ptr_out == NULL) {
+static int
+_cpcs_exec_resolve_range(const struct cpcs_exec_context *ctx,
+			 uint64_t mr_id, uint64_t off, uint64_t len,
+			 struct spdk_bdev **bdev_out, uint64_t *absolute_offset_out)
+{
+	const struct cpcs_exec_resolved_range *mr;
+	uint64_t absolute_offset;
+
+	if (ctx == NULL || bdev_out == NULL || absolute_offset_out == NULL) {
 		return -EINVAL;
 	}
 
@@ -51,27 +54,85 @@ _cpcs_exec_get_buffer(const struct cpcs_exec_context *ctx,
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	if (ctx->mrs != NULL) {
-		return cpcs_mrs_get_buffer(ctx->mrs, mr_id, off, len, ptr_out);
+	if (ctx->resolved_ranges == NULL || ctx->resolved_range_count == 0) {
+		return -SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 
-	/* Inline ranges: treat Memory Range ID as 1-based index. */
-	if (ctx->inline_ranges == NULL || ctx->inline_range_count == 0) {
+	if (mr_id > ctx->resolved_range_count) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
+	mr = &ctx->resolved_ranges[mr_id - 1];
 
-	if (mr_id > ctx->inline_range_count) {
-		return -SPDK_NVME_SC_INVALID_FIELD;
-	}
-
-	inline_mr = ctx->inline_ranges[mr_id - 1];
-	if (off + len > inline_mr.length) {
-		return -SPDK_NVME_SC_INVALID_FIELD;
-	}
-
-	rc = bdev_slm_get_buffer_ptr_by_nsid(inline_mr.mnsid, inline_mr.starting_byte + off, len, ptr_out);
-	if (rc == -ENOENT) {
+	if (mr->bdev == NULL) {
 		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+	}
+
+	if (off > UINT64_MAX - len) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	if (off + len > mr->length) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	if (mr->starting_byte > UINT64_MAX - off) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	absolute_offset = mr->starting_byte + off;
+	*bdev_out = mr->bdev;
+	*absolute_offset_out = absolute_offset;
+	return 0;
+}
+
+static int
+_cpcs_exec_read_range(const struct cpcs_exec_context *ctx,
+		      uint64_t mr_id, uint64_t off, uint64_t len, void *buf)
+{
+	struct spdk_bdev *bdev;
+	uint64_t absolute_offset;
+	int rc;
+
+	if (len != 0 && buf == NULL) {
+		return -EINVAL;
+	}
+
+	rc = _cpcs_exec_resolve_range(ctx, mr_id, off, len, &bdev, &absolute_offset);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = bdev_slm_read_by_bdev(bdev, absolute_offset, len, buf);
+	if (rc == -ENOENT || rc == -ENOTSUP) {
+		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+	}
+	if (rc == -EINVAL) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	return rc;
+}
+
+static int
+_cpcs_exec_write_range(const struct cpcs_exec_context *ctx,
+		       uint64_t mr_id, uint64_t off, uint64_t len, const void *buf)
+{
+	struct spdk_bdev *bdev;
+	uint64_t absolute_offset;
+	int rc;
+
+	if (len != 0 && buf == NULL) {
+		return -EINVAL;
+	}
+
+	rc = _cpcs_exec_resolve_range(ctx, mr_id, off, len, &bdev, &absolute_offset);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = bdev_slm_write_by_bdev(bdev, absolute_offset, len, buf);
+	if (rc == -ENOENT || rc == -ENOTSUP) {
+		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+	}
+	if (rc == -EINVAL) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 	return rc;
 }
@@ -80,8 +141,13 @@ static int
 _builtin_execute_memcpy(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
 	const struct cpcs_builtin_memcpy_desc *desc;
-	void *src;
-	void *dst;
+	uint8_t *tmp;
+	uint64_t src_mr_id;
+	uint64_t src_off;
+	uint64_t dst_mr_id;
+	uint64_t dst_off;
+	uint64_t copied = 0;
+	uint64_t chunk;
 	uint64_t len;
 	int rc;
 
@@ -95,17 +161,39 @@ _builtin_execute_memcpy(const struct cpcs_exec_context *ctx, uint64_t *return_va
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	rc = _cpcs_exec_get_buffer(ctx, from_le64(&desc->src_mr_id), from_le64(&desc->src_off), len, &src);
-	if (rc != 0) {
-		return rc;
+	src_mr_id = from_le64(&desc->src_mr_id);
+	src_off = from_le64(&desc->src_off);
+	dst_mr_id = from_le64(&desc->dst_mr_id);
+	dst_off = from_le64(&desc->dst_off);
+
+	chunk = len < CPCS_BUILTIN_IO_CHUNK ? len : CPCS_BUILTIN_IO_CHUNK;
+	tmp = malloc(chunk);
+	if (tmp == NULL) {
+		return -ENOMEM;
 	}
 
-	rc = _cpcs_exec_get_buffer(ctx, from_le64(&desc->dst_mr_id), from_le64(&desc->dst_off), len, &dst);
-	if (rc != 0) {
-		return rc;
+	while (copied < len) {
+		chunk = len - copied;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+		}
+
+		rc = _cpcs_exec_read_range(ctx, src_mr_id, src_off + copied, chunk, tmp);
+		if (rc != 0) {
+			free(tmp);
+			return rc;
+		}
+
+		rc = _cpcs_exec_write_range(ctx, dst_mr_id, dst_off + copied, chunk, tmp);
+		if (rc != 0) {
+			free(tmp);
+			return rc;
+		}
+
+		copied += chunk;
 	}
 
-	memcpy(dst, src, len);
+	free(tmp);
 	*return_value = len;
 	return 0;
 }
@@ -114,7 +202,11 @@ static int
 _builtin_execute_memfill(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
 	const struct cpcs_builtin_memfill_desc *desc;
-	void *buf;
+	uint64_t mr_id;
+	uint64_t off;
+	uint8_t *tmp;
+	uint64_t written = 0;
+	uint64_t chunk;
 	uint64_t len;
 	int rc;
 
@@ -128,12 +220,31 @@ _builtin_execute_memfill(const struct cpcs_exec_context *ctx, uint64_t *return_v
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	rc = _cpcs_exec_get_buffer(ctx, from_le64(&desc->mr_id), from_le64(&desc->off), len, &buf);
-	if (rc != 0) {
-		return rc;
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+
+	chunk = len < CPCS_BUILTIN_IO_CHUNK ? len : CPCS_BUILTIN_IO_CHUNK;
+	tmp = malloc(chunk);
+	if (tmp == NULL) {
+		return -ENOMEM;
+	}
+	memset(tmp, desc->pattern, chunk);
+
+	while (written < len) {
+		chunk = len - written;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+		}
+
+		rc = _cpcs_exec_write_range(ctx, mr_id, off + written, chunk, tmp);
+		if (rc != 0) {
+			free(tmp);
+			return rc;
+		}
+		written += chunk;
 	}
 
-	memset(buf, desc->pattern, len);
+	free(tmp);
 	*return_value = len;
 	return 0;
 }
@@ -143,7 +254,11 @@ _builtin_execute_sum64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 {
 	const struct cpcs_builtin_sum64_desc *desc;
 	const uint64_t *p;
-	void *buf;
+	uint8_t *buf;
+	uint64_t mr_id;
+	uint64_t off;
+	uint64_t processed = 0;
+	uint64_t chunk;
 	uint64_t len;
 	uint64_t sum = 0;
 	size_t i;
@@ -159,16 +274,35 @@ _builtin_execute_sum64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	rc = _cpcs_exec_get_buffer(ctx, from_le64(&desc->mr_id), from_le64(&desc->off), len, &buf);
-	if (rc != 0) {
-		return rc;
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+
+	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	if (buf == NULL) {
+		return -ENOMEM;
 	}
 
-	p = (const uint64_t *)buf;
-	for (i = 0; i < (len / sizeof(uint64_t)); i++) {
-		sum += p[i];
+	while (processed < len) {
+		chunk = len - processed;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+			chunk -= chunk % sizeof(uint64_t);
+		}
+
+		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			return rc;
+		}
+
+		p = (const uint64_t *)buf;
+		for (i = 0; i < (chunk / sizeof(uint64_t)); i++) {
+			sum += p[i];
+		}
+		processed += chunk;
 	}
 
+	free(buf);
 	*return_value = sum;
 	return 0;
 }
@@ -178,9 +312,14 @@ _builtin_execute_max64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 {
 	const struct cpcs_builtin_sum64_desc *desc;
 	const uint64_t *p;
-	void *buf;
+	uint8_t *buf;
+	uint64_t mr_id;
+	uint64_t off;
+	uint64_t processed = 0;
+	uint64_t chunk;
 	uint64_t len;
-	uint64_t max;
+	uint64_t max = 0;
+	bool initialized = false;
 	size_t i;
 	int rc;
 
@@ -194,19 +333,38 @@ _builtin_execute_max64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	rc = _cpcs_exec_get_buffer(ctx, from_le64(&desc->mr_id), from_le64(&desc->off), len, &buf);
-	if (rc != 0) {
-		return rc;
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+
+	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	if (buf == NULL) {
+		return -ENOMEM;
 	}
 
-	p = (const uint64_t *)buf;
-	max = p[0];
-	for (i = 1; i < (len / sizeof(uint64_t)); i++) {
-		if (p[i] > max) {
-			max = p[i];
+	while (processed < len) {
+		chunk = len - processed;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+			chunk -= chunk % sizeof(uint64_t);
 		}
+
+		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			return rc;
+		}
+
+		p = (const uint64_t *)buf;
+		for (i = 0; i < (chunk / sizeof(uint64_t)); i++) {
+			if (!initialized || p[i] > max) {
+				max = p[i];
+				initialized = true;
+			}
+		}
+		processed += chunk;
 	}
 
+	free(buf);
 	*return_value = max;
 	return 0;
 }
@@ -216,9 +374,14 @@ _builtin_execute_min64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 {
 	const struct cpcs_builtin_sum64_desc *desc;
 	const uint64_t *p;
-	void *buf;
+	uint8_t *buf;
+	uint64_t mr_id;
+	uint64_t off;
+	uint64_t processed = 0;
+	uint64_t chunk;
 	uint64_t len;
-	uint64_t min;
+	uint64_t min = 0;
+	bool initialized = false;
 	size_t i;
 	int rc;
 
@@ -232,19 +395,38 @@ _builtin_execute_min64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	rc = _cpcs_exec_get_buffer(ctx, from_le64(&desc->mr_id), from_le64(&desc->off), len, &buf);
-	if (rc != 0) {
-		return rc;
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+
+	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	if (buf == NULL) {
+		return -ENOMEM;
 	}
 
-	p = (const uint64_t *)buf;
-	min = p[0];
-	for (i = 1; i < (len / sizeof(uint64_t)); i++) {
-		if (p[i] < min) {
-			min = p[i];
+	while (processed < len) {
+		chunk = len - processed;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+			chunk -= chunk % sizeof(uint64_t);
 		}
+
+		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			return rc;
+		}
+
+		p = (const uint64_t *)buf;
+		for (i = 0; i < (chunk / sizeof(uint64_t)); i++) {
+			if (!initialized || p[i] < min) {
+				min = p[i];
+				initialized = true;
+			}
+		}
+		processed += chunk;
 	}
 
+	free(buf);
 	*return_value = min;
 	return 0;
 }
