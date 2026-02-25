@@ -25,12 +25,6 @@ struct spdk_bdev_slm {
 	void *buffer;
 	uint64_t buffer_size;    /* bytes */
 
-	/* Namespace identification */
-	uint32_t nsid;           /* Memory Namespace ID */
-
-	/* Granularity */
-	uint32_t granularity;    /* Access granularity (bytes) */
-
 	TAILQ_ENTRY(spdk_bdev_slm) link;
 };
 

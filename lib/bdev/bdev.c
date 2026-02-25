@@ -5212,6 +5212,12 @@ spdk_bdev_is_zoned(const struct spdk_bdev *bdev)
 	return bdev->zoned;
 }
 
+bool
+spdk_bdev_is_slm(const struct spdk_bdev *bdev)
+{
+	return bdev->slm;
+}
+
 uint32_t
 spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
 {
