@@ -840,3 +840,65 @@ def nvmf_stop_mdns_prr(client, tgt_name=None):
         params['tgt_name'] = tgt_name
 
     return client.call('nvmf_stop_mdns_prr', params)
+
+
+@deprecated_method
+def nvmf_reachability_create_group(client, subsystem_nqn):
+    """Create a reachability group for a subsystem."""
+    params = {
+        'subsystem_nqn': subsystem_nqn,
+    }
+    return client.call('nvmf_reachability_create_group', params)
+
+
+@deprecated_method
+def nvmf_reachability_delete_group(client, subsystem_nqn, group_id):
+    """Delete a reachability group from a subsystem."""
+    params = {
+        'subsystem_nqn': subsystem_nqn,
+        'group_id': group_id,
+    }
+    return client.call('nvmf_reachability_delete_group', params)
+
+
+@deprecated_method
+def nvmf_reachability_add_ns(client, subsystem_nqn, group_id, nsid, csi=0):
+    """Add a namespace to a reachability group."""
+    params = {
+        'subsystem_nqn': subsystem_nqn,
+        'group_id': group_id,
+        'nsid': nsid,
+        'csi': csi,
+    }
+    return client.call('nvmf_reachability_add_ns', params)
+
+
+@deprecated_method
+def nvmf_reachability_remove_ns(client, subsystem_nqn, group_id, nsid):
+    """Remove a namespace from a reachability group."""
+    params = {
+        'subsystem_nqn': subsystem_nqn,
+        'group_id': group_id,
+        'nsid': nsid,
+    }
+    return client.call('nvmf_reachability_remove_ns', params)
+
+
+@deprecated_method
+def nvmf_reachability_create_association(client, subsystem_nqn, group_ids):
+    """Create a reachability association."""
+    params = {
+        'subsystem_nqn': subsystem_nqn,
+        'group_ids': group_ids,
+    }
+    return client.call('nvmf_reachability_create_association', params)
+
+
+@deprecated_method
+def nvmf_reachability_delete_association(client, subsystem_nqn, assoc_id):
+    """Delete a reachability association."""
+    params = {
+        'subsystem_nqn': subsystem_nqn,
+        'assoc_id': assoc_id,
+    }
+    return client.call('nvmf_reachability_delete_association', params)

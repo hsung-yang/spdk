@@ -24,6 +24,8 @@ struct spdk_nvmf_subsystem;
 struct spdk_nvmf_ns;
 struct cpcs_program;
 struct cpcs_memory_range_set;
+struct cpcs_reachability_group;
+struct cpcs_reachability_manager;
 
 /* Maximum limits */
 #define CPCS_MAX_PROGRAMS_PER_NS        256
@@ -54,6 +56,11 @@ struct spdk_nvmf_cpcs_ns {
 	uint8_t max_ranges_per_mrs; /* MAXMEMR */
 	uint8_t mrs_granularity;    /* MRSG: 2^MRSG bytes */
 
+	/* Reachability */
+	struct cpcs_reachability_group *reach_group;
+	uint16_t reach_group_id;
+	struct cpcs_reachability_manager *reach_mgr;
+
 	/* Downloadable program limits */
 	uint64_t max_program_bytes;  /* MAXPB (MiB) */
 	uint64_t used_program_bytes;
@@ -74,7 +81,9 @@ struct spdk_nvmf_cpcs_ns_opts {
 	uint8_t max_ranges_per_mrs; /* MAXMEMR: 0 = no limit */
 	uint8_t mrs_granularity;    /* MRSG: 2^MRSG bytes */
 	uint64_t max_program_bytes;  /* MAXPB in MiB: 0 = no limit */
-	uint8_t load_program_gran;  /* LPG: 2^LPG bytes */};
+	uint8_t load_program_gran;  /* LPG: 2^LPG bytes */
+	uint16_t reach_group_id;     /* Reachability group */
+};
 
 /**
  * Initialize CPCS namespace options with defaults

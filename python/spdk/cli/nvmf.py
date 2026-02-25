@@ -6,7 +6,7 @@
 #
 
 import sys
-from spdk.rpc.cmd_parser import strip_globals, apply_defaults, group_as
+from spdk.rpc.cmd_parser import strip_globals, apply_defaults, group_as, remove_null
 from spdk.rpc.client import print_dict, print_json, print_array  # noqa
 
 
@@ -460,3 +460,67 @@ def add_parser(subparsers):
                               help='Stop publishing pull registration request through mdns')
     p.add_argument('-t', '--tgt-name', help='The name of the NVMe-oF target (optional)', type=str)
     p.set_defaults(func=nvmf_stop_mdns_prr)
+
+    def nvmf_reachability_create_group(args):
+        params = remove_null(strip_globals(vars(args)))
+        print_json(args.client.nvmf_reachability_create_group(**params))
+
+    p = subparsers.add_parser('nvmf_reachability_create_group',
+                              help='Create a reachability group for a subsystem')
+    p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
+    p.set_defaults(func=nvmf_reachability_create_group)
+
+    def nvmf_reachability_delete_group(args):
+        params = remove_null(strip_globals(vars(args)))
+        print_json(args.client.nvmf_reachability_delete_group(**params))
+
+    p = subparsers.add_parser('nvmf_reachability_delete_group',
+                              help='Delete a reachability group from a subsystem')
+    p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
+    p.add_argument('--group-id', dest='group_id', required=True, type=int, help='Reachability group ID')
+    p.set_defaults(func=nvmf_reachability_delete_group)
+
+    def nvmf_reachability_add_ns(args):
+        params = remove_null(strip_globals(vars(args)))
+        print_json(args.client.nvmf_reachability_add_ns(**params))
+
+    p = subparsers.add_parser('nvmf_reachability_add_ns',
+                              help='Add a namespace to a reachability group')
+    p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
+    p.add_argument('--group-id', dest='group_id', required=True, type=int, help='Reachability group ID')
+    p.add_argument('--nsid', dest='nsid', required=True, type=int, help='Namespace ID')
+    p.add_argument('--csi', dest='csi', type=int, default=0, help='Command set identifier (default: 0)')
+    p.set_defaults(func=nvmf_reachability_add_ns)
+
+    def nvmf_reachability_remove_ns(args):
+        params = remove_null(strip_globals(vars(args)))
+        print_json(args.client.nvmf_reachability_remove_ns(**params))
+
+    p = subparsers.add_parser('nvmf_reachability_remove_ns',
+                              help='Remove a namespace from a reachability group')
+    p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
+    p.add_argument('--group-id', dest='group_id', required=True, type=int, help='Reachability group ID')
+    p.add_argument('--nsid', dest='nsid', required=True, type=int, help='Namespace ID')
+    p.set_defaults(func=nvmf_reachability_remove_ns)
+
+    def nvmf_reachability_create_association(args):
+        params = remove_null(strip_globals(vars(args)))
+        print_json(args.client.nvmf_reachability_create_association(**params))
+
+    p = subparsers.add_parser('nvmf_reachability_create_association',
+                              help='Create a reachability association')
+    p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
+    p.add_argument('--group-ids', dest='group_ids', required=True,
+                   type=lambda s: [int(v) for v in s.split(',')],
+                   help='Comma-separated list of reachability group IDs')
+    p.set_defaults(func=nvmf_reachability_create_association)
+
+    def nvmf_reachability_delete_association(args):
+        params = remove_null(strip_globals(vars(args)))
+        print_json(args.client.nvmf_reachability_delete_association(**params))
+
+    p = subparsers.add_parser('nvmf_reachability_delete_association',
+                              help='Delete a reachability association')
+    p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
+    p.add_argument('--assoc-id', dest='assoc_id', required=True, type=int, help='Association ID')
+    p.set_defaults(func=nvmf_reachability_delete_association)

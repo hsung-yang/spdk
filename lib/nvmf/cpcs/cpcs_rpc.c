@@ -44,7 +44,9 @@ struct rpc_cpcs_ns_create {
 	uint16_t max_ranges_per_mrs;
 	uint8_t mrs_granularity;
 	uint32_t max_program_bytes;
-	uint8_t load_program_gran;};
+	uint8_t load_program_gran;
+	uint16_t reach_group_id;
+};
 
 static void
 free_rpc_cpcs_ns_create(struct rpc_cpcs_ns_create *req)
@@ -60,7 +62,9 @@ static const struct spdk_json_object_decoder rpc_cpcs_ns_create_decoders[] = {
 	{"max_ranges_per_mrs", offsetof(struct rpc_cpcs_ns_create, max_ranges_per_mrs), spdk_json_decode_uint16, true},
 	{"mrs_granularity", offsetof(struct rpc_cpcs_ns_create, mrs_granularity), spdk_json_decode_uint8, true},
 	{"max_program_bytes", offsetof(struct rpc_cpcs_ns_create, max_program_bytes), spdk_json_decode_uint32, true},
-	{"load_program_gran", offsetof(struct rpc_cpcs_ns_create, load_program_gran), spdk_json_decode_uint8, true},};
+	{"load_program_gran", offsetof(struct rpc_cpcs_ns_create, load_program_gran), spdk_json_decode_uint8, true},
+	{"reach_group_id", offsetof(struct rpc_cpcs_ns_create, reach_group_id), spdk_json_decode_uint16, true},
+};
 
 static void
 rpc_cpcs_ns_create(struct spdk_jsonrpc_request *request,
@@ -102,6 +106,10 @@ rpc_cpcs_ns_create(struct spdk_jsonrpc_request *request,
 	if (req.load_program_gran != 0) {
 		opts.load_program_gran = req.load_program_gran;
 	}
+	if (req.reach_group_id != 0) {
+		opts.reach_group_id = req.reach_group_id;
+	}
+
 	/* Create compute namespace */
 	struct spdk_nvmf_subsystem *subsystem = get_subsystem_by_nqn(req.subsystem_nqn);
 	if (!subsystem) {

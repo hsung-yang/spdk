@@ -4,6 +4,7 @@
 
 #include "nvmf_cpcs.h"
 #include "nvmf_internal.h"
+#include "reachability.h"
 #include "memory_range_set.h"
 #include "program.h"
 #include "builtin_programs.h"
@@ -41,7 +42,9 @@ spdk_nvmf_cpcs_ns_opts_init(struct spdk_nvmf_cpcs_ns_opts *opts)
 	opts->max_ranges_per_mrs = 32;  /* Default: 32 ranges per MRS */
 	opts->mrs_granularity = 2;      /* Default: 2^2 = 4 bytes */
 	opts->max_program_bytes = 1024; /* Default: 1 GiB */
-	opts->load_program_gran = 12;   /* Default: 2^12 = 4 KiB */}
+	opts->load_program_gran = 12;   /* Default: 2^12 = 4 KiB */
+	opts->reach_group_id = 0;       /* Default: group 0 */
+}
 
 int
 spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
@@ -111,6 +114,12 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 	ns->nsid = opts->nsid;
 	ns->name = NULL; /* Will be set by subsystem */
 	ns->subsystem = subsystem;
+	ns->reach_mgr = cpcs_reachability_mgr_get(subsystem);
+	if (!ns->reach_mgr) {
+		free(ns);
+		return -ENOMEM;
+	}
+
 	/* Initialize program management */
 	ns->max_programs = CPCS_MAX_PROGRAMS_PER_NS;
 	ns->max_activated = opts->max_activated;
@@ -125,6 +134,10 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 	ns->max_ranges_per_mrs = opts->max_ranges_per_mrs;
 	ns->mrs_granularity = opts->mrs_granularity;
 
+	/* Initialize reachability */
+	ns->reach_group_id = opts->reach_group_id;
+	ns->reach_group = NULL; /* Will be set by reachability manager */
+
 	/* Initialize downloadable program limits */
 	ns->max_program_bytes = opts->max_program_bytes * 1024 * 1024; /* MiB to bytes */
 	ns->used_program_bytes = 0;
@@ -133,6 +146,7 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 	rc = pthread_mutex_init(&ns->lock, NULL);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to initialize namespace mutex\n");
+		cpcs_reachability_mgr_put(subsystem);
 		free(ns);
 		return -rc;
 	}
@@ -140,6 +154,7 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 	base_ns = calloc(1, sizeof(*base_ns));
 	if (base_ns == NULL) {
 		pthread_mutex_destroy(&ns->lock);
+		cpcs_reachability_mgr_put(subsystem);
 		free(ns);
 		return -ENOMEM;
 	}
@@ -189,7 +204,9 @@ spdk_nvmf_cpcs_ns_fini(struct spdk_nvmf_cpcs_ns *ns)
 	/* Delete all programs */
 	cpcs_program_unload_all(ns);
 
-	pthread_mutex_destroy(&ns->lock);	free(ns->name);
+	pthread_mutex_destroy(&ns->lock);
+	cpcs_reachability_mgr_put(ns->subsystem);
+	free(ns->name);
 	free(ns);
 }
 

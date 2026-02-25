@@ -4,6 +4,7 @@
 
 #include "memory_range_set.h"
 #include "nvmf_cpcs.h"
+#include "reachability.h"
 
 #include "spdk/log.h"
 #include "spdk/nvme_spec.h"
@@ -264,6 +265,13 @@ cpcs_mrs_validate_locked(struct spdk_nvmf_cpcs_ns *ns,
 					return -SPDK_NVME_CPCS_SC_OVERLAPPING_MEMORY_RANGES;
 				}
 			}
+		}
+
+		/* Check reachability of memory namespace */
+		if (ns->reach_mgr && ns->reach_group_id != 0 &&
+		    !cpcs_reachability_is_memory_ns_reachable(ns->reach_mgr, ns, ranges[i].mnsid)) {
+			SPDK_ERRLOG("Memory namespace %u is not reachable\n", ranges[i].mnsid);
+			return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 		}
 	}
 
