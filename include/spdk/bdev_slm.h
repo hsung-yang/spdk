@@ -63,20 +63,41 @@ int bdev_slm_get_buffer_ptr(const char *name, uint64_t offset,
 			    uint64_t length, void **ptr);
 
 /**
- * Get direct pointer to SLM buffer by namespace ID.
- * Only for internal CPCS use.
+ * Get direct pointer to SLM/vSLM buffer by bdev.
+ * Only for internal CPCS/NVMf use.
  *
- * This function provides direct memory access to the SLM buffer
- * by looking up the SLM bdev by its namespace ID.
- *
- * \param nsid Namespace ID of the SLM bdev.
+ * \param bdev Memory namespace bdev.
  * \param offset Byte offset into the buffer.
  * \param length Length of the region.
  * \param[out] ptr Pointer to the buffer region.
  * \return 0 on success, negative errno on failure.
  */
-int bdev_slm_get_buffer_ptr_by_nsid(uint32_t nsid, uint64_t offset,
+int bdev_slm_get_buffer_ptr_by_bdev(struct spdk_bdev *bdev, uint64_t offset,
 				    uint64_t length, void **ptr);
+
+/**
+ * Read bytes from a memory namespace (SLM or vSLM) by bdev.
+ *
+ * \param bdev Memory namespace bdev.
+ * \param offset Byte offset to read from.
+ * \param length Number of bytes to read.
+ * \param[out] buf Output buffer.
+ * \return 0 on success, negative errno on failure.
+ */
+int bdev_slm_read_by_bdev(struct spdk_bdev *bdev, uint64_t offset,
+			  uint64_t length, void *buf);
+
+/**
+ * Write bytes to a memory namespace (SLM or vSLM) by bdev.
+ *
+ * \param bdev Memory namespace bdev.
+ * \param offset Byte offset to write to.
+ * \param length Number of bytes to write.
+ * \param buf Input buffer.
+ * \return 0 on success, negative errno on failure.
+ */
+int bdev_slm_write_by_bdev(struct spdk_bdev *bdev, uint64_t offset,
+			   uint64_t length, const void *buf);
 
 #ifdef __cplusplus
 }
