@@ -31,12 +31,6 @@ DEFINE_STUB(spdk_bdev_next, struct spdk_bdev *, (struct spdk_bdev *prev), NULL);
 DEFINE_STUB(spdk_bdev_get_nvme_nsid, uint32_t, (struct spdk_bdev *bdev), 0);
 DEFINE_STUB(spdk_bdev_is_slm, bool, (const struct spdk_bdev *bdev), false);
 DEFINE_STUB(spdk_bdev_get_block_size, uint32_t, (const struct spdk_bdev *bdev), 0);
-DEFINE_STUB(bdev_vslm_get_buffer_ptr_by_nsid, int,
-	    (uint32_t nsid, uint64_t offset, uint64_t length, void **ptr), -ENOENT);
-DEFINE_STUB(bdev_vslm_read_by_nsid, int,
-	    (uint32_t nsid, uint64_t offset, uint64_t length, void *buf), -ENOENT);
-DEFINE_STUB(bdev_vslm_write_by_nsid, int,
-	    (uint32_t nsid, uint64_t offset, uint64_t length, const void *buf), -ENOENT);
 
 struct spdk_bdev *
 spdk_bdev_get_by_name(const char *bdev_name)
@@ -88,6 +82,8 @@ test_slm_create_delete(void)
 	if (bdev) {
 		CU_ASSERT(bdev->blocklen == granularity);
 		CU_ASSERT(bdev->blockcnt == (size_mb * 1024 * 1024 / granularity));
+		CU_ASSERT(bdev->nsid == nsid);
+		CU_ASSERT(bdev->slm == true);
 	}
 
 	/* Test deletion */
@@ -177,30 +173,63 @@ test_slm_multiple_instances(void)
 }
 
 static void
-test_slm_nsid_lookup(void)
+test_slm_bdev_access(void)
 {
+	struct spdk_bdev *bdev;
+	struct spdk_bdev fake_bdev = {};
+	void *ptr = (void *)0x1;
+	uint8_t write_buf[16];
+	uint8_t read_buf[16];
 	int rc;
-	void *ptr = NULL;
-	const char *name = "test_slm_nsid";
-	uint32_t nsid = 300;
-	uint64_t size_mb = 8;
-	uint32_t granularity = 4;
 
-	/* Create SLM bdev */
-	rc = bdev_slm_create(name, nsid, size_mb, granularity);
+	rc = bdev_slm_create("test_slm_bdev", 301, 8, 4);
 	CU_ASSERT(rc == 0);
 
-	/* Test lookup by NSID */
-	rc = bdev_slm_get_buffer_ptr_by_nsid(nsid, 0, 1024, &ptr);
+	bdev = spdk_bdev_get_by_name("test_slm_bdev");
+	CU_ASSERT_PTR_NOT_NULL_FATAL(bdev);
+
+	memset(write_buf, 0xA5, sizeof(write_buf));
+	memset(read_buf, 0x00, sizeof(read_buf));
+
+	rc = bdev_slm_write_by_bdev(bdev, 128, sizeof(write_buf), write_buf);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(ptr != NULL);
 
-	/* Test invalid NSID */
-	rc = bdev_slm_get_buffer_ptr_by_nsid(999, 0, 1024, &ptr);
-	CU_ASSERT(rc == -ENOENT);
+	rc = bdev_slm_read_by_bdev(bdev, 128, sizeof(read_buf), read_buf);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(memcmp(read_buf, write_buf, sizeof(write_buf)) == 0);
 
-	/* Cleanup */
-	bdev_slm_delete(name, NULL, NULL);
+	rc = bdev_slm_get_buffer_ptr_by_bdev(bdev, 128, sizeof(write_buf), &ptr);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT_PTR_NOT_NULL(ptr);
+	CU_ASSERT(memcmp(ptr, write_buf, sizeof(write_buf)) == 0);
+
+	rc = bdev_slm_read_by_bdev(bdev, 0, 0, NULL);
+	CU_ASSERT(rc == 0);
+
+	ptr = (void *)0x1;
+	rc = bdev_slm_get_buffer_ptr_by_bdev(bdev, 0, 0, &ptr);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ptr == NULL);
+
+	rc = bdev_slm_read_by_bdev(NULL, 0, 1, read_buf);
+	CU_ASSERT(rc == -EINVAL);
+
+	rc = bdev_slm_write_by_bdev(NULL, 0, 1, write_buf);
+	CU_ASSERT(rc == -EINVAL);
+
+	rc = bdev_slm_get_buffer_ptr_by_bdev(NULL, 0, 1, &ptr);
+	CU_ASSERT(rc == -EINVAL);
+
+	rc = bdev_slm_read_by_bdev(&fake_bdev, 0, 1, read_buf);
+	CU_ASSERT(rc == -ENOTSUP);
+
+	rc = bdev_slm_write_by_bdev(&fake_bdev, 0, 1, write_buf);
+	CU_ASSERT(rc == -ENOTSUP);
+
+	rc = bdev_slm_get_buffer_ptr_by_bdev(&fake_bdev, 0, 1, &ptr);
+	CU_ASSERT(rc == -ENOTSUP);
+
+	bdev_slm_delete("test_slm_bdev", NULL, NULL);
 }
 
 int
@@ -217,16 +246,20 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_slm_invalid_params);
 	CU_ADD_TEST(suite, test_slm_buffer_access);
 	CU_ADD_TEST(suite, test_slm_multiple_instances);
-	CU_ADD_TEST(suite, test_slm_nsid_lookup);
+	CU_ADD_TEST(suite, test_slm_bdev_access);
 
 	allocate_threads(1);
 	set_thread(0);
 
-	rc = vbdev_slm_initialize();
-	CU_ASSERT_FATAL(rc == 0);
+	rc = vbdev_pslm_initialize();
+	if (rc != 0) {
+		CU_cleanup_registry();
+		free_threads();
+		return 1;
+	}
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
-	vbdev_slm_finish();
+	vbdev_pslm_finish();
 	CU_cleanup_registry();
 
 	free_threads();
