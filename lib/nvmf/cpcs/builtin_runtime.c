@@ -432,6 +432,141 @@ _builtin_execute_min64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 }
 
 static int
+_builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	const float *data;
+	uint32_t sum_bits = 0;
+	float sum = 0.0f;
+	size_t total_floats;
+	size_t n;
+	size_t i;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < (2 * sizeof(float))) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	if ((ctx->data_len % (2 * sizeof(float))) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	data = (const float *)ctx->data_buffer;
+	total_floats = ctx->data_len / sizeof(float);
+	n = total_floats / 2;
+
+	for (i = 0; i < n; i++) {
+		sum += data[i] * data[i + n];
+	}
+
+	memcpy(&sum_bits, &sum, sizeof(sum_bits));
+	*return_value = (uint64_t)sum_bits;
+	return 0;
+}
+
+static int
+_builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	const uint8_t *buf;
+	const float *in;
+	float *out;
+	float threshold = 0.0f;
+	size_t n;
+	size_t i;
+	size_t out_count = 0;
+	size_t bytes_after_header;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < (4 + 2 * sizeof(float))) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	buf = (const uint8_t *)ctx->data_buffer;
+	memcpy(&threshold, buf, sizeof(threshold));
+
+	if (ctx->data_len < 4) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	bytes_after_header = ctx->data_len - 4;
+	if ((bytes_after_header % (2 * sizeof(float))) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	n = bytes_after_header / (2 * sizeof(float));
+	in = (const float *)(buf + 4);
+	out = (float *)((uint8_t *)ctx->data_buffer + 4 + n * sizeof(float));
+
+	for (i = 0; i < n; i++) {
+		if (in[i] > threshold) {
+			out[out_count++] = in[i];
+		}
+	}
+
+	*return_value = out_count;
+	return 0;
+}
+
+static int
+_builtin_execute_memcpy_inline(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	uint8_t *buf = (uint8_t *)ctx->data_buffer;
+	size_t n;
+
+	if (buf == NULL || ctx->data_len < 2 || (ctx->data_len % 2) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	n = ctx->data_len / 2;
+	memcpy(buf + n, buf, n);
+	*return_value = n;
+	return 0;
+}
+
+static int
+_builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	uint8_t *buf = (uint8_t *)ctx->data_buffer;
+	uint8_t *src;
+	uint8_t *dst;
+	uint64_t input_size = 0;
+	size_t out_capacity;
+	size_t out_pos = 0;
+	size_t i = 0;
+
+	if (buf == NULL || ctx->data_len < (8 + 1 + 1)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	memcpy(&input_size, buf, sizeof(input_size));
+	if (input_size == 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	if (ctx->data_len < 8 + input_size + 1) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	src = buf + 8;
+	dst = buf + 8 + input_size;
+	out_capacity = ctx->data_len - 8 - input_size;
+
+	while (i < input_size) {
+		uint8_t value = src[i];
+		uint8_t run = 1;
+
+		while ((i + run) < input_size && src[i + run] == value && run < 255) {
+			run++;
+		}
+
+		if (out_pos + 2 > out_capacity) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+
+		dst[out_pos++] = run;
+		dst[out_pos++] = value;
+		i += run;
+	}
+
+	*return_value = out_pos;
+	return 0;
+}
+
+static int
 builtin_execute(struct cpcs_program *prog, struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
 	if (prog == NULL || ctx == NULL || return_value == NULL) {
@@ -449,6 +584,14 @@ builtin_execute(struct cpcs_program *prog, struct cpcs_exec_context *ctx, uint64
 		return _builtin_execute_max64(ctx, return_value);
 	case CPCS_BUILTIN_PIND_MIN64:
 		return _builtin_execute_min64(ctx, return_value);
+	case CPCS_BUILTIN_PIND_DOT_PRODUCT:
+		return _builtin_execute_dot_product(ctx, return_value);
+	case CPCS_BUILTIN_PIND_FILTER_GT:
+		return _builtin_execute_filter_gt(ctx, return_value);
+	case CPCS_BUILTIN_PIND_MEMCPY_INLINE:
+		return _builtin_execute_memcpy_inline(ctx, return_value);
+	case CPCS_BUILTIN_PIND_RLE_COMPRESS:
+		return _builtin_execute_rle_compress(ctx, return_value);
 	default:
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
 	}

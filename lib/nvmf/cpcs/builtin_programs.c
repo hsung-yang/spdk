@@ -24,6 +24,14 @@ _builtin_puid_for_pind(uint16_t pind)
 		return CPCS_BUILTIN_PUID_MAX64;
 	case CPCS_BUILTIN_PIND_MIN64:
 		return CPCS_BUILTIN_PUID_MIN64;
+	case CPCS_BUILTIN_PIND_DOT_PRODUCT:
+		return CPCS_BUILTIN_PUID_DOT_PRODUCT;
+	case CPCS_BUILTIN_PIND_FILTER_GT:
+		return CPCS_BUILTIN_PUID_FILTER_GT;
+	case CPCS_BUILTIN_PIND_MEMCPY_INLINE:
+		return CPCS_BUILTIN_PUID_MEMCPY_INLINE;
+	case CPCS_BUILTIN_PIND_RLE_COMPRESS:
+		return CPCS_BUILTIN_PUID_RLE_COMPRESS;
 	default:
 		return 0;
 	}
@@ -36,7 +44,11 @@ cpcs_program_index_is_builtin(uint16_t pind)
 		pind == CPCS_BUILTIN_PIND_MEMFILL ||
 		pind == CPCS_BUILTIN_PIND_SUM64 ||
 		pind == CPCS_BUILTIN_PIND_MAX64 ||
-		pind == CPCS_BUILTIN_PIND_MIN64);
+		pind == CPCS_BUILTIN_PIND_MIN64 ||
+		pind == CPCS_BUILTIN_PIND_DOT_PRODUCT ||
+		pind == CPCS_BUILTIN_PIND_FILTER_GT ||
+		pind == CPCS_BUILTIN_PIND_MEMCPY_INLINE ||
+		pind == CPCS_BUILTIN_PIND_RLE_COMPRESS);
 }
 
 static int
@@ -95,7 +107,7 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 
 	pthread_mutex_lock(&ns->lock);
 
-	if (ns->max_programs <= CPCS_BUILTIN_PIND_MIN64) {
+	if (ns->max_programs <= CPCS_BUILTIN_PIND_RLE_COMPRESS) {
 		pthread_mutex_unlock(&ns->lock);
 		return -EINVAL;
 	}
@@ -113,11 +125,23 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 	if (rc == 0) {
 		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_MIN64);
 	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_DOT_PRODUCT);
+	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_FILTER_GT);
+	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_MEMCPY_INLINE);
+	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_RLE_COMPRESS);
+	}
 
 	pthread_mutex_unlock(&ns->lock);
 
 	if (rc == 0) {
-		SPDK_NOTICELOG("Installed CPCS built-in programs: memcpy, memfill, sum64, max64, min64\n");
+		SPDK_NOTICELOG("Installed CPCS built-ins: pind 0-8 (memcpy..rle_compress)\n");
 	}
 
 	return rc;
