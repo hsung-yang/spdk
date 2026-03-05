@@ -12,6 +12,7 @@
 
 #include "spdk/bdev.h"
 #include "spdk/bdev_slm.h"
+#include "spdk/env.h"
 #include "spdk/bdev_zone.h"
 #include "spdk/bit_array.h"
 #include "spdk/endian.h"
@@ -4850,7 +4851,7 @@ nvmf_ctrlr_slm_copy_lba_free_ctx(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 		return;
 	}
 
-	free(ctx->coalesced_buf);
+	spdk_dma_free(ctx->coalesced_buf);
 	free(ctx->read_ctxs);
 	free(ctx->ranges);
 	free(ctx);
@@ -4949,7 +4950,7 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 	int rc;
 
 	alloc_len = ctx->coalesced_len;
-	ctx->coalesced_buf = malloc(alloc_len);
+	ctx->coalesced_buf = spdk_dma_malloc(alloc_len, 0x1000, NULL);
 	if (ctx->coalesced_buf == NULL) {
 		nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
 					     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
