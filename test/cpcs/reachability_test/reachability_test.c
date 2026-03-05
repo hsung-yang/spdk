@@ -13,9 +13,9 @@
 
 #include "../cpcs_common.h"
 #include "spdk/nvme_spec.h"
-#include "lib/nvmf/cpcs/nvmf_cpcs.h"
-#include "lib/nvmf/cpcs/reachability.h"
-#include "lib/nvmf/nvmf_internal.h"
+#include "nvmf_cpcs.h"
+#include "reachability.h"
+#include "nvmf_internal.h"
 
 #include "spdk/stdinc.h"
 

@@ -12,7 +12,7 @@
 #include "spdk/thread.h"
 #include "spdk/bdev_vslm.h"
 
-#include "module/bdev/malloc/bdev_malloc.h"
+#include "bdev/malloc/bdev_malloc.h"
 
 static struct spdk_thread *g_thread;
 static bool g_bdev_initialized;

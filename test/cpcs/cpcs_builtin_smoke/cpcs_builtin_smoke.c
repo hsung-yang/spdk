@@ -204,12 +204,80 @@ _cpcs_smoke_ns_create(void)
 	}
 
 	ns->max_programs = CPCS_MAX_PROGRAMS_PER_NS;
+	ns->next_rsid = 1;
+	TAILQ_INIT(&ns->mrs_list);
 	if (pthread_mutex_init(&ns->lock, NULL) != 0) {
 		free(ns);
 		return NULL;
 	}
 
 	return ns;
+}
+
+static int
+_run_exec_with_setup(struct cpcs_exec_context *ctx)
+{
+	struct cpcs_exec_resolved_range *resolved = NULL;
+	struct spdk_bdev *bdev = NULL;
+	uint32_t range_count = 0;
+	int rc;
+	uint32_t i;
+
+	if (ctx == NULL || ctx->program == NULL) {
+		return -EINVAL;
+	}
+
+	if (ctx->ns == NULL) {
+		ctx->ns = ctx->program->ns;
+	}
+	if (ctx->ns == NULL) {
+		return -EINVAL;
+	}
+
+	/* Resolve test-provided inline ranges directly (no request-path / MRS mutation). */
+	if (ctx->inline_range_count == 0 || ctx->inline_ranges == NULL) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	range_count = ctx->inline_range_count;
+	resolved = calloc(range_count, sizeof(*resolved));
+	if (resolved == NULL) {
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < range_count; i++) {
+		bdev = NULL;
+		for (bdev = spdk_bdev_first(); bdev != NULL; bdev = spdk_bdev_next(bdev)) {
+			if (spdk_bdev_get_nvme_nsid(bdev) == ctx->inline_ranges[i].mnsid) {
+				break;
+			}
+		}
+
+		if (bdev == NULL) {
+			rc = -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+			goto out;
+		}
+
+		resolved[i].bdev = bdev;
+		resolved[i].mnsid = ctx->inline_ranges[i].mnsid;
+		resolved[i].starting_byte = ctx->inline_ranges[i].starting_byte;
+		resolved[i].length = ctx->inline_ranges[i].length;
+	}
+
+	ctx->resolved_ranges = resolved;
+	ctx->resolved_range_count = range_count;
+	resolved = NULL;
+
+	rc = cpcs_execute_run(ctx);
+
+out:
+	free(resolved);
+
+	free(ctx->resolved_ranges);
+	ctx->resolved_ranges = NULL;
+	ctx->resolved_range_count = 0;
+
+	return rc;
 }
 
 static void
@@ -264,7 +332,7 @@ _run_memfill(struct cpcs_test_ctx *tctx, struct spdk_nvmf_cpcs_ns *ns,
 	ctx.data_buffer = &desc;
 	ctx.data_len = sizeof(desc);
 
-	rc = cpcs_execute_run(&ctx);
+	rc = _run_exec_with_setup(&ctx);
 	if (rc != 0) {
 		return rc;
 	}
@@ -328,7 +396,7 @@ _run_memcpy(struct cpcs_test_ctx *tctx, struct spdk_nvmf_cpcs_ns *ns,
 	ctx.data_buffer = &desc;
 	ctx.data_len = sizeof(desc);
 
-	rc = cpcs_execute_run(&ctx);
+	rc = _run_exec_with_setup(&ctx);
 	if (rc != 0) {
 		return rc;
 	}
@@ -394,7 +462,7 @@ _run_sum64(struct cpcs_test_ctx *tctx, struct spdk_nvmf_cpcs_ns *ns,
 	ctx.data_buffer = &desc;
 	ctx.data_len = sizeof(desc);
 
-	rc = cpcs_execute_run(&ctx);
+	rc = _run_exec_with_setup(&ctx);
 	if (rc != 0) {
 		return rc;
 	}

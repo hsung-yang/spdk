@@ -10,6 +10,7 @@ C_SRCS = reachability_test.c ../cpcs_common.c
 
 CFLAGS += -I$(SPDK_ROOT_DIR)/test/cpcs
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib/nvmf/cpcs
+CFLAGS += -I$(SPDK_ROOT_DIR)/lib/nvmf
 
 SPDK_LIB_LIST = bdev bdev_slm nvmf
 
