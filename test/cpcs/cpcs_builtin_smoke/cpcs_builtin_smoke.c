@@ -306,33 +306,64 @@ _run_sum64(struct cpcs_test_ctx *tctx, struct spdk_nvmf_cpcs_ns *ns,
 }
 
 static int
-_run_dot_product(struct spdk_nvmf_cpcs_ns *ns)
+_run_dot_product(struct cpcs_test_ctx *tctx, struct spdk_nvmf_cpcs_ns *ns,
+		 const char *slm_name, uint32_t slm_nsid)
 {
 	struct cpcs_program *prog;
 	struct cpcs_exec_context ctx = {};
-	float buf[8] = { 1.0f, 2.0f, 3.0f, 4.0f, 1.0f, 2.0f, 3.0f, 4.0f };
+	struct cpcs_memory_range range = {};
+	struct cpcs_builtin_sum64_desc {
+		uint64_t mr_id;
+		uint64_t off;
+		uint64_t len;
+	} desc;
+	void *buf;
+	/* A = [1, 2, 3, 4], B = [1, 2, 3, 4] => dot = 1+4+9+16 = 30 */
+	float data[8] = { 1.0f, 2.0f, 3.0f, 4.0f, 1.0f, 2.0f, 3.0f, 4.0f };
 	float expected = 30.0f;
 	uint32_t expected_bits = 0;
 	uint32_t got_bits = 0;
+	const uint64_t off = 32768;
 	int rc;
 
-	SPDK_NOTICELOG("CPCS builtin: dot_product\n");
+	SPDK_NOTICELOG("CPCS builtin: dot_product (MRS-based)\n");
 
 	prog = cpcs_program_get(ns, CPCS_BUILTIN_PIND_DOT_PRODUCT);
 	if (prog == NULL) {
 		return -EINVAL;
 	}
 
-	memcpy(&expected_bits, &expected, sizeof(expected_bits));
-	ctx.program = prog;
-	ctx.data_buffer = buf;
-	ctx.data_len = sizeof(buf);
+	/* Write float data into SLM at offset */
+	rc = bdev_slm_get_buffer_ptr(slm_name, off, sizeof(data), &buf);
+	if (rc != 0) {
+		tctx->error_count++;
+		return rc;
+	}
+	memcpy(buf, data, sizeof(data));
 
-	rc = cpcs_execute_run(&ctx);
+	/* Set up MRS range pointing to SLM */
+	range.mnsid = slm_nsid;
+	range.starting_byte = 0;
+	range.length = 64 * 1024;
+
+	/* Build descriptor: mr_id=1, off=offset_in_slm, len=sizeof(data) */
+	memset(&desc, 0, sizeof(desc));
+	to_le64(&desc.mr_id, 1);
+	to_le64(&desc.off, off);
+	to_le64(&desc.len, sizeof(data));
+
+	ctx.program = prog;
+	ctx.inline_ranges = &range;
+	ctx.inline_range_count = 1;
+	ctx.data_buffer = &desc;
+	ctx.data_len = sizeof(desc);
+
+	rc = _run_exec_with_setup(&ctx);
 	if (rc != 0) {
 		return rc;
 	}
 
+	memcpy(&expected_bits, &expected, sizeof(expected_bits));
 	got_bits = (uint32_t)ctx.return_value;
 	if (got_bits != expected_bits) {
 		SPDK_ERRLOG("dot_product mismatch: expected_bits=0x%x got_bits=0x%x\n",
@@ -536,7 +567,7 @@ main(int argc, char **argv)
 		failures++;
 	}
 
-	rc = _run_dot_product(ns);
+	rc = _run_dot_product(&tctx, ns, slm_name, slm_nsid);
 	if (rc != 0) {
 		SPDK_ERRLOG("dot_product FAILED: %d\n", rc);
 		failures++;

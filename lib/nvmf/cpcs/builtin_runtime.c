@@ -431,30 +431,103 @@ _builtin_execute_min64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 	return 0;
 }
 
+/*
+ * DOT_PRODUCT descriptor (same layout as sum64):
+ *   [0:7]   mr_id  — Memory Range ID (1-based)
+ *   [8:15]  offset — byte offset within MRS
+ *   [16:23] length — total bytes (must be divisible by 2*sizeof(float))
+ *
+ * The first half of the data is vector A, the second half is vector B.
+ * Result = A[0]*B[0] + A[1]*B[1] + ... + A[n-1]*B[n-1], returned as
+ * a float bit-pattern in the lower 32 bits of return_value.
+ */
 static int
 _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
-	const float *data;
-	uint32_t sum_bits = 0;
+	const struct cpcs_builtin_sum64_desc *desc;
+	const float *p;
+	uint8_t *buf;
+	uint64_t mr_id;
+	uint64_t off;
+	uint64_t processed = 0;
+	uint64_t chunk;
+	uint64_t len;
+	uint64_t half_len;
 	float sum = 0.0f;
-	size_t total_floats;
-	size_t n;
+	uint32_t sum_bits = 0;
+	uint8_t *buf_a = NULL;
 	size_t i;
+	int rc;
 
-	if (ctx->data_buffer == NULL || ctx->data_len < (2 * sizeof(float))) {
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
-	if ((ctx->data_len % (2 * sizeof(float))) != 0) {
+
+	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+	len = from_le64(&desc->len);
+	if (len == 0 || (len % (2 * sizeof(float))) != 0) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
-	data = (const float *)ctx->data_buffer;
-	total_floats = ctx->data_len / sizeof(float);
-	n = total_floats / 2;
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+	half_len = len / 2;
 
-	for (i = 0; i < n; i++) {
-		sum += data[i] * data[i + n];
+	/* Read vector A (first half) into buf_a */
+	buf_a = malloc(half_len);
+	if (buf_a == NULL) {
+		return -ENOMEM;
 	}
+
+	processed = 0;
+	while (processed < half_len) {
+		chunk = half_len - processed;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+			chunk -= chunk % sizeof(float);
+		}
+
+		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk,
+					   buf_a + processed);
+		if (rc != 0) {
+			free(buf_a);
+			return rc;
+		}
+		processed += chunk;
+	}
+
+	/* Stream vector B (second half) and accumulate dot product */
+	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	if (buf == NULL) {
+		free(buf_a);
+		return -ENOMEM;
+	}
+
+	processed = 0;
+	while (processed < half_len) {
+		chunk = half_len - processed;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+			chunk -= chunk % sizeof(float);
+		}
+
+		rc = _cpcs_exec_read_range(ctx, mr_id, off + half_len + processed,
+					   chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			free(buf_a);
+			return rc;
+		}
+
+		p = (const float *)buf;
+		for (i = 0; i < (chunk / sizeof(float)); i++) {
+			sum += ((const float *)buf_a)[processed / sizeof(float) + i] * p[i];
+		}
+		processed += chunk;
+	}
+
+	free(buf);
+	free(buf_a);
 
 	memcpy(&sum_bits, &sum, sizeof(sum_bits));
 	*return_value = (uint64_t)sum_bits;
