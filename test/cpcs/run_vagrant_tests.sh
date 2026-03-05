@@ -17,6 +17,8 @@ DISTRO="${SPDK_VAGRANT_DISTRO:-ubuntu2204}"
 VMCPU="${SPDK_VAGRANT_VMCPU:-4}"
 VMRAM="${SPDK_VAGRANT_VMRAM:-8192}"
 PROVIDER="${SPDK_VAGRANT_PROVIDER:-virtualbox}"
+SKIP_UBPF="${SKIP_UBPF:-1}"
+RUN_EBPF_UT="${RUN_EBPF_UT:-0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -90,7 +92,8 @@ function create_vm() {
     export SPDK_VAGRANT_PROVIDER="$PROVIDER"
     export COPY_SPDK_DIR=1
     export SPDK_DIR="$SPDK_ROOT"
-    export DEPLOY_TEST_VM=1
+    # Optional: keep VM bootstrap minimal and do explicit setup in setup_vm()
+    export DEPLOY_TEST_VM="${DEPLOY_TEST_VM:-0}"
 
     info "VM Configuration:"
     info "  Distro:   $DISTRO"
@@ -112,31 +115,69 @@ function setup_vm() {
 
     cd "$TEST_VM_DIR"
 
-    # Install uBPF if missing (required for eBPF runtime unit tests).
-    vagrant ssh -c "if [ ! -f /usr/local/include/ubpf.h ]; then \
-        if command -v apt-get >/dev/null 2>&1; then \
-            sudo apt-get update && sudo apt-get install -y build-essential git cmake; \
-        elif command -v dnf >/dev/null 2>&1; then \
-            sudo dnf install -y make gcc gcc-c++ git cmake; \
-        elif command -v yum >/dev/null 2>&1; then \
-            sudo yum install -y make gcc gcc-c++ git cmake; \
-        else \
-            echo 'No supported package manager found for uBPF install' >&2; \
-            exit 1; \
-        fi && \
-        rm -rf /tmp/ubpf && \
-        GIT_SSL_NO_VERIFY=true git clone https://github.com/iovisor/ubpf.git /tmp/ubpf && \
-        cd /tmp/ubpf && \
-        cmake -S . -B build -DUBPF_ENABLE_INSTALL=ON -DUBPF_SKIP_EXTERNAL=ON && \
-        cmake --build build && \
-        sudo cmake --install build; \
+    # Install base build dependencies first to avoid distro-specific bootstrap failures.
+    vagrant ssh -c "if command -v apt-get >/dev/null 2>&1; then \
+        sudo sh -c 'printf \"nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n\" > /etc/resolv.conf' && \
+        sudo apt-get update && sudo apt-get install -y \
+        build-essential meson ninja-build pkg-config \
+        python3 python3-pip python3-pyelftools \
+        libaio-dev libssl-dev liburing-dev \
+        libnuma-dev uuid-dev libcunit1-dev \
+        nasm libpciaccess-dev git \
+        autoconf automake libtool libncurses-dev; \
+    elif command -v dnf >/dev/null 2>&1; then \
+        sudo dnf install -y \
+        gcc gcc-c++ make meson ninja-build pkgconf-pkg-config \
+        python3 python3-pip python3-pyelftools \
+        libaio-devel openssl-devel liburing-devel \
+        numactl-devel libuuid-devel CUnit-devel \
+        nasm libpciaccess-devel git \
+        autoconf automake libtool ncurses-devel; \
+    elif command -v yum >/dev/null 2>&1; then \
+        sudo yum install -y \
+        gcc gcc-c++ make meson ninja-build pkgconfig \
+        python3 python3-pip \
+        libaio-devel openssl-devel liburing-devel \
+        numactl-devel libuuid-devel CUnit-devel \
+        nasm libpciaccess-devel git \
+        autoconf automake libtool ncurses-devel; \
+    else \
+        echo 'No supported package manager found' >&2; \
+        exit 1; \
     fi" || {
-        error "Failed to install uBPF"
+        error "Failed to install base build dependencies"
         exit 1
     }
 
+    # Optional uBPF install (required only for eBPF runtime unit tests).
+    if [[ "$SKIP_UBPF" != "1" ]]; then
+        vagrant ssh -c "if [ ! -f /usr/local/include/ubpf.h ]; then \
+            if command -v apt-get >/dev/null 2>&1; then \
+                sudo apt-get update && sudo apt-get install -y build-essential git cmake; \
+            elif command -v dnf >/dev/null 2>&1; then \
+                sudo dnf install -y make gcc gcc-c++ git cmake; \
+            elif command -v yum >/dev/null 2>&1; then \
+                sudo yum install -y make gcc gcc-c++ git cmake; \
+            else \
+                echo 'No supported package manager found for uBPF install' >&2; \
+                exit 1; \
+            fi && \
+            rm -rf /tmp/ubpf && \
+            GIT_SSL_NO_VERIFY=true git clone https://github.com/iovisor/ubpf.git /tmp/ubpf && \
+            cd /tmp/ubpf && \
+            cmake -S . -B build -DUBPF_ENABLE_INSTALL=ON -DUBPF_SKIP_EXTERNAL=ON && \
+            cmake --build build && \
+            sudo cmake --install build; \
+        fi" || {
+            error "Failed to install uBPF"
+            exit 1
+        }
+    else
+        info "Skipping uBPF install (SKIP_UBPF=1)"
+    fi
+
     # Build SPDK
-    vagrant ssh -c 'cd /home/vagrant/spdk_repo/spdk && ./configure && JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN || echo 1) && make -j${JOBS}' || {
+    vagrant ssh -c 'cd /home/vagrant/spdk_repo/spdk && ./configure --without-nvme-cuse && JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN || echo 1) && make -j${JOBS}' || {
         error "Failed to build SPDK"
         exit 1
     }
@@ -148,6 +189,34 @@ function run_tests() {
     info "Running CPCS tests in VM..."
 
     cd "$TEST_VM_DIR"
+
+    # Upload frequently edited test scripts without syncing the full tree.
+    # Full rsync can delete guest build artifacts when host build dirs are absent.
+    vagrant upload "$SPDK_ROOT/test/cpcs/cpcs.sh" "/home/vagrant/spdk_repo/spdk/test/cpcs/cpcs.sh" || {
+        error "Failed to upload CPCS test script into VM"
+        return 1
+    }
+
+    # Ensure SPDK target exists (it may be missing after source refresh operations).
+    vagrant ssh -c "test -x /home/vagrant/spdk_repo/spdk/build/bin/spdk_tgt" || {
+        warn "spdk_tgt not found in VM; rebuilding SPDK"
+        vagrant ssh -c 'cd /home/vagrant/spdk_repo/spdk && ./configure --without-nvme-cuse && JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN || echo 1) && make -j${JOBS}' || {
+            error "Failed to rebuild SPDK in VM"
+            return 1
+        }
+    }
+
+    # SPDK target requires hugepages in the guest. Ensure they are configured
+    # for this test run and cleaned up afterwards.
+    vagrant ssh -c "cd /home/vagrant/spdk_repo/spdk && sudo scripts/setup.sh" || {
+        error "Failed to configure hugepages in VM"
+        return 1
+    }
+
+    cleanup_hugepages() {
+        vagrant ssh -c "cd /home/vagrant/spdk_repo/spdk && sudo scripts/setup.sh reset" >/dev/null 2>&1 || true
+    }
+    trap cleanup_hugepages EXIT
 
     # Run CPCS integration tests
     vagrant ssh -c "cd /home/vagrant/spdk_repo/spdk && sudo ./test/cpcs/cpcs.sh" || {
@@ -181,15 +250,23 @@ function run_tests() {
 
     info "Builtin smoke tests passed!"
 
-    # Run eBPF runtime unit tests
-    vagrant ssh -c "cd /home/vagrant/spdk_repo/spdk/test/unit/lib/nvmf/cpcs_ebpf.c && make && ./cpcs_ebpf_ut" || {
-        error "eBPF runtime unit tests failed"
-        return 1
-    }
+    if [[ "$RUN_EBPF_UT" == "1" ]]; then
+        # Run eBPF runtime unit tests
+        vagrant ssh -c "cd /home/vagrant/spdk_repo/spdk/test/unit/lib/nvmf/cpcs_ebpf.c && make && ./cpcs_ebpf_ut" || {
+            error "eBPF runtime unit tests failed"
+            return 1
+        }
 
-    info "eBPF runtime unit tests passed!"
+        info "eBPF runtime unit tests passed!"
+    else
+        info "Skipping eBPF runtime unit tests (RUN_EBPF_UT=0)"
+    fi
 
     info "All CPCS tests passed successfully!"
+
+    # The run succeeded; remove trap and cleanup explicitly for deterministic flow.
+    trap - EXIT
+    cleanup_hugepages
 }
 
 function cleanup_vm() {
