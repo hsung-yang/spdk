@@ -9,8 +9,8 @@ source $rootdir/test/common/autotest_common.sh
 
 # CPCS test configuration
 CPCS_TEST_SUBSYSTEM_NQN="nqn.2024-01.io.spdk:cpcs-test"
-CPCS_COMPUTE_NSID=200
-CPCS_MEMORY_NSID=100
+CPCS_COMPUTE_NSID="${CPCS_COMPUTE_NSID:-2}"
+CPCS_MEMORY_NSID="${CPCS_MEMORY_NSID:-1}"
 CPCS_SLM_SIZE_MB=64
 SPDK_TEST_CORE_MASK="${SPDK_TEST_CORE_MASK:-0x2}"
 SPDK_TEST_RPC_SOCK="${SPDK_TEST_RPC_SOCK:-/var/tmp/spdk_cpcs.sock}"
