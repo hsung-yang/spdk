@@ -247,6 +247,7 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 			if (!ctx->data_buffer) {
 				return -ENOMEM;
 			}
+			ctx->data_buffer_base = ctx->data_buffer;
 			ctx->data_buffer_owned = true;
 
 			copied = spdk_nvmf_request_copy_to_buf(req, ctx->data_buffer, dlen);
@@ -345,6 +346,10 @@ cpcs_execute_setup_memory(struct cpcs_exec_context *ctx)
 			return rc;
 		}
 
+		/* Advance data_buffer past the range descriptors so builtins see their own descriptor */
+		ctx->data_buffer = (uint8_t *)ctx->data_buffer + required_size;
+		ctx->data_len -= (uint32_t)required_size;
+
 		SPDK_DEBUGLOG(nvmf_cpcs, "Parsed %u inline memory ranges\n", ctx->inline_range_count);
 	}
 
@@ -371,10 +376,7 @@ cpcs_execute_run(struct cpcs_exec_context *ctx)
 		      ctx->program->pind, ctx->program->ptype);
 
 	/* Execute program */
-	/* TODO: consider async execution to avoid blocking the exec thread. */
-	pthread_mutex_lock(&ctx->program->lock);
 	rc = runtime->execute(ctx->program, ctx, &ctx->return_value);
-	pthread_mutex_unlock(&ctx->program->lock);
 	if (rc != 0) {
 		SPDK_ERRLOG("Program %u execution failed: %d\n", ctx->program->pind, rc);
 	}
@@ -430,8 +432,8 @@ cpcs_execute_complete(struct cpcs_exec_context *ctx, int status)
 		free(ctx->resolved_ranges);
 	}
 
-	if (ctx->data_buffer && ctx->data_buffer_owned) {
-		free(ctx->data_buffer);
+	if (ctx->data_buffer_owned) {
+		free(ctx->data_buffer_base != NULL ? ctx->data_buffer_base : ctx->data_buffer);
 	}
 
 	/* Complete request */

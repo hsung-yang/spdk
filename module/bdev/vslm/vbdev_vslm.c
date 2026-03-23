@@ -34,6 +34,7 @@ struct vslm_page {
 	uint64_t ppn;
 	bool dirty;
 	bool is_busy;
+	bool in_lru;
 	TAILQ_ENTRY(vslm_page) lru_link;
 	LIST_ENTRY(vslm_page) hash_link;
 };
@@ -488,22 +489,18 @@ vslm_hash_remove(struct vbdev_vslm *vslm, struct vslm_page *page)
 static void
 vslm_lru_touch(struct vbdev_vslm *vslm, struct vslm_page *page)
 {
-	struct vslm_page *iter;
-
-	TAILQ_FOREACH(iter, &vslm->lru_list, lru_link) {
-		if (iter == page) {
-			TAILQ_REMOVE(&vslm->lru_list, page, lru_link);
-			break;
-		}
+	if (page->in_lru) {
+		TAILQ_REMOVE(&vslm->lru_list, page, lru_link);
 	}
-
 	TAILQ_INSERT_TAIL(&vslm->lru_list, page, lru_link);
+	page->in_lru = true;
 }
 
 static void
 vslm_lru_remove(struct vbdev_vslm *vslm, struct vslm_page *page)
 {
 	TAILQ_REMOVE(&vslm->lru_list, page, lru_link);
+	page->in_lru = false;
 }
 
 static struct vslm_page *
@@ -527,6 +524,7 @@ vslm_pick_victim(struct vbdev_vslm *vslm)
 	TAILQ_FOREACH(page, &vslm->lru_list, lru_link) {
 		if (!page->is_busy) {
 			TAILQ_REMOVE(&vslm->lru_list, page, lru_link);
+			page->in_lru = false;
 			return page;
 		}
 	}
@@ -669,8 +667,19 @@ vslm_submit_sync_base_io(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 		return rc;
 	}
 
-	while (!ctx.done) {
-		spdk_thread_poll(thread, 0, 0);
+	{
+		uint64_t start_ticks = spdk_get_ticks();
+		uint64_t hz = spdk_get_ticks_hz();
+		bool warned = false;
+
+		while (!ctx.done) {
+			spdk_thread_poll(thread, 0, 0);
+			if (!warned && hz > 0 &&
+			    (spdk_get_ticks() - start_ticks) >= hz * 30) {
+				SPDK_ERRLOG("vSLM sync base I/O pending >30s — possible backing device hang\n");
+				warned = true;
+			}
+		}
 	}
 
 	if (is_write && submitted && ctx.status == 0) {

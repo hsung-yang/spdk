@@ -51,8 +51,9 @@ struct cpcs_exec_context {
 	uint64_t                        cparam2;    /* CDW12-13 */
 
 	/* Data buffer (from DPTR) */
-	void                           *data_buffer;
-	uint32_t                        data_len;   /* DLEN */
+	void                           *data_buffer;      /* current read position (may be advanced past inline range descriptors) */
+	void                           *data_buffer_base; /* original allocation base; used for free() when data_buffer_owned */
+	uint32_t                        data_len;   /* DLEN remaining after data_buffer advancement */
 	bool                            data_buffer_owned;
 
 	/* Output */

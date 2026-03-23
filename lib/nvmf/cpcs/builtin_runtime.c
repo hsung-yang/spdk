@@ -139,11 +139,16 @@ _builtin_execute_vector_float_direct(const struct cpcs_exec_context *ctx, uint16
 			rhs_norm += rhs * rhs;
 		}
 
-		result = dot / sqrtf(lhs_norm * rhs_norm);
-		if (result < -1.0f) {
-			result = -1.0f;
-		} else if (result > 1.0f) {
-			result = 1.0f;
+		float denom = sqrtf(lhs_norm * rhs_norm);
+		if (denom == 0.0f) {
+			result = 0.0f;
+		} else {
+			result = dot / denom;
+			if (result < -1.0f) {
+				result = -1.0f;
+			} else if (result > 1.0f) {
+				result = 1.0f;
+			}
 		}
 	} else {
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
