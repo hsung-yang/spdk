@@ -13,6 +13,7 @@
 #include "spdk/bdev_slm.h"
 #include "spdk/endian.h"
 #include "spdk/log.h"
+#include <math.h>
 
 struct cpcs_builtin_memcpy_desc {
 	uint64_t src_mr_id;
@@ -36,7 +37,168 @@ struct cpcs_builtin_sum64_desc {
 	uint64_t len;
 };
 
+struct cpcs_builtin_multi_agg64_result {
+	uint64_t count;
+	double sum;
+	double min;
+	double max;
+};
+
 #define CPCS_BUILTIN_IO_CHUNK (64 * 1024)
+
+static bool
+_builtin_has_direct_data(const struct cpcs_exec_context *ctx)
+{
+	return ctx != NULL && ctx->resolved_range_count == 0;
+}
+
+static int
+_builtin_execute_reduce64_direct(const struct cpcs_exec_context *ctx, uint16_t pind, uint64_t *return_value)
+{
+	const uint64_t *vals;
+	uint64_t result;
+	size_t count;
+	size_t i;
+
+	if (ctx == NULL || ctx->data_buffer == NULL || return_value == NULL) {
+		return -EINVAL;
+	}
+	if (ctx->data_len == 0 || (ctx->data_len % sizeof(uint64_t)) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	vals = (const uint64_t *)ctx->data_buffer;
+	count = ctx->data_len / sizeof(uint64_t);
+	result = vals[0];
+
+	if (pind == CPCS_BUILTIN_PIND_SUM64) {
+		result = 0;
+		for (i = 0; i < count; i++) {
+			result += vals[i];
+		}
+	} else if (pind == CPCS_BUILTIN_PIND_MAX64) {
+		for (i = 1; i < count; i++) {
+			if (vals[i] > result) {
+				result = vals[i];
+			}
+		}
+	} else if (pind == CPCS_BUILTIN_PIND_MIN64) {
+		for (i = 1; i < count; i++) {
+			if (vals[i] < result) {
+				result = vals[i];
+			}
+		}
+	} else {
+		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
+	}
+
+	*return_value = result;
+	return 0;
+}
+
+static int
+_builtin_execute_vector_float_direct(const struct cpcs_exec_context *ctx, uint16_t pind, uint64_t *return_value)
+{
+	const float *vals;
+	size_t count;
+	size_t half;
+	float result = 0.0f;
+	uint32_t bits = 0;
+	size_t i;
+
+	if (ctx == NULL || ctx->data_buffer == NULL || return_value == NULL) {
+		return -EINVAL;
+	}
+	if (ctx->data_len == 0 || (ctx->data_len % (2 * sizeof(float))) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	vals = (const float *)ctx->data_buffer;
+	count = ctx->data_len / sizeof(float);
+	half = count / 2;
+
+	if (pind == CPCS_BUILTIN_PIND_DOT_PRODUCT) {
+		for (i = 0; i < half; i++) {
+			result += vals[i] * vals[i + half];
+		}
+	} else if (pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ) {
+		for (i = 0; i < half; i++) {
+			float diff = vals[i] - vals[i + half];
+			result += diff * diff;
+		}
+	} else if (pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY) {
+		float dot = 0.0f;
+		float lhs_norm = 0.0f;
+		float rhs_norm = 0.0f;
+
+		for (i = 0; i < half; i++) {
+			float lhs = vals[i];
+			float rhs = vals[i + half];
+			dot += lhs * rhs;
+			lhs_norm += lhs * lhs;
+			rhs_norm += rhs * rhs;
+		}
+
+		result = dot / sqrtf(lhs_norm * rhs_norm);
+		if (result < -1.0f) {
+			result = -1.0f;
+		} else if (result > 1.0f) {
+			result = 1.0f;
+		}
+	} else {
+		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
+	}
+
+	memcpy(&bits, &result, sizeof(bits));
+	*return_value = (uint64_t)bits;
+	return 0;
+}
+
+static int
+_builtin_execute_multi_agg64_direct(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	struct cpcs_builtin_multi_agg64_result result;
+	const double *vals;
+	uint8_t *out;
+	size_t input_len;
+	size_t count;
+	size_t i;
+
+	if (ctx == NULL || ctx->data_buffer == NULL || return_value == NULL) {
+		return -EINVAL;
+	}
+	if (ctx->data_len <= sizeof(result)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	input_len = ctx->data_len - sizeof(result);
+	if (input_len == 0 || (input_len % sizeof(double)) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	vals = (const double *)ctx->data_buffer;
+	count = input_len / sizeof(double);
+	result.count = count;
+	result.sum = 0.0;
+	result.min = vals[0];
+	result.max = vals[0];
+
+	for (i = 0; i < count; i++) {
+		double value = vals[i];
+		result.sum += value;
+		if (value < result.min) {
+			result.min = value;
+		}
+		if (value > result.max) {
+			result.max = value;
+		}
+	}
+
+	out = (uint8_t *)ctx->data_buffer + input_len;
+	memcpy(out, &result, sizeof(result));
+	*return_value = sizeof(result);
+	return 0;
+}
 
 static int
 _cpcs_exec_resolve_range(const struct cpcs_exec_context *ctx,
@@ -264,6 +426,10 @@ _builtin_execute_sum64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 	size_t i;
 	int rc;
 
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_reduce64_direct(ctx, CPCS_BUILTIN_PIND_SUM64, return_value);
+	}
+
 	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
@@ -322,6 +488,10 @@ _builtin_execute_max64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 	bool initialized = false;
 	size_t i;
 	int rc;
+
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_reduce64_direct(ctx, CPCS_BUILTIN_PIND_MAX64, return_value);
+	}
 
 	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
@@ -384,6 +554,10 @@ _builtin_execute_min64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 	bool initialized = false;
 	size_t i;
 	int rc;
+
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_reduce64_direct(ctx, CPCS_BUILTIN_PIND_MIN64, return_value);
+	}
 
 	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
@@ -459,6 +633,10 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	size_t i;
 	int rc;
 
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_DOT_PRODUCT, return_value);
+	}
+
 	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
@@ -532,6 +710,33 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	memcpy(&sum_bits, &sum, sizeof(sum_bits));
 	*return_value = (uint64_t)sum_bits;
 	return 0;
+}
+
+static int
+_builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	if (!_builtin_has_direct_data(ctx)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	return _builtin_execute_multi_agg64_direct(ctx, return_value);
+}
+
+static int
+_builtin_execute_l2_distance_sq(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	if (!_builtin_has_direct_data(ctx)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_L2_DISTANCE_SQ, return_value);
+}
+
+static int
+_builtin_execute_cosine_similarity(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	if (!_builtin_has_direct_data(ctx)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_COSINE_SIMILARITY, return_value);
 }
 
 static int
@@ -665,6 +870,12 @@ builtin_execute(struct cpcs_program *prog, struct cpcs_exec_context *ctx, uint64
 		return _builtin_execute_memcpy_inline(ctx, return_value);
 	case CPCS_BUILTIN_PIND_RLE_COMPRESS:
 		return _builtin_execute_rle_compress(ctx, return_value);
+	case CPCS_BUILTIN_PIND_MULTI_AGG64:
+		return _builtin_execute_multi_agg64(ctx, return_value);
+	case CPCS_BUILTIN_PIND_L2_DISTANCE_SQ:
+		return _builtin_execute_l2_distance_sq(ctx, return_value);
+	case CPCS_BUILTIN_PIND_COSINE_SIMILARITY:
+		return _builtin_execute_cosine_similarity(ctx, return_value);
 	default:
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
 	}
