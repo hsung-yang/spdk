@@ -326,10 +326,12 @@ cpcs_program_validate(struct cpcs_program *prog)
 
 	/* Initialize runtime context if not already done */
 	if (!prog->runtime) {
-		rc = runtime->init(prog);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to initialize runtime: %d\n", rc);
-			return rc;
+		if (runtime->init) {
+			rc = runtime->init(prog);
+			if (rc != 0) {
+				SPDK_ERRLOG("Failed to initialize runtime: %d\n", rc);
+				return rc;
+			}
 		}
 	}
 

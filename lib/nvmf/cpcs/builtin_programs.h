@@ -52,7 +52,7 @@ enum cpcs_builtin_program {
 #define CPCS_BUILTIN_PIND_MULTI_AGG64   9u
 #define CPCS_BUILTIN_PIND_L2_DISTANCE_SQ 10u
 #define CPCS_BUILTIN_PIND_COSINE_SIMILARITY 11u
-#define CPCS_BUILTIN_PIND_DIRECT_NS_AGG     0x20u
+#define CPCS_BUILTIN_PIND_DIRECT_NS_AGG     12u
 
 /* PUID values are a stable ABI for experiments (host can refer to them). */
 #define CPCS_BUILTIN_PUID_MEMCPY  0x0000000000000001ull

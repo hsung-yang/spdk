@@ -31,6 +31,14 @@ typedef uint64_t (*ubpf_jit_fn)(void *mem, size_t mem_len);
 #define EBPF_VM_MEM_SIZE (1024 * 1024)
 
 /*
+ * Per-execution VM memory bounds for helper validation.
+ * SPDK reactors are single-threaded, so thread-local is sufficient.
+ */
+static __thread struct cpcs_exec_context *g_ebpf_exec_ctx;
+static __thread uint8_t *g_ebpf_vm_mem;
+static __thread size_t   g_ebpf_vm_mem_size;
+
+/*
  * eBPF Helper Functions
  * These are callable from eBPF programs
  */
@@ -83,10 +91,18 @@ static uint64_t
 helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 		uint64_t len, uint64_t buf_ptr)
 {
-	struct cpcs_exec_context *exec_ctx = ctx;
+	struct cpcs_exec_context *exec_ctx = g_ebpf_exec_ctx;
+	uint8_t *mem = g_ebpf_vm_mem;
+	size_t mem_size = g_ebpf_vm_mem_size;
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
 	int rc;
+
+	if (mem == NULL || buf_ptr < (uint64_t)mem ||
+	    buf_ptr + len > (uint64_t)mem + mem_size) {
+		SPDK_ERRLOG("SLM read: buf_ptr=0x%lx len=%lu outside VM memory\n", buf_ptr, len);
+		return (uint64_t)-1;
+	}
 
 	if (mr_id == 0) {
 		/* Read from input data buffer */
@@ -125,10 +141,19 @@ static uint64_t
 helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 		 uint64_t len, uint64_t buf_ptr)
 {
-	struct cpcs_exec_context *exec_ctx = ctx;
+	struct cpcs_exec_context *exec_ctx = g_ebpf_exec_ctx;
+	uint8_t *mem = g_ebpf_vm_mem;
+	size_t mem_size = g_ebpf_vm_mem_size;
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
 	int rc;
+
+	/* Validate buf_ptr is within VM memory sandbox */
+	if (mem == NULL || buf_ptr < (uint64_t)mem ||
+	    buf_ptr + len > (uint64_t)mem + mem_size) {
+		SPDK_ERRLOG("SLM write: buf_ptr=0x%lx len=%lu outside VM memory\n", buf_ptr, len);
+		return (uint64_t)-1;
+	}
 
 	if (mr_id == 0) {
 		/* Cannot write to input data buffer */
@@ -162,7 +187,7 @@ static uint64_t
 helper_get_param(void *ctx, uint64_t param_id, uint64_t unused1,
 		 uint64_t unused2, uint64_t unused3)
 {
-	struct cpcs_exec_context *exec_ctx = ctx;
+	struct cpcs_exec_context *exec_ctx = g_ebpf_exec_ctx;
 
 	switch (param_id) {
 	case 1:
@@ -184,8 +209,17 @@ static uint64_t
 helper_log(void *ctx, uint64_t level, uint64_t msg_ptr,
 	   uint64_t msg_len, uint64_t unused)
 {
+	uint8_t *mem = g_ebpf_vm_mem;
+	size_t mem_size = g_ebpf_vm_mem_size;
 	char msg[256];
 	size_t copy_len = msg_len < sizeof(msg) - 1 ? msg_len : sizeof(msg) - 1;
+
+	/* Validate msg_ptr is within VM memory sandbox */
+	if (mem == NULL || msg_ptr < (uint64_t)mem ||
+	    msg_ptr + msg_len > (uint64_t)mem + mem_size) {
+		SPDK_ERRLOG("eBPF log: msg_ptr=0x%lx len=%lu outside VM memory\n", msg_ptr, msg_len);
+		return (uint64_t)-1;
+	}
 
 	memcpy(msg, (void *)msg_ptr, copy_len);
 	msg[copy_len] = '\0';
@@ -351,12 +385,33 @@ ebpf_execute(struct cpcs_program *prog,
 		return -ENOMEM;
 	}
 
-	/* Copy execution context to VM memory (first part) */
-	size_t ctx_size = sizeof(*exec_ctx);
-	if (ctx_size > ctx->mem_size) {
-		ctx_size = ctx->mem_size;
+	/*
+	 * Copy only safe data fields into VM memory.  Do NOT expose raw
+	 * kernel/process pointers (ns, program, mrs, req, data_buffer) to
+	 * the eBPF sandbox — an eBPF program could read them and pass them
+	 * to helper functions.
+	 */
+	struct {
+		uint64_t cparam1;
+		uint64_t cparam2;
+		uint32_t data_len;
+		uint32_t _pad;
+	} safe_ctx = {
+		.cparam1  = exec_ctx->cparam1,
+		.cparam2  = exec_ctx->cparam2,
+		.data_len = exec_ctx->data_len,
+	};
+	size_t safe_size = sizeof(safe_ctx);
+	if (safe_size > ctx->mem_size) {
+		safe_size = ctx->mem_size;
 	}
-	memcpy(mem, exec_ctx, ctx_size);
+	memset(mem, 0, ctx->mem_size);
+	memcpy(mem, &safe_ctx, safe_size);
+
+	/* Set thread-local state for helper functions */
+	g_ebpf_exec_ctx    = exec_ctx;
+	g_ebpf_vm_mem      = mem;
+	g_ebpf_vm_mem_size = ctx->mem_size;
 
 	/* Execute program */
 	if (ctx->jit_enabled && ctx->jit_func) {
@@ -376,6 +431,11 @@ ebpf_execute(struct cpcs_program *prog,
 		SPDK_DEBUGLOG(nvmf_cpcs, "eBPF program %u executed (interpreter) returned 0x%lx\n",
 			      prog->pind, ret);
 	}
+
+	/* Clear thread-local state */
+	g_ebpf_exec_ctx    = NULL;
+	g_ebpf_vm_mem      = NULL;
+	g_ebpf_vm_mem_size = 0;
 
 	free(mem);
 #else

@@ -511,6 +511,7 @@ vslm_get_free_page(struct vbdev_vslm *vslm)
 	page = TAILQ_FIRST(&vslm->free_list);
 	if (page) {
 		TAILQ_REMOVE(&vslm->free_list, page, lru_link);
+		page->in_lru = false;
 	}
 
 	return page;

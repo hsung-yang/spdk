@@ -173,6 +173,9 @@ cpcs_mrs_get(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
 
 	TAILQ_FOREACH(mrs, &ns->mrs_list, link) {
 		if (mrs->rsid == rsid) {
+			/* Acquire ref while still holding lock to prevent TOCTOU race
+			 * with cpcs_mrs_delete on another thread. */
+			__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
 			pthread_mutex_unlock(&ns->lock);
 			return mrs;
 		}

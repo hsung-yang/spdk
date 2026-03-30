@@ -165,7 +165,7 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 	pthread_mutex_unlock(&ns->lock);
 
 	if (rc == 0) {
-		SPDK_NOTICELOG("Installed CPCS built-ins: pind 0-11, 0x20 (memcpy..cosine_similarity, direct_ns_agg)\n");
+		SPDK_NOTICELOG("Installed CPCS built-ins: pind 0-12 (memcpy..cosine_similarity, direct_ns_agg)\n");
 	}
 
 	return rc;

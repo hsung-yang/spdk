@@ -289,17 +289,11 @@ cpcs_execute_setup_memory(struct cpcs_exec_context *ctx)
 	struct spdk_nvme_cpcs_memory_range_descriptor *descriptors;
 
 	if (ctx->rsid != 0) {
-		/* Use pre-created Memory Range Set */
+		/* Use pre-created Memory Range Set (cpcs_mrs_get acquires a ref atomically) */
 		ctx->mrs = cpcs_mrs_get(ctx->ns, ctx->rsid);
 		if (!ctx->mrs) {
 			SPDK_ERRLOG("MRS %u not found\n", ctx->rsid);
 			return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET_ID;
-		}
-
-		rc = cpcs_mrs_acquire(ctx->mrs);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to acquire MRS %u: %d\n", ctx->rsid, rc);
-			return rc;
 		}
 
 		SPDK_DEBUGLOG(nvmf_cpcs, "Acquired MRS %u for execution\n", ctx->rsid);
