@@ -295,7 +295,6 @@ static int
 ebpf_validate(struct cpcs_program *prog)
 {
 	struct cpcs_ebpf_ctx *ctx = (struct cpcs_ebpf_ctx *)prog->runtime;
-	int rc = 0;
 
 	if (!ctx) {
 		SPDK_ERRLOG("No runtime context\n");
@@ -309,6 +308,7 @@ ebpf_validate(struct cpcs_program *prog)
 	}
 
 #if UBPF_AVAILABLE
+	int rc;
 	char *errmsg = NULL;
 
 	/* Load eBPF bytecode into VM */
@@ -370,7 +370,6 @@ ebpf_execute(struct cpcs_program *prog,
 {
 	struct cpcs_ebpf_ctx *ctx = (struct cpcs_ebpf_ctx *)prog->runtime;
 	uint64_t ret = 0;
-	int exec_rc = 0;
 
 	if (!ctx) {
 		SPDK_ERRLOG("No runtime context\n");
@@ -378,6 +377,8 @@ ebpf_execute(struct cpcs_program *prog,
 	}
 
 #if UBPF_AVAILABLE
+	int exec_rc;
+
 	/* Allocate VM memory */
 	void *mem = malloc(ctx->mem_size);
 	if (!mem) {
