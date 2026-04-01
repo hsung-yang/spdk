@@ -46,22 +46,27 @@ NVMe completions.
 
 ### 1.2 Protocol Hierarchy
 
-```
-Initiator Side                          Target Side
-─────────────────────────────────────────────────────────
-┌──────────────────┐                ┌──────────────────────┐
-│  NVMe Driver     │                │  SPDK NVMe-oF Target  │
-│  (host kernel or │                │  (spdk_nvmf_tgt)      │
-│   SPDK nvme lib) │                │                       │
-└────────┬─────────┘                └──────────┬───────────┘
-         │  NVMe Commands (Fabrics Capsules)    │
-         │◄────────────────────────────────────►│
-┌────────┴─────────┐                ┌──────────┴───────────┐
-│  Fabric Driver   │                │  Transport Layer      │
-│  (RDMA/TCP/FC)   │                │  (RDMA/TCP/FC)        │
-└────────┬─────────┘                └──────────┬───────────┘
-         │  Network Fabric                      │
-         └──────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Initiator["Initiator Side"]
+        NVME_DRV["NVMe Driver\n(host kernel or SPDK nvme lib)"]
+        FAB_DRV["Fabric Driver\n(RDMA/TCP/FC)"]
+        NVME_DRV --> FAB_DRV
+    end
+
+    subgraph Target["Target Side"]
+        NVMF_TGT["SPDK NVMe-oF Target\n(spdk_nvmf_tgt)"]
+        TRANS["Transport Layer\n(RDMA/TCP/FC)"]
+        NVMF_TGT --> TRANS
+    end
+
+    NVME_DRV <-->|"NVMe Commands\n(Fabrics Capsules)"| NVMF_TGT
+    FAB_DRV <-->|"Network Fabric"| TRANS
+
+    style NVME_DRV fill:#e1f5ff,stroke:#333
+    style NVMF_TGT fill:#e1f5ff,stroke:#333
+    style FAB_DRV fill:#fff4e1,stroke:#333
+    style TRANS fill:#fff4e1,stroke:#333
 ```
 
 ### 1.3 NVMe-oF Fabric Commands
@@ -89,12 +94,30 @@ NVMe-oF maintains the NVMe queue model:
 - All QPs connecting to the same subsystem from the same host are grouped under a
   **Controller** (a virtual NVMe controller).
 
-```
-Host (Initiator)
-  ├── Admin QP  (QID=0)  ──►  Controller (cntlid=N)
-  ├── I/O QP   (QID=1)  ──►  Controller (cntlid=N)
-  ├── I/O QP   (QID=2)  ──►  Controller (cntlid=N)
-  └── I/O QP   (QID=N)  ──►  Controller (cntlid=N)
+```mermaid
+graph LR
+    HOST["Host (Initiator)"]
+    AQP["Admin QP (QID=0)"]
+    IQP1["I/O QP (QID=1)"]
+    IQP2["I/O QP (QID=2)"]
+    IQPN["I/O QP (QID=N)"]
+    CTRLR["Controller (cntlid=N)"]
+
+    HOST --> AQP
+    HOST --> IQP1
+    HOST --> IQP2
+    HOST --> IQPN
+    AQP --> CTRLR
+    IQP1 --> CTRLR
+    IQP2 --> CTRLR
+    IQPN --> CTRLR
+
+    style HOST fill:#e1f5ff,stroke:#333
+    style CTRLR fill:#e1ffe1,stroke:#333
+    style AQP fill:#fff4e1,stroke:#333
+    style IQP1 fill:#fff4e1,stroke:#333
+    style IQP2 fill:#fff4e1,stroke:#333
+    style IQPN fill:#fff4e1,stroke:#333
 ```
 
 ### 1.5 NQN - NVMe Qualified Name
@@ -150,11 +173,15 @@ struct spdk_nvmf_subsystem *spdk_nvmf_subsystem_create(
 
 Subsystem states (from `lib/nvmf/nvmf_internal.h`):
 
-```
-INACTIVE ──► ACTIVATING ──► ACTIVE ──► PAUSING ──► PAUSED
-                                             ▲            │
-                                             └────────────┘ (RESUMING)
-ACTIVE ──► DEACTIVATING ──► INACTIVE
+```mermaid
+stateDiagram-v2
+    INACTIVE --> ACTIVATING
+    ACTIVATING --> ACTIVE
+    ACTIVE --> PAUSING
+    PAUSING --> PAUSED
+    PAUSED --> ACTIVE : RESUMING
+    ACTIVE --> DEACTIVATING
+    DEACTIVATING --> INACTIVE
 ```
 
 State transitions are explicit and asynchronous. The subsystem must be paused before
@@ -431,43 +458,22 @@ The `3x` multiplier arises because each I/O request may require:
 
 The RDMA transport uses an explicit state machine for each request:
 
-```
-FREE
-  │
-  ▼
-NEW  ──► NEED_BUFFER ──► HAVE_BUFFER
-                              │
-              ┌───────────────┤
-              │               │
-              ▼               ▼
-  DATA_TRANSFER_TO_CONTROLLER_PENDING
-              │
-              ▼
-  TRANSFERRING_HOST_TO_CONTROLLER  (RDMA READ in flight)
-              │
-              ▼
-  READY_TO_EXECUTE
-              │
-              ▼
-  EXECUTING   (bdev I/O in flight)
-              │
-              ▼
-  EXECUTED
-              │
-              ▼
-  DATA_TRANSFER_TO_HOST_PENDING
-              │
-              ▼
-  TRANSFERRING_CONTROLLER_TO_HOST (RDMA WRITE in flight)
-              │
-              ▼
-  READY_TO_COMPLETE_PENDING
-              │
-              ▼
-  COMPLETING  (Send WR for completion response in flight)
-              │
-              ▼
-  COMPLETED ──► FREE
+```mermaid
+stateDiagram-v2
+    FREE --> NEW
+    NEW --> NEED_BUFFER
+    NEED_BUFFER --> HAVE_BUFFER
+    HAVE_BUFFER --> DATA_TRANSFER_TO_CONTROLLER_PENDING
+    DATA_TRANSFER_TO_CONTROLLER_PENDING --> TRANSFERRING_HOST_TO_CONTROLLER : RDMA READ in flight
+    TRANSFERRING_HOST_TO_CONTROLLER --> READY_TO_EXECUTE
+    READY_TO_EXECUTE --> EXECUTING : bdev I/O in flight
+    EXECUTING --> EXECUTED
+    EXECUTED --> DATA_TRANSFER_TO_HOST_PENDING
+    DATA_TRANSFER_TO_HOST_PENDING --> TRANSFERRING_CONTROLLER_TO_HOST : RDMA WRITE in flight
+    TRANSFERRING_CONTROLLER_TO_HOST --> READY_TO_COMPLETE_PENDING
+    READY_TO_COMPLETE_PENDING --> COMPLETING : Send WR for completion response
+    COMPLETING --> COMPLETED
+    COMPLETED --> FREE
 ```
 
 ### 4.4 Memory Registration Strategy
@@ -492,20 +498,20 @@ memory per-I/O.
 
 ### 4.5 RDMA Transport Data Flow (Read I/O)
 
-```
-Initiator                                    Target (SPDK)
-─────────────────────────────────────────────────────────────
-1. Send(NVMe Read CMD capsule) ──────────────►
-                                              Receive capsule
-                                              Allocate request
-                                              Allocate buffer
-2.               ◄─────────────── RDMA READ (pull data from initiator)
-   (for write:    RDMA WRITE to push data to initiator)
-                                              Wait for RDMA completion
-                                              Submit bdev I/O
-                                              Wait for bdev completion
-3.               ◄─────────────── Send(NVMe Completion capsule)
-   Complete I/O
+```mermaid
+sequenceDiagram
+    participant I as Initiator
+    participant T as Target (SPDK)
+
+    I->>T: 1. Send(NVMe Read CMD capsule)
+    Note right of T: Receive capsule
+    Note right of T: Allocate request + buffer
+    T->>I: 2. RDMA WRITE (push data to initiator)
+    Note right of T: Wait for RDMA completion
+    Note right of T: Submit bdev I/O
+    Note right of T: Wait for bdev completion
+    T->>I: 3. Send(NVMe Completion capsule)
+    Note left of I: Complete I/O
 ```
 
 ### 4.6 InfiniBand, RoCE, and iWARP
@@ -530,18 +536,21 @@ Performance ranking: InfiniBand ~ RoCE v2 > iWARP.
 NVMe/TCP (defined in NVMe-oF TP 8000) encapsulates NVMe-oF capsules in TCP using
 a PDU (Protocol Data Unit) format. Each PDU has:
 
-```
-┌─────────────────────────────┐
-│  Common Header (8 bytes)    │  PDU type, flags, hlen, pdo, plen
-├─────────────────────────────┤
-│  PDU-specific Header        │  Varies by PDU type
-├─────────────────────────────┤
-│  Header Digest (optional)   │  CRC32C of header
-├─────────────────────────────┤
-│  Data (optional)            │  Inline data for capsules
-├─────────────────────────────┤
-│  Data Digest (optional)     │  CRC32C of data
-└─────────────────────────────┘
+```mermaid
+graph TD
+    CH["Common Header (8 bytes)\nPDU type, flags, hlen, pdo, plen"]
+    PSH["PDU-specific Header\nVaries by PDU type"]
+    HD["Header Digest (optional)\nCRC32C of header"]
+    DATA["Data (optional)\nInline data for capsules"]
+    DD["Data Digest (optional)\nCRC32C of data"]
+
+    CH --> PSH --> HD --> DATA --> DD
+
+    style CH fill:#fff4e1,stroke:#333
+    style PSH fill:#fff4e1,stroke:#333
+    style HD fill:#f0f0f0,stroke:#333
+    style DATA fill:#e1f5ff,stroke:#333
+    style DD fill:#f0f0f0,stroke:#333
 ```
 
 PDU types:
@@ -578,41 +587,29 @@ sent inline with the command capsule, eliminating the R2T round-trip.
 
 The TCP transport has a detailed state machine for each request:
 
-```
-FREE
- │
- ▼
-NEW
- │
- ▼
-NEED_BUFFER ──► HAVE_BUFFER
-                    │
-          ┌─────────┴──────────┐
-          │                    │
-          ▼                    ▼
-AWAITING_ZCOPY_START    TRANSFERRING_HOST_TO_CONTROLLER
-          │                    │
-          ▼                    ▼
-ZCOPY_START_COMPLETED   AWAITING_R2T_ACK
-          │                    │
-          └─────────┬──────────┘
-                    ▼
-             READY_TO_EXECUTE
-                    │
-                    ▼
-               EXECUTING
-                    │
-                    ▼
-               EXECUTED
-                    │
-                    ▼
-           READY_TO_COMPLETE
-                    │
-                    ▼
-  TRANSFERRING_CONTROLLER_TO_HOST
-                    │
-                    ▼
-                 COMPLETED ──► FREE
+```mermaid
+stateDiagram-v2
+    FREE --> NEW
+    NEW --> NEED_BUFFER
+    NEED_BUFFER --> HAVE_BUFFER
+
+    state branch <<choice>>
+    HAVE_BUFFER --> branch
+    branch --> AWAITING_ZCOPY_START : zero-copy path
+    branch --> TRANSFERRING_HOST_TO_CONTROLLER : standard path
+
+    AWAITING_ZCOPY_START --> ZCOPY_START_COMPLETED
+    TRANSFERRING_HOST_TO_CONTROLLER --> AWAITING_R2T_ACK
+
+    ZCOPY_START_COMPLETED --> READY_TO_EXECUTE
+    AWAITING_R2T_ACK --> READY_TO_EXECUTE
+
+    READY_TO_EXECUTE --> EXECUTING
+    EXECUTING --> EXECUTED
+    EXECUTED --> READY_TO_COMPLETE
+    READY_TO_COMPLETE --> TRANSFERRING_CONTROLLER_TO_HOST
+    TRANSFERRING_CONTROLLER_TO_HOST --> COMPLETED
+    COMPLETED --> FREE
 ```
 
 Zero-copy (ZCOPY) states apply when the underlying bdev supports zcopy and the
@@ -621,23 +618,24 @@ directly, avoiding a copy between the bdev and the network layer.
 
 ### 5.4 TCP Connection Establishment
 
-```
-Initiator                            Target
-──────────────────────────────────────────────────
-TCP connect ──────────────────────►
-                                    Accept socket
-Send ICReq PDU ──────────────────►  (Initialize Connection Request)
-                                    Negotiate params (MAXH2CDATA, MAXR2T, etc.)
-             ◄─────────────────── Send ICResp PDU
-Send Connect capsule (Admin QP) ──► (NVMe-oF Fabric Connect command)
-                                    Create controller
-                                    Assign cntlid
-             ◄─────────────────── Send Connect response (cntlid in response)
-Admin QP established
-Send Connect capsule (I/O QP N) ──► (second Connect for I/O queue)
-             ◄─────────────────── Connect response
-I/O QP established
-NVMe commands flow normally...
+```mermaid
+sequenceDiagram
+    participant I as Initiator
+    participant T as Target (SPDK)
+
+    I->>T: TCP connect
+    Note right of T: Accept socket
+    I->>T: Send ICReq PDU (Initialize Connection Request)
+    Note right of T: Negotiate params (MAXH2CDATA, MAXR2T, etc.)
+    T->>I: Send ICResp PDU
+    I->>T: Send Connect capsule (Admin QP) - Fabric Connect command
+    Note right of T: Create controller, assign cntlid
+    T->>I: Connect response (cntlid in response)
+    Note over I: Admin QP established
+    I->>T: Send Connect capsule (I/O QP N)
+    T->>I: Connect response
+    Note over I: I/O QP established
+    Note over I,T: NVMe commands flow normally...
 ```
 
 ### 5.5 TCP Socket Layer
@@ -686,13 +684,21 @@ Key differences from RDMA and TCP:
 
 ### 6.2 FC Transport Structure
 
-```
-SPDK NVMe-oF Target
-  └── FC Transport (fc.c, fc_ls.c)
-        ├── LS (Link Service) handler (fc_ls.c)
-        │     Handles: PLOGI, FLOGI, PRLI, etc.
-        └── I/O handler (fc.c)
-              Handles: FCP commands mapped to NVMe
+```mermaid
+graph TD
+    TGT["SPDK NVMe-oF Target"]
+    FC["FC Transport (fc.c, fc_ls.c)"]
+    LS["LS (Link Service) handler (fc_ls.c)\nHandles: PLOGI, FLOGI, PRLI, etc."]
+    IO["I/O handler (fc.c)\nHandles: FCP commands mapped to NVMe"]
+
+    TGT --> FC
+    FC --> LS
+    FC --> IO
+
+    style TGT fill:#e1f5ff,stroke:#333
+    style FC fill:#fff4e1,stroke:#333
+    style LS fill:#ffe1f5,stroke:#333
+    style IO fill:#ffe1f5,stroke:#333
 ```
 
 The FC transport in SPDK is used with SoC-based FC adapters that expose a
@@ -731,30 +737,33 @@ enum spdk_nvmf_qpair_state {
 
 ### 7.2 Connection Establishment Flow
 
-```
-Transport accept() detects new connection
-    │
-    ▼
-Transport creates qpair (state: UNINITIALIZED)
-    │
-    ▼
-Target assigns qpair to a poll group (round-robin or custom policy)
-    │
-    ▼
-poll_group_add() called on transport
-    │
-    ▼
-NVMe-oF Connect command received (state: CONNECTING)
-    │
-    ├── Is this Admin QP (QID=0)?
-    │     ├── YES: Create new Controller, assign cntlid
-    │     └── NO:  Find existing Controller by hostnqn+cntlid
-    │
-    ▼
-Authentication (if configured, state: AUTHENTICATING)
-    │
-    ▼
-State: ENABLED - I/O can begin
+```mermaid
+flowchart TD
+    A["Transport accept() detects new connection"]
+    B["Transport creates qpair\n(state: UNINITIALIZED)"]
+    C["Target assigns qpair to a poll group\n(round-robin or custom policy)"]
+    D["poll_group_add() called on transport"]
+    E["NVMe-oF Connect command received\n(state: CONNECTING)"]
+    F{"Is this Admin QP\n(QID=0)?"}
+    G["Create new Controller,\nassign cntlid"]
+    H["Find existing Controller\nby hostnqn+cntlid"]
+    I["Authentication\n(if configured, state: AUTHENTICATING)"]
+    J["State: ENABLED\nI/O can begin"]
+
+    A --> B --> C --> D --> E --> F
+    F -->|YES| G
+    F -->|NO| H
+    G --> I
+    H --> I
+    I --> J
+
+    style A fill:#fff4e1,stroke:#333
+    style E fill:#fff4e1,stroke:#333
+    style F fill:#f0f0f0,stroke:#333
+    style G fill:#e1ffe1,stroke:#333
+    style H fill:#e1ffe1,stroke:#333
+    style I fill:#ffe1f5,stroke:#333
+    style J fill:#e1f5ff,stroke:#333
 ```
 
 ### 7.3 Keep-Alive and Association Timeout
@@ -882,10 +891,22 @@ struct spdk_nvmf_listen_opts {
 
 This enables active-active and active-passive multipath configurations:
 
-```
-Host
- ├── Path 1 ──► SPDK Target A (ANA: Optimized)    ──► Shared bdev
- └── Path 2 ──► SPDK Target B (ANA: Non-Optimized) ──► Shared bdev
+```mermaid
+graph LR
+    HOST["Host"]
+    TGT_A["SPDK Target A\n(ANA: Optimized)"]
+    TGT_B["SPDK Target B\n(ANA: Non-Optimized)"]
+    BDEV["Shared bdev"]
+
+    HOST -->|"Path 1"| TGT_A
+    HOST -->|"Path 2"| TGT_B
+    TGT_A --> BDEV
+    TGT_B --> BDEV
+
+    style HOST fill:#e1f5ff,stroke:#333
+    style TGT_A fill:#e1ffe1,stroke:#333
+    style TGT_B fill:#fff4e1,stroke:#333
+    style BDEV fill:#ffe1f5,stroke:#333
 ```
 
 ### 8.4 Multipath Configuration Example
@@ -985,8 +1006,17 @@ rpc.py nvmf_discovery_add_referral \
 
 For large NVMe-oF deployments, SPDK can act as a **Central Discovery Controller**:
 
-```
-Hosts ──► CDC (SPDK Discovery Target) ──► Referrals to multiple storage targets
+```mermaid
+graph LR
+    HOSTS["Hosts"]
+    CDC["CDC\n(SPDK Discovery Target)"]
+    REF["Referrals to multiple\nstorage targets"]
+
+    HOSTS --> CDC --> REF
+
+    style HOSTS fill:#e1f5ff,stroke:#333
+    style CDC fill:#fff4e1,stroke:#333
+    style REF fill:#e1ffe1,stroke:#333
 ```
 
 The CDC aggregates the discovery information from multiple storage targets and

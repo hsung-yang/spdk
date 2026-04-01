@@ -56,18 +56,37 @@ Everything in DPDK flows from `rte_eal_init()`. If EAL initialization fails, not
 
 DPDK does not use the heap (malloc) for performance-critical allocations. Instead:
 
-```
-Physical Memory
-  ├── Huge Pages (2MB or 1GB each)
-  │     ├── Locked in RAM (no swapping)
-  │     ├── Mapped with large TLB entries (fewer TLB misses)
-  │     └── Physically contiguous within each page
-  └── Normal 4KB pages (fallback with --no-huge)
+```mermaid
+graph TD
+    PM["Physical Memory"]
+    HP["Huge Pages (2MB or 1GB each)"]
+    NP["Normal 4KB pages<br/>(fallback with --no-huge)"]
+    Locked["Locked in RAM (no swapping)"]
+    TLB["Mapped with large TLB entries<br/>(fewer TLB misses)"]
+    Contig["Physically contiguous<br/>within each page"]
 
-Huge Page Memory
-  ├── rte_malloc heap       <- general purpose allocations
-  ├── rte_memzone           <- named, statically allocated regions
-  └── rte_mempool           <- pre-allocated element pools
+    HPM["Huge Page Memory"]
+    Heap["rte_malloc heap<br/>(general purpose allocations)"]
+    MZ["rte_memzone<br/>(named, statically allocated regions)"]
+    MP["rte_mempool<br/>(pre-allocated element pools)"]
+
+    PM --> HP
+    PM --> NP
+    HP --> Locked
+    HP --> TLB
+    HP --> Contig
+
+    HPM --> Heap
+    HPM --> MZ
+    HPM --> MP
+
+    style PM fill:#f0f0f0,stroke:#333
+    style HP fill:#e1ffe1,stroke:#333
+    style NP fill:#f0f0f0,stroke:#333
+    style HPM fill:#e1ffe1,stroke:#333
+    style Heap fill:#fff4e1,stroke:#333
+    style MZ fill:#fff4e1,stroke:#333
+    style MP fill:#fff4e1,stroke:#333
 ```
 
 Huge pages matter for two reasons:
@@ -103,17 +122,21 @@ SPDK never calls DPDK functions directly from its core libraries. All DPDK calls
 
 ### 2.1 Why the Abstraction Exists
 
-```
-Application Code
-      |
-      v
-  spdk/env.h          <-- stable public API
-      |
-      v
- lib/env_dpdk/        <-- DPDK implementation
-      |
-      v
-  DPDK rte_* APIs     <-- may change between DPDK versions
+```mermaid
+graph TD
+    App["Application Code"]
+    Env["spdk/env.h<br/>(stable public API)"]
+    Lib["lib/env_dpdk/<br/>(DPDK implementation)"]
+    DPDK["DPDK rte_* APIs<br/>(may change between DPDK versions)"]
+
+    App --> Env
+    Env --> Lib
+    Lib --> DPDK
+
+    style App fill:#e1f5ff,stroke:#333
+    style Env fill:#fff4e1,stroke:#333
+    style Lib fill:#ffe1f5,stroke:#333
+    style DPDK fill:#e1ffe1,stroke:#333
 ```
 
 The abstraction serves three purposes:
@@ -178,15 +201,33 @@ spdk_mempool_lookup(const char *name)
 
 When an SPDK application starts, the initialization flow is:
 
-```
-spdk_app_start()
-  └── spdk_env_init(opts)                   [init.c]
-        ├── build_eal_cmdline(opts, ...)     [init.c - builds argv for rte_eal_init]
-        ├── rte_eal_init(argc, argv)         [DPDK EAL]
-        └── spdk_env_dpdk_post_init()        [init.c]
-              ├── pci_env_init()             [pci.c]
-              ├── mem_map_init()             [memory.c]
-              └── vtophys_init()             [memory.c]
+```mermaid
+graph TD
+    A["spdk_app_start()"]
+    B["spdk_env_init(opts) &nbsp; [init.c]"]
+    C["build_eal_cmdline(opts, ...) &nbsp; [init.c]"]
+    D["rte_eal_init(argc, argv) &nbsp; [DPDK EAL]"]
+    E["spdk_env_dpdk_post_init() &nbsp; [init.c]"]
+    F["pci_env_init() &nbsp; [pci.c]"]
+    G["mem_map_init() &nbsp; [memory.c]"]
+    H["vtophys_init() &nbsp; [memory.c]"]
+
+    A --> B
+    B --> C
+    B --> D
+    B --> E
+    E --> F
+    E --> G
+    E --> H
+
+    style A fill:#e1f5ff,stroke:#333
+    style B fill:#fff4e1,stroke:#333
+    style C fill:#ffe1f5,stroke:#333
+    style D fill:#e1ffe1,stroke:#333
+    style E fill:#ffe1f5,stroke:#333
+    style F fill:#f0f0f0,stroke:#333
+    style G fill:#f0f0f0,stroke:#333
+    style H fill:#f0f0f0,stroke:#333
 ```
 
 ### 3.2 The spdk_env_opts Structure
@@ -700,39 +741,50 @@ SPDK strongly prefers VFIO. The VFIO path is handled through DPDK's VFIO integra
 
 ### 7.3 PCI Device Lifecycle in SPDK
 
-```
-spdk_pci_device_attach(driver, user_cb, user_cb_arg, &pci_addr)
-  |
-  v
-pci.c: build "BDF" string (e.g. "0000:01:00.0")
-  |
-  v
-rte_eal_hotplug_add("pci", bdf, "")    <- ask DPDK to probe the device
-  |
-  v
-DPDK PCI bus scan triggers probe()
-  |
-  v
-pci_device_init()                      <- SPDK's probe callback
-  |
-  ├── dpdk_pci_device_get_mem_resource()  <- map BARs
-  ├── vtophys_pci_device_added()           <- register with vtophys
-  └── user callback (e.g. nvme_probe_cb)  <- application logic
+```mermaid
+flowchart TD
+    A["spdk_pci_device_attach(driver, user_cb, user_cb_arg, &pci_addr)"]
+    B["pci.c: build BDF string<br/>(e.g. 0000:01:00.0)"]
+    C["rte_eal_hotplug_add('pci', bdf, '')<br/>ask DPDK to probe the device"]
+    D["DPDK PCI bus scan triggers probe()"]
+    E["pci_device_init()<br/>SPDK's probe callback"]
+    F["dpdk_pci_device_get_mem_resource()<br/>map BARs"]
+    G["vtophys_pci_device_added()<br/>register with vtophys"]
+    H["user callback (e.g. nvme_probe_cb)<br/>application logic"]
+
+    A --> B --> C --> D --> E
+    E --> F
+    E --> G
+    E --> H
+
+    style A fill:#e1f5ff,stroke:#333
+    style B fill:#fff4e1,stroke:#333
+    style C fill:#e1ffe1,stroke:#333
+    style D fill:#e1ffe1,stroke:#333
+    style E fill:#ffe1f5,stroke:#333
+    style F fill:#f0f0f0,stroke:#333
+    style G fill:#f0f0f0,stroke:#333
+    style H fill:#e1f5ff,stroke:#333
 ```
 
 Device removal:
-```
-spdk_pci_device_detach(dev)
-  |
-  v
-rte_eal_alarm_set(1, detach_rte_cb, rte_dev)
-  |
-  v
-detach_rte_cb() (runs in DPDK interrupt thread)
-  |
-  v
-vtophys_pci_device_removed()
-rte_eal_hotplug_remove("pci", bdf)
+```mermaid
+flowchart TD
+    A["spdk_pci_device_detach(dev)"]
+    B["rte_eal_alarm_set(1, detach_rte_cb, rte_dev)"]
+    C["detach_rte_cb()<br/>(runs in DPDK interrupt thread)"]
+    D["vtophys_pci_device_removed()"]
+    E["rte_eal_hotplug_remove('pci', bdf)"]
+
+    A --> B --> C
+    C --> D
+    C --> E
+
+    style A fill:#e1f5ff,stroke:#333
+    style B fill:#fff4e1,stroke:#333
+    style C fill:#ffe1f5,stroke:#333
+    style D fill:#f0f0f0,stroke:#333
+    style E fill:#f0f0f0,stroke:#333
 ```
 
 Detach runs asynchronously via `rte_eal_alarm_set` to avoid calling `rte_eal_hotplug_remove` from the DPDK interrupt thread directly, which would deadlock.
@@ -813,17 +865,35 @@ Hardware DMA engines work with physical addresses (or IOVAs in VA mode). When SP
 
 `memory.c` implements a three-level page table mirroring the CPU's own page table structure:
 
-```
-Virtual Address Layout (x86-64, 48-bit)
-  Bits [47:30] = 256TB index (top level, 512 entries)
-  Bits [29:21] = 1GB index    (mid level, 512 entries per top entry)
-  Bits [20:12] = 2MB index    (leaf level, 512 entries per mid entry)
-  Bits [11:0]  = 4KB offset
+```mermaid
+graph TD
+    VA["Virtual Address Layout (x86-64, 48-bit)"]
+    B47["Bits [47:30]<br/>256TB index<br/>(top level, 512 entries)"]
+    B29["Bits [29:21]<br/>1GB index<br/>(mid level, 512 entries per top)"]
+    B20["Bits [20:12]<br/>2MB index<br/>(leaf level, 512 entries per mid)"]
+    B11["Bits [11:0]<br/>4KB offset"]
 
-Translation Map
-  map_256tb[512]
-    └── map_1gb[512]
-          └── translation entries (one per 4KB page)
+    TM["Translation Map"]
+    M256["map_256tb[512]"]
+    M1G["map_1gb[512]"]
+    Leaf["translation entries<br/>(one per 4KB page)"]
+
+    VA --> B47
+    VA --> B29
+    VA --> B20
+    VA --> B11
+
+    TM --> M256 --> M1G --> Leaf
+
+    style VA fill:#e1f5ff,stroke:#333
+    style B47 fill:#fff4e1,stroke:#333
+    style B29 fill:#fff4e1,stroke:#333
+    style B20 fill:#fff4e1,stroke:#333
+    style B11 fill:#fff4e1,stroke:#333
+    style TM fill:#ffe1f5,stroke:#333
+    style M256 fill:#e1ffe1,stroke:#333
+    style M1G fill:#e1ffe1,stroke:#333
+    style Leaf fill:#f0f0f0,stroke:#333
 ```
 
 ```c
@@ -983,26 +1053,30 @@ rte_cryptodev_start(dev_id);
 
 `lib/bdev/bdev_crypto.c` (and related files) use an `rte_mempool` for crypto operations and an `rte_ring` as a software queue to batch crypto requests before submission:
 
-```
-User I/O Request
-    |
-    v
-bdev_crypto_readv_blocks() / bdev_crypto_writev_blocks()
-    |
-    v
-Build rte_crypto_op from mempool
-    |
-    v
-rte_cryptodev_enqueue_burst(dev_id, qp_id, ops, count)
-    |
-    v
-[Hardware or software crypto processing]
-    |
-    v
-Polling loop: rte_cryptodev_dequeue_burst()
-    |
-    v
-Complete original I/O request
+```mermaid
+flowchart TD
+    A["User I/O Request"]
+    B["bdev_crypto_readv_blocks() /<br/>bdev_crypto_writev_blocks()"]
+    C["Build rte_crypto_op from mempool"]
+    D["rte_cryptodev_enqueue_burst<br/>(dev_id, qp_id, ops, count)"]
+    E["Hardware or software<br/>crypto processing"]
+
+    A --> B --> C --> D --> E
+
+    style A fill:#e1f5ff,stroke:#333
+    style B fill:#fff4e1,stroke:#333
+    style C fill:#ffe1f5,stroke:#333
+    style D fill:#e1ffe1,stroke:#333
+    style E fill:#f0f0f0,stroke:#333
+```mermaid
+flowchart TD
+    F["Polling loop:<br/>rte_cryptodev_dequeue_burst()"]
+    G["Complete original I/O request"]
+
+    F --> G
+
+    style F fill:#ffe1f5,stroke:#333
+    style G fill:#e1f5ff,stroke:#333
 ```
 
 The `bdev_crypto` polling uses SPDK's poller infrastructure: `spdk_poller_register()` registers a function that calls `rte_cryptodev_dequeue_burst()` on every reactor iteration.

@@ -26,16 +26,19 @@
 
 Every SPDK application must initialize two distinct layers before touching any device.
 
-```
-┌──────────────────────────────────────┐
-│           Your Application           │
-├──────────────────────────────────────┤
-│         SPDK NVMe Driver             │  ← spdk_nvme_probe()
-├──────────────────────────────────────┤
-│       SPDK Environment (env)         │  ← spdk_env_init()
-├──────────────────────────────────────┤
-│   DPDK + Hugepages + VFIO/UIO        │  ← configured via spdk_env_opts
-└──────────────────────────────────────┘
+```mermaid
+graph TD
+    A["Your Application"]
+    B["SPDK NVMe Driver — spdk_nvme_probe()"]
+    C["SPDK Environment (env) — spdk_env_init()"]
+    D["DPDK + Hugepages + VFIO/UIO — configured via spdk_env_opts"]
+
+    A --> B --> C --> D
+
+    style A fill:#e1f5ff,stroke:#333
+    style B fill:#fff4e1,stroke:#333
+    style C fill:#ffe1f5,stroke:#333
+    style D fill:#f0f0f0,stroke:#333
 ```
 
 **Layer 1 - Environment (`spdk/env.h`)**: Sets up DPDK, binds hugepage memory, and
@@ -52,15 +55,21 @@ Skipping or reordering these layers causes crashes or silent failures.
 
 SPDK does not return a list of devices. Instead it calls your functions during enumeration:
 
-```
-spdk_nvme_probe()
-    │
-    ├── for each found controller:
-    │       └── probe_cb()  ← "Should I attach to this one?"
-    │               return true  → SPDK attaches and calls attach_cb()
-    │               return false → SPDK skips this controller
-    │
-    └── returns 0 on success (after all callbacks complete)
+```mermaid
+flowchart TD
+    A["spdk_nvme_probe()"] --> B{"For each found controller"}
+    B --> C["probe_cb() — Should I attach?"]
+    C -->|"return true"| D["SPDK attaches and calls attach_cb()"]
+    C -->|"return false"| E["SPDK skips this controller"]
+    D --> B
+    E --> B
+    B -->|"All done"| F["Returns 0 on success"]
+
+    style A fill:#ffe1f5,stroke:#333
+    style C fill:#e1f5ff,stroke:#333
+    style D fill:#e1ffe1,stroke:#333
+    style E fill:#f0f0f0,stroke:#333
+    style F fill:#e1ffe1,stroke:#333
 ```
 
 This design lets you filter devices by transport address, model number, or any
@@ -73,14 +82,15 @@ application-specific criterion before committing resources.
 SPDK I/O is non-blocking. Submitting a command returns immediately; you must poll
 a queue pair to drain completions and trigger your callback:
 
-```
-spdk_nvme_ns_cmd_write()   ← returns immediately, command is enqueued
-        │
-        │  (NVMe hardware processes command)
-        │
-spdk_nvme_qpair_process_completions()   ← you call this in a loop
-        │
-        └── your write_complete() callback fires here
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant NVMe as NVMe Hardware
+    App->>NVMe: spdk_nvme_ns_cmd_write() — returns immediately
+    Note over NVMe: Hardware processes command
+    App->>App: spdk_nvme_qpair_process_completions() — called in a loop
+    NVMe-->>App: Completion entry ready
+    App->>App: write_complete() callback fires
 ```
 
 There is no blocking wait anywhere in this path. Latency is minimized because the

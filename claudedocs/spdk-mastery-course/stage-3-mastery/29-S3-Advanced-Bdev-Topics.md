@@ -44,30 +44,33 @@ A virtual bdev **opens** one or more base bdevs, **claims** exclusive or shared 
 
 ### 1.2 The Layering Stack
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│                  NVMe-oF / iSCSI / vhost target                │  (initiator)
-└───────────────────────────┬────────────────────────────────────┘
-                            │  spdk_bdev_read/write/unmap …
-┌───────────────────────────▼────────────────────────────────────┐
-│                    QoS rate-limiter                             │  (virtual layer)
-└───────────────────────────┬────────────────────────────────────┘
-                            │
-┌───────────────────────────▼────────────────────────────────────┐
-│                      Crypto bdev                               │  (virtual layer)
-└───────────────────────────┬────────────────────────────────────┘
-                            │
-┌───────────────────────────▼────────────────────────────────────┐
-│                    Lvol bdev (thin-prov.)                       │  (virtual layer)
-└───────────────────────────┬────────────────────────────────────┘
-                            │
-┌───────────────────────────▼────────────────────────────────────┐
-│                     RAID5f bdev                                 │  (virtual layer)
-└──────────┬────────────────┬──────────────────┬─────────────────┘
-           │                │                  │
-     ┌─────▼──┐       ┌─────▼──┐         ┌─────▼──┐
-     │NVMe ns0│       │NVMe ns1│         │NVMe ns2│          (physical)
-     └────────┘       └────────┘         └────────┘
+```mermaid
+graph TD
+    TGT["NVMe-oF / iSCSI / vhost target"]
+    QOS["QoS rate-limiter"]
+    CRYPTO["Crypto bdev"]
+    LVOL["Lvol bdev (thin-prov.)"]
+    RAID["RAID5f bdev"]
+    NS0["NVMe ns0"]
+    NS1["NVMe ns1"]
+    NS2["NVMe ns2"]
+
+    TGT -->|"spdk_bdev_read/write/unmap ..."| QOS
+    QOS --> CRYPTO
+    CRYPTO --> LVOL
+    LVOL --> RAID
+    RAID --> NS0
+    RAID --> NS1
+    RAID --> NS2
+
+    style TGT fill:#e1f5ff,stroke:#333
+    style QOS fill:#ffe1f5,stroke:#333
+    style CRYPTO fill:#ffe1f5,stroke:#333
+    style LVOL fill:#ffe1f5,stroke:#333
+    style RAID fill:#ffe1f5,stroke:#333
+    style NS0 fill:#e1ffe1,stroke:#333
+    style NS1 fill:#e1ffe1,stroke:#333
+    style NS2 fill:#e1ffe1,stroke:#333
 ```
 
 Every layer in the stack is a fully independent `spdk_bdev`. The next layer above uses exactly the same public API (`spdk_bdev_read_blocks`, `spdk_bdev_write_blocks`, etc.) regardless of what lies beneath. This uniformity is the central design win: any vbdev can stack on top of any other bdev without special-casing.
@@ -414,23 +417,15 @@ rpc.py bdev_raid_create \
 
 ### 3.7 RAID State Transitions
 
-```
-        ┌─────────────────────────────────┐
-        │        CONFIGURING              │
-        │  (waiting for base bdevs)       │
-        └─────────────┬───────────────────┘
-                      │ all required bdevs present
-                      ▼
-        ┌─────────────────────────────────┐
-        │          ONLINE                 │◄──── rebuild completes
-        │  (fully operational)            │
-        └─────────────┬───────────────────┘
-                      │ member removed/failed
-                      ▼
-        ┌─────────────────────────────────┐
-        │          OFFLINE                │
-        │  (I/O returns error)            │
-        └─────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    CONFIGURING: CONFIGURING\n(waiting for base bdevs)
+    ONLINE: ONLINE\n(fully operational)
+    OFFLINE: OFFLINE\n(I/O returns error)
+
+    CONFIGURING --> ONLINE : all required bdevs present
+    ONLINE --> OFFLINE : member removed/failed
+    OFFLINE --> ONLINE : rebuild completes
 ```
 
 ---
@@ -441,20 +436,18 @@ rpc.py bdev_raid_create \
 
 The crypto vbdev (`module/bdev/crypto/vbdev_crypto.c`) wraps an existing bdev and provides transparent AES-CBC or AES-XTS block encryption. It depends on DPDK's `rte_cryptodev` framework or SPDK's accelerator abstraction.
 
-```
-Application
-    │  read/write plaintext blocks
-    ▼
-┌──────────────────────────────┐
-│        Crypto Bdev           │
-│  encrypt on write            │
-│  decrypt on read             │
-└──────────────┬───────────────┘
-               │  read/write ciphertext blocks
-               ▼
-┌──────────────────────────────┐
-│     Base Bdev (e.g. NVMe)    │
-└──────────────────────────────┘
+```mermaid
+graph TD
+    APP["Application"]
+    CRYPTO["Crypto Bdev\nencrypt on write\ndecrypt on read"]
+    BASE["Base Bdev (e.g. NVMe)"]
+
+    APP -->|"read/write plaintext blocks"| CRYPTO
+    CRYPTO -->|"read/write ciphertext blocks"| BASE
+
+    style APP fill:#e1f5ff,stroke:#333
+    style CRYPTO fill:#ffe1f5,stroke:#333
+    style BASE fill:#e1ffe1,stroke:#333
 ```
 
 ### 4.2 Key Concepts
@@ -527,20 +520,18 @@ vbdev_crypto_submit_request(struct spdk_io_channel *ch,
 
 ### 5.1 Architecture
 
-```
-Application
-    │  read/write uncompressed blocks
-    ▼
-┌──────────────────────────────┐
-│       Compress Bdev          │
-│  compress on write           │
-│  decompress on read          │
-└──────────────┬───────────────┘
-               │  read/write compressed chunks
-               ▼
-┌──────────────────────────────┐
-│     PMem or NVMe base bdev   │
-└──────────────────────────────┘
+```mermaid
+graph TD
+    APP["Application"]
+    COMP["Compress Bdev\ncompress on write\ndecompress on read"]
+    BASE["PMem or NVMe base bdev"]
+
+    APP -->|"read/write uncompressed blocks"| COMP
+    COMP -->|"read/write compressed chunks"| BASE
+
+    style APP fill:#e1f5ff,stroke:#333
+    style COMP fill:#ffe1f5,stroke:#333
+    style BASE fill:#e1ffe1,stroke:#333
 ```
 
 ### 5.2 Compression Granularity and Metadata
@@ -570,22 +561,18 @@ The compress bdev used DPDK's `rte_compressdev` with LZ4 or deflate back-ends, m
 
 The lvol subsystem (`lib/lvol/`, `module/bdev/lvol/`) provides thin-provisioned, snapshotable, cloneable block devices built on top of SPDK's Blob Store.
 
-```
-┌────────────────────────────────────────────────────┐
-│                   lvol bdev                         │
-│  (thin-provisioned, 4 MiB cluster allocation)       │
-└───────────────────────┬────────────────────────────┘
-                        │  blob I/O
-                        ▼
-┌────────────────────────────────────────────────────┐
-│              Blob Store (lvol store)                │
-│  manages clusters, metadata, superblock             │
-└───────────────────────┬────────────────────────────┘
-                        │  block I/O
-                        ▼
-┌────────────────────────────────────────────────────┐
-│           Base Bdev (NVMe, RAID, etc.)              │
-└────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    LVOL["lvol bdev\n(thin-provisioned, 4 MiB cluster allocation)"]
+    BLOB["Blob Store (lvol store)\nmanages clusters, metadata, superblock"]
+    BASE["Base Bdev (NVMe, RAID, etc.)"]
+
+    LVOL -->|"blob I/O"| BLOB
+    BLOB -->|"block I/O"| BASE
+
+    style LVOL fill:#ffe1f5,stroke:#333
+    style BLOB fill:#fff4e1,stroke:#333
+    style BASE fill:#e1ffe1,stroke:#333
 ```
 
 ### 6.2 Key Terminology
@@ -746,20 +733,21 @@ void spdk_lvol_open(struct spdk_lvol *lvol,
 
 ### 6.6 Snapshot / Clone Tree
 
-```
-           ┌────────────────┐
-           │  vol0 (lvol)   │  ← original writable volume
-           └───────┬────────┘
-                   │  snapshot("snap0")
-                   ▼
-           ┌────────────────┐
-           │   snap0 (RO)   │  ← frozen point-in-time
-           └───────┬────────┘
-           ┌───────┤ clone(…)
-           │       │
-    ┌──────▼─┐  ┌──▼──────┐
-    │ clone_A│  │ clone_B  │  ← independent writable volumes
-    └────────┘  └─────────┘
+```mermaid
+graph TD
+    VOL0["vol0 (lvol)\noriginal writable volume"]
+    SNAP0["snap0 (RO)\nfrozen point-in-time"]
+    CLONE_A["clone_A\nwritable volume"]
+    CLONE_B["clone_B\nwritable volume"]
+
+    VOL0 -->|"snapshot('snap0')"| SNAP0
+    SNAP0 -->|"clone(...)"| CLONE_A
+    SNAP0 -->|"clone(...)"| CLONE_B
+
+    style VOL0 fill:#e1f5ff,stroke:#333
+    style SNAP0 fill:#f0f0f0,stroke:#333
+    style CLONE_A fill:#e1ffe1,stroke:#333
+    style CLONE_B fill:#e1ffe1,stroke:#333
 ```
 
 Clusters that have not been written since the snapshot are shared; a write to clone_A triggers allocation of a new cluster only for the dirty extent.
@@ -1177,25 +1165,34 @@ Key trace point groups: `bdev_io_start`, `bdev_io_done`, `bdev_abort`, `lvol_cow
 
 ## 12. Architecture Summary: Mental Model
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  Bdev Layer – uniform API surface (spdk_bdev_read/write/unmap)   │
-├──────────────────────────────────────────────────────────────────┤
-│  Virtual modules (vbdevs):                                        │
-│    • QoS      – rate-limit with token buckets                     │
-│    • Crypto   – per-block AES-CBC/XTS via accel framework         │
-│    • Compress – variable-length LZ4/deflate with extent map       │
-│    • Lvol     – thin-prov, snapshot, clone via Blob Store         │
-│    • RAID     – striping (0), mirror (1), parity (5f)            │
-│    • Split    – partition a bdev into N equal regions             │
-│    • Zone     – zone emulation on conventional bdev               │
-│    • Passthru – identity transform (template / debugging)         │
-│    • Delay    – artificial I/O latency injection                  │
-│    • Error    – artificial error injection                        │
-├──────────────────────────────────────────────────────────────────┤
-│  Physical modules (leaf bdevs):                                   │
-│    • NVMe, AIO, io_uring, Malloc, Null, RBD, iSCSI, xNVMe, FTL  │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph API["Bdev Layer - uniform API surface"]
+        direction LR
+        A["spdk_bdev_read / write / unmap"]
+    end
+
+    subgraph VBDEV["Virtual modules (vbdevs)"]
+        V1["QoS - rate-limit with token buckets"]
+        V2["Crypto - per-block AES-CBC/XTS via accel framework"]
+        V3["Compress - variable-length LZ4/deflate with extent map"]
+        V4["Lvol - thin-prov, snapshot, clone via Blob Store"]
+        V5["RAID - striping (0), mirror (1), parity (5f)"]
+        V6["Split - partition a bdev into N equal regions"]
+        V7["Zone - zone emulation on conventional bdev"]
+        V8["Passthru / Delay / Error - identity, latency, error injection"]
+    end
+
+    subgraph PHYS["Physical modules (leaf bdevs)"]
+        P1["NVMe, AIO, io_uring, Malloc, Null, RBD, iSCSI, xNVMe, FTL"]
+    end
+
+    API --> VBDEV
+    VBDEV --> PHYS
+
+    style API fill:#e1f5ff,stroke:#333
+    style VBDEV fill:#ffe1f5,stroke:#333
+    style PHYS fill:#e1ffe1,stroke:#333
 ```
 
 Key architectural properties:

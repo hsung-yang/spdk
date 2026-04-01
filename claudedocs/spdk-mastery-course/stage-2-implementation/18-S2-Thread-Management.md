@@ -27,24 +27,47 @@
 
 SPDK threads are **not** OS threads. They are lightweight, stackless cooperative scheduling units that run on top of DPDK lcores (logical CPU cores). Understanding this distinction is fundamental to writing correct SPDK code.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    OS / Kernel                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-│  │ pthread  │  │ pthread  │  │ pthread  │  (one per    │
-│  │ (lcore 0)│  │ (lcore 1)│  │ (lcore 2)│   core)     │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘             │
-│       │              │              │                    │
-│  ┌────▼─────┐  ┌────▼─────┐  ┌────▼─────┐             │
-│  │ Reactor 0│  │ Reactor 1│  │ Reactor 2│  SPDK Event  │
-│  │ (polling)│  │ (polling)│  │ (polling)│  Framework   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘             │
-│       │              │              │                    │
-│  ┌────▼─────┐  ┌────▼─────┐  ┌────▼─────┐             │
-│  │ spdk_    │  │ spdk_    │  │ spdk_    │  SPDK        │
-│  │ thread A │  │ thread B │  │ thread C │  Threads     │
-│  └──────────┘  └──────────┘  └──────────┘             │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph OS["OS / Kernel"]
+        direction TB
+        subgraph pthreads["pthreads (one per core)"]
+            P0["pthread<br/>(lcore 0)"]
+            P1["pthread<br/>(lcore 1)"]
+            P2["pthread<br/>(lcore 2)"]
+        end
+        subgraph reactors["SPDK Event Framework"]
+            R0["Reactor 0<br/>(polling)"]
+            R1["Reactor 1<br/>(polling)"]
+            R2["Reactor 2<br/>(polling)"]
+        end
+        subgraph threads["SPDK Threads"]
+            T0["spdk_thread A"]
+            T1["spdk_thread B"]
+            T2["spdk_thread C"]
+        end
+    end
+
+    P0 --> R0
+    P1 --> R1
+    P2 --> R2
+    R0 --> T0
+    R1 --> T1
+    R2 --> T2
+
+    style OS fill:#f0f0f0,stroke:#999
+    style pthreads fill:#f0f0f0,stroke:#aaa
+    style reactors fill:#fff4e1,stroke:#e0c080
+    style threads fill:#ffe1f5,stroke:#e0a0d0
+    style P0 fill:#f0f0f0,stroke:#999
+    style P1 fill:#f0f0f0,stroke:#999
+    style P2 fill:#f0f0f0,stroke:#999
+    style R0 fill:#fff4e1,stroke:#e0c080
+    style R1 fill:#fff4e1,stroke:#e0c080
+    style R2 fill:#fff4e1,stroke:#e0c080
+    style T0 fill:#ffe1f5,stroke:#e0a0d0
+    style T1 fill:#ffe1f5,stroke:#e0a0d0
+    style T2 fill:#ffe1f5,stroke:#e0a0d0
 ```
 
 **Key Properties**:
@@ -60,23 +83,14 @@ SPDK threads are **not** OS threads. They are lightweight, stackless cooperative
 
 ### Concept 2: Thread Lifecycle State Machine
 
-```
-spdk_thread_create()
-        │
-        ▼
- ┌─────────────┐
- │   RUNNING   │◄──── spdk_thread_poll() drives execution
- └──────┬──────┘
-        │ spdk_thread_exit()
-        ▼
- ┌─────────────┐
- │   EXITING   │◄──── draining pollers, channels, messages
- └──────┬──────┘
-        │ spdk_thread_is_exited() == true
-        ▼
- ┌─────────────┐
- │   EXITED    │◄──── safe to call spdk_thread_destroy()
- └─────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING : spdk_thread_create()
+    RUNNING --> RUNNING : spdk_thread_poll() drives execution
+    RUNNING --> EXITING : spdk_thread_exit()
+    EXITING --> EXITING : draining pollers, channels, messages
+    EXITING --> EXITED : spdk_thread_is_exited() == true
+    EXITED --> [*] : spdk_thread_destroy()
 ```
 
 From `lib/thread/thread.c`, the internal state enum:
@@ -364,18 +378,17 @@ _rpc_thread_set_cpumask(void *arg)
 
 Messages are the only safe way to coordinate between SPDK threads. The underlying mechanism is a lock-free ring buffer (`spdk_ring`) with a small per-thread cache to avoid pool pressure.
 
-```
-Thread A                          Thread B
-   │                                 │
-   │  spdk_thread_send_msg(B, fn, ctx)
-   │──────────────────────────────►  │
-   │  (enqueue to B's ring)          │
-   │                                 │
-   │                   spdk_thread_poll(B, ...)
-   │                                 │
-   │                    dequeue msg  │
-   │                    call fn(ctx) │
-   │                                 ▼
+```mermaid
+sequenceDiagram
+    participant A as Thread A
+    participant B as Thread B
+
+    A->>B: spdk_thread_send_msg(B, fn, ctx)
+    Note left of A: enqueue to B's ring
+
+    Note right of B: spdk_thread_poll(B, ...)
+    B->>B: dequeue msg
+    B->>B: call fn(ctx)
 ```
 
 ### Basic Message Sending
@@ -657,22 +670,22 @@ I/O channels are the mechanism for giving each thread its own private context fo
 
 ### The io_device / io_channel Model
 
-```
-┌─────────────────────────────────────────────────────┐
-│  io_device (global, e.g., struct nvme_ctrlr *)      │
-│                                                     │
-│  Registered with: spdk_io_device_register()         │
-│  create_cb: allocates per-channel context           │
-│  destroy_cb: frees per-channel context              │
-└──────────────────────┬──────────────────────────────┘
-                       │  one channel per thread
-         ┌─────────────┼─────────────┐
-         ▼             ▼             ▼
-   ┌──────────┐  ┌──────────┐  ┌──────────┐
-   │ Thread 0 │  │ Thread 1 │  │ Thread 2 │
-   │ channel  │  │ channel  │  │ channel  │
-   │ (qpair 0)│  │ (qpair 1)│  │ (qpair 2)│
-   └──────────┘  └──────────┘  └──────────┘
+```mermaid
+graph TD
+    DEV["<b>io_device</b> (global, e.g., struct nvme_ctrlr *)<br/><br/>Registered with: spdk_io_device_register()<br/>create_cb: allocates per-channel context<br/>destroy_cb: frees per-channel context"]
+
+    DEV -->|one channel per thread| CH0
+    DEV -->|one channel per thread| CH1
+    DEV -->|one channel per thread| CH2
+
+    CH0["Thread 0 channel<br/>(qpair 0)"]
+    CH1["Thread 1 channel<br/>(qpair 1)"]
+    CH2["Thread 2 channel<br/>(qpair 2)"]
+
+    style DEV fill:#fff4e1,stroke:#e0c080
+    style CH0 fill:#ffe1f5,stroke:#e0a0d0
+    style CH1 fill:#ffe1f5,stroke:#e0a0d0
+    style CH2 fill:#ffe1f5,stroke:#e0a0d0
 ```
 
 ### Registering an I/O Device

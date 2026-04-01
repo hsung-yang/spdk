@@ -449,13 +449,27 @@ snapshot file) offline and reconstructs a timeline.
 
 Key structures from `include/spdk/trace.h`:
 
-```
-spdk_trace_file (shared memory root)
-├── tsc_rate                   (TSC frequency for time conversion)
-├── tpoint_mask[20]            (which tpoints are enabled, per group)
-├── tpoint[SPDK_TRACE_MAX_TPOINT_ID]  (tpoint definitions)
-└── per-lcore history (ring buffers)
-    └── entries[]              (circular array of spdk_trace_entry)
+```mermaid
+graph TD
+    Root["spdk_trace_file<br/>(shared memory root)"]
+    TSC["tsc_rate<br/>(TSC frequency for time conversion)"]
+    Mask["tpoint_mask[20]<br/>(which tpoints are enabled, per group)"]
+    TP["tpoint[SPDK_TRACE_MAX_TPOINT_ID]<br/>(tpoint definitions)"]
+    Hist["per-lcore history<br/>(ring buffers)"]
+    Ent["entries[]<br/>(circular array of spdk_trace_entry)"]
+
+    Root --> TSC
+    Root --> Mask
+    Root --> TP
+    Root --> Hist
+    Hist --> Ent
+
+    style Root fill:#ffe1f5,stroke:#333
+    style TSC fill:#fff4e1,stroke:#333
+    style Mask fill:#fff4e1,stroke:#333
+    style TP fill:#fff4e1,stroke:#333
+    style Hist fill:#e1ffe1,stroke:#333
+    style Ent fill:#e1f5ff,stroke:#333
 ```
 
 Each `spdk_trace_entry` is 32 bytes and records:

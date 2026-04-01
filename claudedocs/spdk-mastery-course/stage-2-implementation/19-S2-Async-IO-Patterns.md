@@ -1059,16 +1059,18 @@ correct_free_cb(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 
 ### Async I/O Lifecycle
 
-```
-spdk_bdev_read_blocks()   ← submit (returns 0 or error immediately)
-      |
-      | [device services request]
-      |
-spdk_bdev_io_completion_cb()   ← fires on reactor thread
-      |--- spdk_bdev_free_io()
-      |--- check success / handle error
-      |--- optionally submit next I/O
-      |--- free context when done
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Dev as Device
+
+    App->>Dev: spdk_bdev_read_blocks() — returns 0 or error immediately
+    Note over Dev: Device services request
+    Dev-->>App: spdk_bdev_io_completion_cb() fires on reactor thread
+    Note over App: spdk_bdev_free_io()
+    Note over App: Check success / handle error
+    Note over App: Optionally submit next I/O
+    Note over App: Free context when done
 ```
 
 ---

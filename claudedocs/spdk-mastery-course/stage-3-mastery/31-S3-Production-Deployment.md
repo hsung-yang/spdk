@@ -226,9 +226,22 @@ architected at the system level around SPDK instances.
 
 ### 3.1 Active-Passive Failover (NVMe-oF)
 
-```
-[Initiator] ──multipath──┬── [SPDK Target A] (active)  ──── [NVMe SSD pool]
-                         └── [SPDK Target B] (standby) ──── [NVMe SSD pool]
+```mermaid
+flowchart LR
+    Init["Initiator"]
+    TA["SPDK Target A<br/>(active)"]
+    TB["SPDK Target B<br/>(standby)"]
+    Pool["NVMe SSD pool"]
+
+    Init -- "multipath" --> TA
+    Init -- "multipath" --> TB
+    TA --> Pool
+    TB --> Pool
+
+    style Init fill:#e1f5ff,stroke:#333
+    style TA fill:#e1ffe1,stroke:#333
+    style TB fill:#f0f0f0,stroke:#333
+    style Pool fill:#fff4e1,stroke:#333
 ```
 
 - NVMe-oF ANA (Asymmetric Namespace Access) groups: controller A owns Optimized path,
@@ -250,16 +263,31 @@ architected at the system level around SPDK instances.
 
 ### 3.2 Active-Active with Shared-Nothing Architecture
 
-```
-[Initiators]
-    |
-[Load Balancer / Round-Robin multipath]
-    |               |
-[SPDK Target A] [SPDK Target B]
-    |               |
- [NVMe-A pool]  [NVMe-B pool]
-    |               |
-    └───[Replication layer (e.g., DRBD/Ceph RBD bdev)]───┘
+```mermaid
+flowchart TD
+    Init["Initiators"]
+    LB["Load Balancer / Round-Robin multipath"]
+    TA["SPDK Target A"]
+    TB["SPDK Target B"]
+    PA["NVMe-A pool"]
+    PB["NVMe-B pool"]
+    Repl["Replication layer<br/>(e.g., DRBD / Ceph RBD bdev)"]
+
+    Init --> LB
+    LB --> TA
+    LB --> TB
+    TA --> PA
+    TB --> PB
+    PA --> Repl
+    PB --> Repl
+
+    style Init fill:#e1f5ff,stroke:#333
+    style LB fill:#fff4e1,stroke:#333
+    style TA fill:#e1ffe1,stroke:#333
+    style TB fill:#e1ffe1,stroke:#333
+    style PA fill:#f0f0f0,stroke:#333
+    style PB fill:#f0f0f0,stroke:#333
+    style Repl fill:#ffe1f5,stroke:#333
 ```
 
 Each target owns a dedicated slice of NVMe devices. Replication can be handled by SPDK's
@@ -1322,26 +1350,25 @@ coredumpctl info -1               # most recent core dump
 
 ### 12.1 Small-Scale: Single-Node All-Flash Array
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Storage Server (2× Intel Xeon, 256 GiB RAM)        │
-│                                                       │
-│  ┌──────────────────────────────────────────────┐   │
-│  │  spdk_tgt  (cores 2-15, hugepages 32 GiB)    │   │
-│  │                                               │   │
-│  │  NVMe bdevs: NVMe0n1, NVMe1n1, NVMe2n1,      │   │
-│  │              NVMe3n1 (4× 3.84 TB U.2 NVMe)   │   │
-│  │                                               │   │
-│  │  lvstore: 15.4 TB usable                      │   │
-│  │  100 thin-provisioned LVOLs                   │   │
-│  │                                               │   │
-│  │  NVMe-oF TCP target:                          │   │
-│  │    2× 25GbE (bond0, bond1 LACP)               │   │
-│  └──────────────────────────────────────────────┘   │
-│                                                       │
-│  Management: rpc_http_proxy → Telegraf → Prometheus  │
-│  HA: Pacemaker/Corosync on peer node                │
-└─────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Server["Storage Server (2x Intel Xeon, 256 GiB RAM)"]
+        subgraph SPDK["spdk_tgt (cores 2-15, hugepages 32 GiB)"]
+            Bdevs["NVMe bdevs: NVMe0n1, NVMe1n1,<br/>NVMe2n1, NVMe3n1<br/>(4x 3.84 TB U.2 NVMe)"]
+            LVStore["lvstore: 15.4 TB usable<br/>100 thin-provisioned LVOLs"]
+            Target["NVMe-oF TCP target:<br/>2x 25GbE (bond0, bond1 LACP)"]
+        end
+        Mgmt["Management: rpc_http_proxy -> Telegraf -> Prometheus"]
+        HA["HA: Pacemaker/Corosync on peer node"]
+    end
+
+    style Server fill:#f0f0f0,stroke:#333
+    style SPDK fill:#ffe1f5,stroke:#333
+    style Bdevs fill:#e1ffe1,stroke:#333
+    style LVStore fill:#fff4e1,stroke:#333
+    style Target fill:#e1f5ff,stroke:#333
+    style Mgmt fill:#fff4e1,stroke:#333
+    style HA fill:#fff4e1,stroke:#333
 ```
 
 Configuration pattern:
@@ -1378,15 +1405,33 @@ Configuration pattern:
 
 ### 12.2 Medium-Scale: Disaggregated Storage with Multiple Targets
 
-```
-[Compute Cluster]          [Storage Fabric]        [Storage Nodes]
-  K8s Node 1 ────────────── 100GbE RoCE ────────── SPDK Target A
-  K8s Node 2 ─────────────────────────────────────  (8× NVMe, 2 reactors)
-  K8s Node 3 ──────────────────────────────────────
-                                                     SPDK Target B
-                                                     (8× NVMe, 2 reactors)
+```mermaid
+flowchart LR
+    subgraph Compute["Compute Cluster"]
+        K1["K8s Node 1"]
+        K2["K8s Node 2"]
+        K3["K8s Node 3"]
+    end
 
-CSI Driver (nvme-of-csi) provisions LVOLs from targets and presents as PersistentVolumes
+    Fabric["100GbE RoCE<br/>Storage Fabric"]
+
+    subgraph Storage["Storage Nodes"]
+        TA["SPDK Target A<br/>(8x NVMe, 2 reactors)"]
+        TB["SPDK Target B<br/>(8x NVMe, 2 reactors)"]
+    end
+
+    K1 --> Fabric
+    K2 --> Fabric
+    K3 --> Fabric
+    Fabric --> TA
+    Fabric --> TB
+
+    CSI["CSI Driver (nvme-of-csi)<br/>provisions LVOLs as PersistentVolumes"]
+
+    style Compute fill:#e1f5ff,stroke:#333
+    style Fabric fill:#fff4e1,stroke:#333
+    style Storage fill:#e1ffe1,stroke:#333
+    style CSI fill:#f0f0f0,stroke:#333
 ```
 
 ### 12.3 Large-Scale: Hyperscale NVMe-oF Fabric

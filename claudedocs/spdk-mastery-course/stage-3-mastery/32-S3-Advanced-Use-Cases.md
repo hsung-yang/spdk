@@ -34,30 +34,42 @@ SPDK is uniquely positioned for appliance work because:
 
 ### 1.2 Reference Appliance Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Storage Appliance                        │
-│                                                                  │
-│  Network Port 0 (25GbE)      Network Port 1 (25GbE)             │
-│       │                              │                           │
-│  ┌────▼────────────┐       ┌─────────▼──────────┐               │
-│  │  NVMe-oF Target │       │   iSCSI Target     │               │
-│  │  (RDMA/TCP)     │       │   (TCP/IP)         │               │
-│  └────┬────────────┘       └─────────┬──────────┘               │
-│       │                              │                           │
-│  ┌────▼──────────────────────────────▼──────────┐               │
-│  │               bdev Layer                      │               │
-│  │  ┌──────────┐  ┌──────────┐  ┌────────────┐  │               │
-│  │  │ NVMe bdev│  │RAID bdev │  │Crypto bdev │  │               │
-│  │  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │               │
-│  └───────┼─────────────┼──────────────┼──────────┘               │
-│          │             │              │                           │
-│  ┌───────▼─────────────▼──────────────▼──────────┐               │
-│  │           Userspace NVMe Driver                │               │
-│  └───────────────────────────────────────────────┘               │
-│                                                                  │
-│          PCIe NVMe SSDs (8 x P5800X or similar)                 │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Appliance["Storage Appliance"]
+        NP0["Network Port 0<br/>(25GbE)"]
+        NP1["Network Port 1<br/>(25GbE)"]
+
+        NP0 --> NVMeOF["NVMe-oF Target<br/>(RDMA/TCP)"]
+        NP1 --> iSCSI["iSCSI Target<br/>(TCP/IP)"]
+
+        NVMeOF --> bdev
+        iSCSI --> bdev
+
+        subgraph bdev["bdev Layer"]
+            NVMeBdev["NVMe bdev"]
+            RAIDBdev["RAID bdev"]
+            CryptoBdev["Crypto bdev"]
+        end
+
+        NVMeBdev --> USpaceNVMe
+        RAIDBdev --> USpaceNVMe
+        CryptoBdev --> USpaceNVMe
+
+        USpaceNVMe["Userspace NVMe Driver"]
+        USpaceNVMe --> SSDs["PCIe NVMe SSDs<br/>(8 x P5800X or similar)"]
+    end
+
+    style NP0 fill:#f0f0f0,stroke:#999
+    style NP1 fill:#f0f0f0,stroke:#999
+    style NVMeOF fill:#fff4e1,stroke:#e6a800
+    style iSCSI fill:#fff4e1,stroke:#e6a800
+    style bdev fill:#ffe1f5,stroke:#cc5599
+    style NVMeBdev fill:#ffe1f5,stroke:#cc5599
+    style RAIDBdev fill:#ffe1f5,stroke:#cc5599
+    style CryptoBdev fill:#ffe1f5,stroke:#cc5599
+    style USpaceNVMe fill:#e1ffe1,stroke:#339933
+    style SSDs fill:#f0f0f0,stroke:#999
 ```
 
 ### 1.3 Component Selection for Appliances
@@ -128,14 +140,16 @@ Ceph is a distributed storage system widely deployed in cloud infrastructure. SP
 
 The SPDK `bdev` layer can replace the BlueStore block abstraction under Ceph OSDs. The key project here is the `spdk_bdev` backend for Ceph OSD, which bypasses the Linux block layer entirely:
 
-```
-Ceph OSD Process
-     │
-     ├── BlueStore (userspace)
-     │        │
-     │    SPDK bdev_nvme (userspace NVMe driver)
-     │        │
-     └────────▼────── NVMe SSD (PCIe)
+```mermaid
+graph TD
+    OSD["Ceph OSD Process"] --> BlueStore["BlueStore (userspace)"]
+    BlueStore --> BdevNVMe["SPDK bdev_nvme<br/>(userspace NVMe driver)"]
+    BdevNVMe --> SSD["NVMe SSD (PCIe)"]
+
+    style OSD fill:#e1f5ff,stroke:#0077b6
+    style BlueStore fill:#fff4e1,stroke:#e6a800
+    style BdevNVMe fill:#e1ffe1,stroke:#339933
+    style SSD fill:#f0f0f0,stroke:#999
 ```
 
 Benefits:
@@ -153,13 +167,30 @@ bluestore_block_path = spdk:trtype:PCIe traddr:0000:02:00.0
 
 The simpler integration path is to present NVMe-oF namespaces from SPDK targets as block devices that Ceph OSDs consume. This requires no Ceph modification and provides hardware-accelerated storage with RDMA transport.
 
-```
-Ceph Node                        SPDK Storage Node
-┌──────────────┐    RDMA/TCP     ┌──────────────────┐
-│ Ceph OSD     │◄───NVMe-oF─────│ nvmf_tgt         │
-│ BlueStore    │                 │ bdev_nvme         │
-│ /dev/nvmeXn1 │                 │ NVMe SSDs (PCIe)  │
-└──────────────┘                 └──────────────────┘
+```mermaid
+flowchart LR
+    subgraph CephNode["Ceph Node"]
+        OSD["Ceph OSD"]
+        BlueStore["BlueStore"]
+        DevNVMe["/dev/nvmeXn1"]
+    end
+
+    subgraph SPDKNode["SPDK Storage Node"]
+        nvmf["nvmf_tgt"]
+        bdevnvme["bdev_nvme"]
+        SSDs["NVMe SSDs (PCIe)"]
+    end
+
+    SPDKNode -- "NVMe-oF<br/>(RDMA/TCP)" --> CephNode
+
+    style CephNode fill:#e1f5ff,stroke:#0077b6
+    style SPDKNode fill:#e1ffe1,stroke:#339933
+    style OSD fill:#e1f5ff,stroke:#0077b6
+    style BlueStore fill:#e1f5ff,stroke:#0077b6
+    style DevNVMe fill:#e1f5ff,stroke:#0077b6
+    style nvmf fill:#e1ffe1,stroke:#339933
+    style bdevnvme fill:#e1ffe1,stroke:#339933
+    style SSDs fill:#f0f0f0,stroke:#999
 ```
 
 ### 2.2 OpenStack Integration
@@ -170,19 +201,31 @@ OpenStack Cinder (block storage) integrates with SPDK through two paths:
 
 The `cinder-volume` service can provision volumes on SPDK targets using the NVMe-oF Cinder driver. The SPDK JSON-RPC API is called by the driver to create logical volumes, attach them to NVMe-oF subsystems, and return the connection details to Nova (compute).
 
-```
-Nova Instance               Cinder Volume Service
-┌───────────┐  attach       ┌───────────────────────┐
-│  VM       │──────────────►│ NVMe-oF Cinder Driver │
-│ /dev/nvme │               │ (calls SPDK JSON-RPC) │
-└───────────┘               └──────────┬────────────┘
-                                        │ JSON-RPC
-                                        ▼
-                             ┌──────────────────────┐
-                             │    SPDK spdk_tgt     │
-                             │    bdev_lvol         │
-                             │    nvmf subsystem    │
-                             └──────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Nova["Nova Instance"]
+        VM["VM<br/>/dev/nvme"]
+    end
+
+    subgraph Cinder["Cinder Volume Service"]
+        Driver["NVMe-oF Cinder Driver<br/>(calls SPDK JSON-RPC)"]
+    end
+
+    subgraph SPDK["SPDK spdk_tgt"]
+        lvol["bdev_lvol"]
+        nvmf["nvmf subsystem"]
+    end
+
+    VM -- "attach" --> Driver
+    Driver -- "JSON-RPC" --> SPDK
+
+    style Nova fill:#e1f5ff,stroke:#0077b6
+    style VM fill:#e1f5ff,stroke:#0077b6
+    style Cinder fill:#fff4e1,stroke:#e6a800
+    style Driver fill:#fff4e1,stroke:#e6a800
+    style SPDK fill:#ffe1f5,stroke:#cc5599
+    style lvol fill:#ffe1f5,stroke:#cc5599
+    style nvmf fill:#ffe1f5,stroke:#cc5599
 ```
 
 **Path 2: Cinder with Ceph RBD + SPDK OSD**
@@ -208,21 +251,18 @@ RocksDB is an LSM-tree key-value store used by many databases as their storage e
 
 SPDK provides `BlobFS`, a filesystem abstraction built on top of Blobstore, specifically designed for RocksDB. BlobFS presents a POSIX-like file API that RocksDB uses via its `Env` abstraction, while internally routing all I/O through SPDK asynchronous paths.
 
-```
-RocksDB
-   │
-   │ rocksdb::Env interface
-   ▼
-SPDK SpdkEnv (lib/env_dpdk / BlobFS)
-   │
-   ▼
-SPDK Blobstore (lib/blob/)
-   │
-   ▼
-SPDK NVMe bdev (userspace driver)
-   │
-   ▼
-NVMe SSD
+```mermaid
+graph TD
+    RocksDB["RocksDB"] -- "rocksdb::Env interface" --> SpdkEnv["SPDK SpdkEnv<br/>(lib/env_dpdk / BlobFS)"]
+    SpdkEnv --> Blobstore["SPDK Blobstore<br/>(lib/blob/)"]
+    Blobstore --> BdevNVMe["SPDK NVMe bdev<br/>(userspace driver)"]
+    BdevNVMe --> SSD["NVMe SSD"]
+
+    style RocksDB fill:#e1f5ff,stroke:#0077b6
+    style SpdkEnv fill:#fff4e1,stroke:#e6a800
+    style Blobstore fill:#ffe1f5,stroke:#cc5599
+    style BdevNVMe fill:#e1ffe1,stroke:#339933
+    style SSD fill:#f0f0f0,stroke:#999
 ```
 
 **Building RocksDB with SPDK support:**
@@ -344,24 +384,45 @@ For extreme latency requirements, the `spdk_uring_io` or tablespace on NBD appro
 
 The Container Storage Interface (CSI) standardizes how Kubernetes provisioners interact with storage backends. SPDK integrates as a CSI driver that provisions NVMe-oF volumes backed by SPDK logical volumes:
 
-```
-Kubernetes Node                  SPDK Storage Backend
-┌─────────────────────┐          ┌──────────────────────┐
-│ kubelet              │          │ spdk_tgt              │
-│   │                  │  NVMe-oF │   │                   │
-│ CSI Node Plugin     │◄─────────│ nvmf subsystem        │
-│   │ /dev/nvme1n1     │          │   │                   │
-│   │                  │          │ bdev_lvol             │
-│ Pod Volume Mount    │          │   │                   │
-│ /data               │          │ Blobstore             │
-└─────────────────────┘          │   │                   │
-                                  │ NVMe SSDs             │
-Kubernetes Control Plane          └──────────────────────┘
-┌─────────────────────┐
-│ CSI Controller      │ JSON-RPC
-│ (Provisioner)       │─────────────────────────────────►
-│  creates PVC        │          SPDK JSON-RPC API
-└─────────────────────┘
+```mermaid
+flowchart LR
+    subgraph K8sNode["Kubernetes Node"]
+        kubelet["kubelet"]
+        CSINode["CSI Node Plugin"]
+        devnvme["/dev/nvme1n1"]
+        PodMount["Pod Volume Mount<br/>/data"]
+        kubelet --> CSINode --> devnvme --> PodMount
+    end
+
+    subgraph K8sCP["Kubernetes Control Plane"]
+        CSICtrl["CSI Controller<br/>(Provisioner)<br/>creates PVC"]
+    end
+
+    subgraph SPDKBackend["SPDK Storage Backend"]
+        spdk_tgt["spdk_tgt"]
+        nvmf["nvmf subsystem"]
+        lvol["bdev_lvol"]
+        blob["Blobstore"]
+        ssds["NVMe SSDs"]
+        spdk_tgt --> nvmf --> lvol --> blob --> ssds
+    end
+
+    SPDKBackend -- "NVMe-oF" --> K8sNode
+    CSICtrl -- "JSON-RPC" --> SPDKBackend
+
+    style K8sNode fill:#e1f5ff,stroke:#0077b6
+    style kubelet fill:#e1f5ff,stroke:#0077b6
+    style CSINode fill:#e1f5ff,stroke:#0077b6
+    style devnvme fill:#e1f5ff,stroke:#0077b6
+    style PodMount fill:#e1f5ff,stroke:#0077b6
+    style K8sCP fill:#fff4e1,stroke:#e6a800
+    style CSICtrl fill:#fff4e1,stroke:#e6a800
+    style SPDKBackend fill:#e1ffe1,stroke:#339933
+    style spdk_tgt fill:#ffe1f5,stroke:#cc5599
+    style nvmf fill:#ffe1f5,stroke:#cc5599
+    style lvol fill:#ffe1f5,stroke:#cc5599
+    style blob fill:#ffe1f5,stroke:#cc5599
+    style ssds fill:#f0f0f0,stroke:#999
 ```
 
 ### 4.2 SPDK CSI Driver
@@ -473,20 +534,27 @@ Blobstore (`lib/blob/`) is SPDK's persistent block allocator. It sits between ra
 
 **Storage hierarchy:**
 
-```
-Blobstore
-│
-├── Logical Block (512B or 4KiB, device native)
-│
-├── Page (fixed multiple of logical blocks, default 4KiB)
-│     └── Metadata pages: superblock, extent pages, blob headers
-│
-├── Cluster (fixed multiple of pages, default 1MiB = 256 pages)
-│     └── Allocation unit for blob data; always contiguous pages
-│
-└── Blob (ordered list of clusters)
-      ├── Data: application payload in clusters
-      └── xattrs: arbitrary key-value metadata per blob
+```mermaid
+graph TD
+    BS["Blobstore"] --> LB["Logical Block<br/>(512B or 4KiB, device native)"]
+    BS --> Page["Page<br/>(fixed multiple of logical blocks, default 4KiB)"]
+    BS --> Cluster["Cluster<br/>(fixed multiple of pages, default 1MiB = 256 pages)"]
+    BS --> Blob["Blob<br/>(ordered list of clusters)"]
+
+    Page --> MetaPages["Metadata pages: superblock,<br/>extent pages, blob headers"]
+    Cluster --> AllocUnit["Allocation unit for blob data;<br/>always contiguous pages"]
+    Blob --> BlobData["Data: application payload<br/>in clusters"]
+    Blob --> Xattrs["xattrs: arbitrary key-value<br/>metadata per blob"]
+
+    style BS fill:#ffe1f5,stroke:#cc5599
+    style LB fill:#f0f0f0,stroke:#999
+    style Page fill:#f0f0f0,stroke:#999
+    style Cluster fill:#f0f0f0,stroke:#999
+    style Blob fill:#fff4e1,stroke:#e6a800
+    style MetaPages fill:#e1f5ff,stroke:#0077b6
+    style AllocUnit fill:#e1f5ff,stroke:#0077b6
+    style BlobData fill:#e1ffe1,stroke:#339933
+    style Xattrs fill:#e1ffe1,stroke:#339933
 ```
 
 **Key design principles:**
@@ -661,34 +729,37 @@ The Flash Translation Layer (`lib/ftl/`) implements a software FTL that runs in 
 
 ### 6.2 FTL Architecture
 
-```
-Host Application
-     │
-     │ Block I/O (random read/write)
-     ▼
-┌─────────────────────────────────────────────────────┐
-│                  FTL Core (ftl_core.c)               │
-│                                                      │
-│  ┌──────────────┐      ┌──────────────────────────┐  │
-│  │  Write Path  │      │     Read Path             │  │
-│  │              │      │                           │  │
-│  │ NV Cache ──►│      │ L2P Lookup ──► Physical  │  │
-│  │ Band Writer  │      │  Address                 │  │
-│  └──────────────┘      └──────────────────────────┘  │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐   │
-│  │         Garbage Collector (ftl_reloc.c)      │   │
-│  │  Selects victim bands → copies valid data →  │   │
-│  │  erases band → returns to free pool          │   │
-│  └──────────────────────────────────────────────┘   │
-│                                                      │
-│  L2P Table: Logical Block → Physical (Zone:Offset)  │
-└─────────────────────────────────────────────────────┘
-     │
-     │ Sequential zone writes (WRITE commands)
-     │ Explicit zone resets (ZONE RESET commands)
-     ▼
-ZNS SSD / Open-Channel SSD
+```mermaid
+graph TD
+    HostApp["Host Application"] -- "Block I/O<br/>(random read/write)" --> FTLCore
+
+    subgraph FTLCore["FTL Core (ftl_core.c)"]
+        subgraph WritePath["Write Path"]
+            NVCache["NV Cache"] --> BandWriter["Band Writer"]
+        end
+        subgraph ReadPath["Read Path"]
+            L2PLookup["L2P Lookup"] --> PhysAddr["Physical Address"]
+        end
+        subgraph GC["Garbage Collector (ftl_reloc.c)"]
+            GCDesc["Selects victim bands --> copies valid data --><br/>erases band --> returns to free pool"]
+        end
+        L2PTable["L2P Table: Logical Block --> Physical (Zone:Offset)"]
+    end
+
+    FTLCore -- "Sequential zone writes (WRITE commands)<br/>Explicit zone resets (ZONE RESET commands)" --> ZNS["ZNS SSD / Open-Channel SSD"]
+
+    style HostApp fill:#e1f5ff,stroke:#0077b6
+    style FTLCore fill:#ffe1f5,stroke:#cc5599
+    style WritePath fill:#fff4e1,stroke:#e6a800
+    style ReadPath fill:#fff4e1,stroke:#e6a800
+    style GC fill:#fff4e1,stroke:#e6a800
+    style NVCache fill:#fff4e1,stroke:#e6a800
+    style BandWriter fill:#fff4e1,stroke:#e6a800
+    style L2PLookup fill:#fff4e1,stroke:#e6a800
+    style PhysAddr fill:#fff4e1,stroke:#e6a800
+    style GCDesc fill:#fff4e1,stroke:#e6a800
+    style L2PTable fill:#ffe1f5,stroke:#cc5599
+    style ZNS fill:#f0f0f0,stroke:#999
 ```
 
 ### 6.3 FTL Configuration
@@ -925,24 +996,21 @@ Typical improvements with SPDK over kernel driver:
 
 SPDK's NBD module (`lib/nbd/`) creates a communication channel between an SPDK bdev and the Linux kernel's NBD driver. This exposes any SPDK bdev as a standard Linux block device (`/dev/nbdN`), making it accessible to any Linux application — filesystems, LVM, databases — without SPDK source modifications.
 
-```
-Linux Userspace Application
-(MySQL, PostgreSQL, ext4 filesystem, etc.)
-         │
-         │ Standard POSIX read/write/ioctl
-         ▼
-    /dev/nbd0
-         │
-    Linux NBD driver (kernel)
-         │ NBD protocol over Unix socket
-         ▼
-    SPDK NBD server (lib/nbd/)
-         │
-         ▼
-    SPDK bdev (NVMe, lvol, RAID, etc.)
-         │
-         ▼
-    NVMe SSD
+```mermaid
+graph TD
+    App["Linux Userspace Application<br/>(MySQL, PostgreSQL, ext4 filesystem, etc.)"]
+    App -- "Standard POSIX<br/>read/write/ioctl" --> DevNbd["/dev/nbd0"]
+    DevNbd --> NBDDriver["Linux NBD driver (kernel)"]
+    NBDDriver -- "NBD protocol over<br/>Unix socket" --> NBDServer["SPDK NBD server<br/>(lib/nbd/)"]
+    NBDServer --> Bdev["SPDK bdev<br/>(NVMe, lvol, RAID, etc.)"]
+    Bdev --> SSD["NVMe SSD"]
+
+    style App fill:#e1f5ff,stroke:#0077b6
+    style DevNbd fill:#f0f0f0,stroke:#999
+    style NBDDriver fill:#f0f0f0,stroke:#999
+    style NBDServer fill:#ffe1f5,stroke:#cc5599
+    style Bdev fill:#ffe1f5,stroke:#cc5599
+    style SSD fill:#f0f0f0,stroke:#999
 ```
 
 ### 8.2 NBD Usage
@@ -1020,23 +1088,40 @@ NBD is suitable for:
 **Problem**: 8-node storage cluster needs to serve 10 million IOPS at sub-50µs P99 latency for a financial trading application.
 
 **Architecture:**
-```
-8x Storage Nodes, each with:
-  - 2x 25GbE RDMA (RoCEv2)
-  - 8x NVMe P5800X (6.4TB each)
-  - 2x Xeon cores dedicated to SPDK reactors
+```mermaid
+graph TD
+    subgraph StorageNode["8x Storage Nodes (each)"]
+        HW["2x 25GbE RDMA (RoCEv2)<br/>8x NVMe P5800X (6.4TB each)<br/>2x Xeon cores dedicated to SPDK reactors"]
 
-SPDK configuration per node:
-  - spdk_tgt (NVMe-oF RDMA target)
-  - bdev_nvme (8 namespaces per node)
-  - bdev_raid (RAID-1 across 2 nodes for HA)
-  - bdev_lvol (thin-provisioned volumes)
-  - nvmf subsystem (ANA for multipath)
+        subgraph SPDKConfig["SPDK Configuration per Node"]
+            spdk_tgt["spdk_tgt<br/>(NVMe-oF RDMA target)"]
+            bdev_nvme["bdev_nvme<br/>(8 namespaces per node)"]
+            bdev_raid["bdev_raid<br/>(RAID-1 across 2 nodes for HA)"]
+            bdev_lvol["bdev_lvol<br/>(thin-provisioned volumes)"]
+            nvmf["nvmf subsystem<br/>(ANA for multipath)"]
+        end
+    end
 
-Host (initiator) side:
-  - Linux nvme-tcp or nvme-rdma kernel driver
-  - dm-multipath for HA failover
-  - Application: custom C++ with io_uring
+    subgraph Host["Host (Initiator) Side"]
+        driver["Linux nvme-tcp or<br/>nvme-rdma kernel driver"]
+        multipath["dm-multipath<br/>for HA failover"]
+        app["Application: custom C++<br/>with io_uring"]
+    end
+
+    Host -- "NVMe-oF RDMA" --> StorageNode
+
+    style StorageNode fill:#e1ffe1,stroke:#339933
+    style HW fill:#f0f0f0,stroke:#999
+    style SPDKConfig fill:#ffe1f5,stroke:#cc5599
+    style spdk_tgt fill:#ffe1f5,stroke:#cc5599
+    style bdev_nvme fill:#ffe1f5,stroke:#cc5599
+    style bdev_raid fill:#ffe1f5,stroke:#cc5599
+    style bdev_lvol fill:#ffe1f5,stroke:#cc5599
+    style nvmf fill:#ffe1f5,stroke:#cc5599
+    style Host fill:#e1f5ff,stroke:#0077b6
+    style driver fill:#e1f5ff,stroke:#0077b6
+    style multipath fill:#e1f5ff,stroke:#0077b6
+    style app fill:#e1f5ff,stroke:#0077b6
 ```
 
 **Key decisions:**
@@ -1051,20 +1136,39 @@ Host (initiator) side:
 **Problem**: 500-camera system writing 4K video streams (avg 8 MB/s per camera = 4 GB/s aggregate) with 30-day retention and instant retrieval.
 
 **Architecture:**
-```
-Ingest Nodes (2x, active-passive)
-  - SPDK NVMe-oF target (TCP)
-  - bdev_raid RAID-6 over 12x NVMe
-  - bdev_ftl over ZNS SSDs (write-optimized)
-  - Custom "ring buffer" on Blobstore:
-      - Write pointer advances sequentially
-      - Oldest blobs deleted to make space
-      - xattrs store camera ID, timestamp, duration
+```mermaid
+graph TD
+    subgraph Ingest["Ingest Nodes (2x, active-passive)"]
+        NVMeOF_T["SPDK NVMe-oF target (TCP)"]
+        RAID6["bdev_raid RAID-6<br/>over 12x NVMe"]
+        FTL["bdev_ftl over ZNS SSDs<br/>(write-optimized)"]
+        subgraph RingBuf["Custom Ring Buffer on Blobstore"]
+            WP["Write pointer advances sequentially"]
+            Del["Oldest blobs deleted to make space"]
+            XA["xattrs store camera ID,<br/>timestamp, duration"]
+        end
+    end
 
-Retrieval Nodes (4x, stateless)
-  - Connect to same NVMe-oF namespaces
-  - Read blobs by camera ID + time range lookup
-  - Serve HTTP range requests to clients
+    subgraph Retrieval["Retrieval Nodes (4x, stateless)"]
+        Connect["Connect to same<br/>NVMe-oF namespaces"]
+        ReadBlob["Read blobs by camera ID<br/>+ time range lookup"]
+        HTTP["Serve HTTP range<br/>requests to clients"]
+    end
+
+    Retrieval -- "NVMe-oF" --> Ingest
+
+    style Ingest fill:#e1ffe1,stroke:#339933
+    style NVMeOF_T fill:#fff4e1,stroke:#e6a800
+    style RAID6 fill:#ffe1f5,stroke:#cc5599
+    style FTL fill:#ffe1f5,stroke:#cc5599
+    style RingBuf fill:#fff4e1,stroke:#e6a800
+    style WP fill:#fff4e1,stroke:#e6a800
+    style Del fill:#fff4e1,stroke:#e6a800
+    style XA fill:#fff4e1,stroke:#e6a800
+    style Retrieval fill:#e1f5ff,stroke:#0077b6
+    style Connect fill:#e1f5ff,stroke:#0077b6
+    style ReadBlob fill:#e1f5ff,stroke:#0077b6
+    style HTTP fill:#e1f5ff,stroke:#0077b6
 ```
 
 **Key design choice**: Blobstore's sequential cluster allocation pattern aligns with ZNS SSD zone structure, eliminating garbage collection overhead during ingest. The FTL bdev layer handles the zone management transparently.
@@ -1074,22 +1178,44 @@ Retrieval Nodes (4x, stateless)
 **Problem**: Cloud provider needs to offer high-performance MySQL and PostgreSQL to tenants with guaranteed IOPS per tenant.
 
 **Architecture:**
-```
-Kubernetes Cluster
-├── Storage Plane (dedicated nodes)
-│   ├── SPDK spdk_tgt per node
-│   ├── bdev_lvol with thin provisioning
-│   ├── nvmf subsystem per tenant namespace
-│   └── bdev_qos (per-volume IOPS limits)
-│
-├── CSI Driver
-│   ├── Controller plugin: creates lvols, manages subsystems
-│   └── Node plugin: connects NVMe-oF, presents /dev/nvme
-│
-└── Database Pods
-    ├── MySQL: InnoDB tablespace on NVMe-oF PVC
-    ├── PostgreSQL: tablespace on NVMe-oF PVC
-    └── Redis: RDB/AOF persistence on NVMe-oF PVC
+```mermaid
+graph TD
+    subgraph K8s["Kubernetes Cluster"]
+        subgraph StoragePlane["Storage Plane (dedicated nodes)"]
+            spdk_tgt["SPDK spdk_tgt per node"]
+            lvol["bdev_lvol with thin provisioning"]
+            nvmf["nvmf subsystem<br/>per tenant namespace"]
+            qos["bdev_qos<br/>(per-volume IOPS limits)"]
+        end
+
+        subgraph CSI["CSI Driver"]
+            ctrl["Controller plugin:<br/>creates lvols, manages subsystems"]
+            node["Node plugin:<br/>connects NVMe-oF, presents /dev/nvme"]
+        end
+
+        subgraph DBPods["Database Pods"]
+            mysql["MySQL: InnoDB tablespace<br/>on NVMe-oF PVC"]
+            pg["PostgreSQL: tablespace<br/>on NVMe-oF PVC"]
+            redis["Redis: RDB/AOF persistence<br/>on NVMe-oF PVC"]
+        end
+    end
+
+    DBPods -- "NVMe-oF PVC" --> CSI
+    CSI -- "JSON-RPC /<br/>NVMe-oF" --> StoragePlane
+
+    style K8s fill:#f0f0f0,stroke:#999
+    style StoragePlane fill:#ffe1f5,stroke:#cc5599
+    style spdk_tgt fill:#ffe1f5,stroke:#cc5599
+    style lvol fill:#ffe1f5,stroke:#cc5599
+    style nvmf fill:#ffe1f5,stroke:#cc5599
+    style qos fill:#ffe1f5,stroke:#cc5599
+    style CSI fill:#fff4e1,stroke:#e6a800
+    style ctrl fill:#fff4e1,stroke:#e6a800
+    style node fill:#fff4e1,stroke:#e6a800
+    style DBPods fill:#e1f5ff,stroke:#0077b6
+    style mysql fill:#e1f5ff,stroke:#0077b6
+    style pg fill:#e1f5ff,stroke:#0077b6
+    style redis fill:#e1f5ff,stroke:#0077b6
 ```
 
 **IOPS isolation via bdev_qos:**
@@ -1108,20 +1234,26 @@ rpc.py bdev_set_qos_limit tenant_vol_1 \
 
 Computational storage devices (CSDs) execute compute tasks near the storage device to reduce data movement. SPDK plays a role in the host-side orchestration:
 
-```
-Host Application
-     │ JSON-RPC
-     ▼
-SPDK spdk_tgt
-     │
-     ├── bdev_nvme → Computational Storage Drive (CSD)
-     │               │
-     │               ├── Standard NVMe I/O (read/write)
-     │               └── NVMe vendor commands (offload tasks)
-     │
-     └── Custom offload engine module
-         Translates high-level compute requests
-         to CSD-specific NVMe commands
+```mermaid
+graph TD
+    HostApp["Host Application"] -- "JSON-RPC" --> spdk_tgt["SPDK spdk_tgt"]
+
+    spdk_tgt --> bdev_nvme["bdev_nvme"]
+    spdk_tgt --> offload["Custom offload engine module<br/>Translates high-level compute requests<br/>to CSD-specific NVMe commands"]
+
+    bdev_nvme --> CSD["Computational Storage Drive (CSD)"]
+    offload --> CSD
+
+    CSD --> StdIO["Standard NVMe I/O<br/>(read/write)"]
+    CSD --> VendorCmd["NVMe vendor commands<br/>(offload tasks)"]
+
+    style HostApp fill:#e1f5ff,stroke:#0077b6
+    style spdk_tgt fill:#ffe1f5,stroke:#cc5599
+    style bdev_nvme fill:#e1ffe1,stroke:#339933
+    style offload fill:#fff4e1,stroke:#e6a800
+    style CSD fill:#f0f0f0,stroke:#999
+    style StdIO fill:#f0f0f0,stroke:#999
+    style VendorCmd fill:#f0f0f0,stroke:#999
 ```
 
 SPDK's passthrough (`bdev_nvme_send_cmd`) allows vendor-specific NVMe commands to reach CSDs, enabling applications to orchestrate computation without a kernel driver change.
@@ -1178,30 +1310,64 @@ Use this framework to select SPDK components for your use case:
 
 ### 10.2 Component Interaction Matrix
 
-```
-                    ┌───────────────────────────────────────────────┐
-                    │          Frontend Protocols                   │
-                    │  nvmf_tgt  iscsi_tgt  vhost  nbd  direct_api │
-                    └──────────────────┬────────────────────────────┘
-                                       │
-                    ┌──────────────────▼────────────────────────────┐
-                    │               bdev Layer                      │
-                    │  bdev_qos → bdev_crypto → bdev_compress       │
-                    │                    │                           │
-                    │  bdev_lvol ────────┤                           │
-                    │  bdev_raid ────────┤                           │
-                    │  bdev_ocf  ────────┤                           │
-                    └──────────────────┬────────────────────────────┘
-                                       │
-                    ┌──────────────────▼────────────────────────────┐
-                    │            Storage Backends                   │
-                    │  bdev_nvme  bdev_ftl  bdev_rbd  bdev_uring   │
-                    └──────────────────┬────────────────────────────┘
-                                       │
-                    ┌──────────────────▼────────────────────────────┐
-                    │            Physical Storage                   │
-                    │  PCIe NVMe  ZNS SSD  Ceph  Kernel block dev  │
-                    └───────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Frontend["Frontend Protocols"]
+        nvmf_tgt["nvmf_tgt"]
+        iscsi_tgt["iscsi_tgt"]
+        vhost["vhost"]
+        nbd["nbd"]
+        direct_api["direct_api"]
+    end
+
+    subgraph BdevLayer["bdev Layer"]
+        bdev_qos["bdev_qos"] --> bdev_crypto["bdev_crypto"] --> bdev_compress["bdev_compress"]
+        bdev_lvol["bdev_lvol"]
+        bdev_raid["bdev_raid"]
+        bdev_ocf["bdev_ocf"]
+    end
+
+    subgraph Backends["Storage Backends"]
+        bdev_nvme["bdev_nvme"]
+        bdev_ftl["bdev_ftl"]
+        bdev_rbd["bdev_rbd"]
+        bdev_uring["bdev_uring"]
+    end
+
+    subgraph Physical["Physical Storage"]
+        PCIeNVMe["PCIe NVMe"]
+        ZNS["ZNS SSD"]
+        Ceph["Ceph"]
+        KernelDev["Kernel block dev"]
+    end
+
+    Frontend --> BdevLayer
+    BdevLayer --> Backends
+    Backends --> Physical
+
+    style Frontend fill:#fff4e1,stroke:#e6a800
+    style nvmf_tgt fill:#fff4e1,stroke:#e6a800
+    style iscsi_tgt fill:#fff4e1,stroke:#e6a800
+    style vhost fill:#fff4e1,stroke:#e6a800
+    style nbd fill:#fff4e1,stroke:#e6a800
+    style direct_api fill:#fff4e1,stroke:#e6a800
+    style BdevLayer fill:#ffe1f5,stroke:#cc5599
+    style bdev_qos fill:#ffe1f5,stroke:#cc5599
+    style bdev_crypto fill:#ffe1f5,stroke:#cc5599
+    style bdev_compress fill:#ffe1f5,stroke:#cc5599
+    style bdev_lvol fill:#ffe1f5,stroke:#cc5599
+    style bdev_raid fill:#ffe1f5,stroke:#cc5599
+    style bdev_ocf fill:#ffe1f5,stroke:#cc5599
+    style Backends fill:#e1ffe1,stroke:#339933
+    style bdev_nvme fill:#e1ffe1,stroke:#339933
+    style bdev_ftl fill:#e1ffe1,stroke:#339933
+    style bdev_rbd fill:#e1ffe1,stroke:#339933
+    style bdev_uring fill:#e1ffe1,stroke:#339933
+    style Physical fill:#f0f0f0,stroke:#999
+    style PCIeNVMe fill:#f0f0f0,stroke:#999
+    style ZNS fill:#f0f0f0,stroke:#999
+    style Ceph fill:#f0f0f0,stroke:#999
+    style KernelDev fill:#f0f0f0,stroke:#999
 ```
 
 ### 10.3 Anti-Patterns to Avoid

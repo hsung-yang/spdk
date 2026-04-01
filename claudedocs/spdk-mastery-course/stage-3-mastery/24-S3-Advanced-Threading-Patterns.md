@@ -439,11 +439,15 @@ Memory ordering prevents the CPU (and compiler) from reordering loads and stores
 
 **Practical example — ring produce/consume pair**:
 
-```
-Producer (Core 0)            Consumer (Core 1)
-─────────────────            ─────────────────
-STORE data[slot]   ──────►  (sees data[slot])
-RELEASE store tail           ACQUIRE load tail
+```mermaid
+sequenceDiagram
+    participant P as Producer (Core 0)
+    participant C as Consumer (Core 1)
+
+    P->>P: STORE data[slot]
+    P->>C: RELEASE store tail
+    C->>C: ACQUIRE load tail
+    C->>C: sees data[slot]
 ```
 
 The RELEASE on the producer's tail store and ACQUIRE on the consumer's tail load create a happens-before edge. The consumer is guaranteed to see `data[slot]` after seeing the updated tail.
@@ -688,21 +692,15 @@ spdk_thread_destroy(thread);
 
 The scheduler framework separates *policy* (which thread should live on which core) from *mechanism* (how threads are moved). The scheduler implements policy; the reactor implements mechanism.
 
-```
-┌──────────────────────────────────────────────┐
-│              Scheduling Reactor               │
-│                                              │
-│  Every scheduler_period_us microseconds:     │
-│  1. Collect spdk_scheduler_core_info[]       │
-│  2. Call scheduler->balance(core_info, N)    │
-│  3. Apply lcore changes via reactor_thread_op│
-└──────────────────────────────────────────────┘
-         │ balance() modifies thread_info->lcore
-         ▼
-┌──────────────────────────────────────────────┐
-│           Scheduler Implementation           │
-│  (static / dynamic / custom)                 │
-└──────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    SR["Scheduling Reactor<br/><br/>Every scheduler_period_us microseconds:<br/>1. Collect spdk_scheduler_core_info[]<br/>2. Call scheduler->balance(core_info, N)<br/>3. Apply lcore changes via reactor_thread_op"]
+    SI["Scheduler Implementation<br/>(static / dynamic / custom)"]
+
+    SR -- "balance() modifies<br/>thread_info->lcore" --> SI
+
+    style SR fill:#ffe1f5,stroke:#333
+    style SI fill:#e1ffe1,stroke:#333
 ```
 
 ### 6.2 Scheduler Registration
@@ -991,10 +989,21 @@ prepare_to_wake(uint32_t core)
 
 This creates an automatic power-performance curve:
 
-```
-Workload:  Low ──────────────────────────────► High
-Frequency: Min ──────────────────────────────► Max
-CPU cores: 1 (interrupt) ────────────────────► N (polling)
+```mermaid
+flowchart LR
+    subgraph Low["Low Workload"]
+        FreqMin["Frequency: Min"]
+        CoreInt["CPU cores: 1 (interrupt)"]
+    end
+    subgraph High["High Workload"]
+        FreqMax["Frequency: Max"]
+        CorePoll["CPU cores: N (polling)"]
+    end
+
+    Low -- "Workload increases" --> High
+
+    style Low fill:#e1f5ff,stroke:#333
+    style High fill:#ffe1f5,stroke:#333
 ```
 
 ### 7.4 Governor Registration and Selection

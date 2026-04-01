@@ -33,35 +33,43 @@ The answer is vhost-user, a protocol that lets the VM's virtio driver talk direc
 
 Traditional QEMU storage emulation goes through multiple layers:
 
-```
-Guest OS
-  |
-  v
-virtio-blk driver (guest kernel)
-  |   <-- VM exit on every I/O submission
-  v
-QEMU virtio-blk emulation (host userspace)
-  |
-  v
-Host kernel block layer
-  |
-  v
-Storage device
+```mermaid
+flowchart TD
+    G["Guest OS"]
+    VD["virtio-blk driver<br/>(guest kernel)"]
+    QE["QEMU virtio-blk emulation<br/>(host userspace)"]
+    KB["Host kernel block layer"]
+    SD["Storage device"]
+
+    G --> VD
+    VD -- "VM exit on every<br/>I/O submission" --> QE
+    QE --> KB
+    KB --> SD
+
+    style G fill:#e1f5ff,stroke:#333
+    style VD fill:#e1ffe1,stroke:#333
+    style QE fill:#fff4e1,stroke:#333
+    style KB fill:#f0f0f0,stroke:#333
+    style SD fill:#f0f0f0,stroke:#333
 ```
 
 With SPDK vhost-user:
 
-```
-Guest OS
-  |
-  v
-virtio-blk driver (guest kernel)
-  |   <-- writes directly to shared memory ring
-  v
-SPDK vhost poller (poll-mode, no VM exits on submission)
-  |
-  v
-SPDK bdev layer (NVMe, Malloc, AIO, ...)
+```mermaid
+flowchart TD
+    G["Guest OS"]
+    VD["virtio-blk driver<br/>(guest kernel)"]
+    SP["SPDK vhost poller<br/>(poll-mode, no VM exits on submission)"]
+    BD["SPDK bdev layer<br/>(NVMe, Malloc, AIO, ...)"]
+
+    G --> VD
+    VD -- "writes directly to<br/>shared memory ring" --> SP
+    SP --> BD
+
+    style G fill:#e1f5ff,stroke:#333
+    style VD fill:#e1ffe1,stroke:#333
+    style SP fill:#ffe1f5,stroke:#333
+    style BD fill:#fff4e1,stroke:#333
 ```
 
 The elimination of VM exits on I/O submission is the key performance gain. SPDK's polling model also avoids the overhead of virtio kick notifications.
@@ -83,21 +91,18 @@ Understanding three distinct layers prevents confusion throughout this module.
 
 **Vhost-user** is an extension of the vhost protocol that runs the device back-end in user space. It uses a Unix domain socket for control messages and shared memory (via `mmap`) for data rings.
 
-```
-+----------------------------------+
-|  VIRTIO SPECIFICATION            |
-|  (ring format, device types,     |
-|   feature bits, protocol)        |
-+----------------------------------+
-         |               |
-         v               v
-+---------------+  +-------------------+
-|  vhost        |  |  vhost-user       |
-|  (kernel)     |  |  (user space)     |
-|               |  |                   |
-|  vhost_net    |  |  SPDK vhost       |
-|  vhost_scsi   |  |  (this module)    |
-+---------------+  +-------------------+
+```mermaid
+graph TD
+    VS["VIRTIO SPECIFICATION<br/>(ring format, device types,<br/>feature bits, protocol)"]
+    VK["vhost (kernel)<br/><br/>vhost_net<br/>vhost_scsi"]
+    VU["vhost-user (user space)<br/><br/>SPDK vhost<br/>(this module)"]
+
+    VS --> VK
+    VS --> VU
+
+    style VS fill:#fff4e1,stroke:#333
+    style VK fill:#f0f0f0,stroke:#333
+    style VU fill:#ffe1f5,stroke:#333
 ```
 
 SPDK implements a **vhost-user back-end server**. It listens on Unix domain sockets and waits for connections from front-end clients — most commonly QEMU.
@@ -108,58 +113,45 @@ SPDK implements a **vhost-user back-end server**. It listens on Unix domain sock
 
 The virtqueue is the core data structure for passing I/O between the driver (guest) and device (SPDK). The split ring format (virtio 1.0) consists of three regions in shared memory:
 
-```
-Virtqueue (Split Ring Format)
-==============================================================
+```mermaid
+graph TD
+    subgraph VQ["Virtqueue (Split Ring Format)"]
+        subgraph DT["DESCRIPTOR TABLE (driver fills, device reads)"]
+            D0["desc0"] --- D1["desc1"] --- D2["desc2"] --- D3["desc3"] --- D4["desc4"] --- D5["desc5"]
+        end
+        DF["Each descriptor:<br/>addr - guest physical address of buffer<br/>len - buffer length in bytes<br/>flags - NEXT (chain), WRITE (device writable)<br/>next - index of next descriptor in chain"]
 
-DESCRIPTOR TABLE (driver fills, device reads)
-+-------+-------+-------+-------+-------+-------+
-| desc0 | desc1 | desc2 | desc3 | desc4 | desc5 |  ...
-+-------+-------+-------+-------+-------+-------+
-  Each descriptor:
-    addr   - guest physical address of buffer
-    len    - buffer length in bytes
-    flags  - NEXT (chain), WRITE (device writable)
-    next   - index of next descriptor in chain
+        subgraph AR["AVAILABLE RING (driver produces, device consumes)"]
+            AF["flags"] --- AI["idx"] --- AR0["ring[0]"] --- AR1["ring[1]"] --- AR2["ring[2]"]
+        end
+        AD["flags - VRING_AVAIL_F_NO_INTERRUPT (suppress kicks)<br/>idx - next index driver will write<br/>ring - indices into descriptor table"]
 
-AVAILABLE RING (driver produces, device consumes)
-+---------+--------+--------+--------+--------+
-|  flags  | idx    | ring[0]| ring[1]| ring[2]|  ...
-+---------+--------+--------+--------+--------+
-  flags - VRING_AVAIL_F_NO_INTERRUPT (suppress kicks)
-  idx   - next index driver will write
-  ring  - indices into descriptor table
+        subgraph UR["USED RING (device produces, driver consumes)"]
+            UF["flags"] --- UI["idx"] --- UR0["ring[0]"] --- UR1["ring[1]"] --- UR2["ring[2]"]
+        end
+        UD["flags - VRING_USED_F_NO_NOTIFY (suppress notifications)<br/>idx - next index device will write<br/>ring[] - {id: desc_head, len: bytes_written}"]
+    end
 
-USED RING (device produces, driver consumes)
-+---------+--------+--------+--------+--------+
-|  flags  | idx    | ring[0]| ring[1]| ring[2]|  ...
-+---------+--------+--------+--------+--------+
-  flags  - VRING_USED_F_NO_NOTIFY (suppress notifications)
-  idx    - next index device will write
-  ring[] - {id: desc_head, len: bytes_written}
+    style DT fill:#e1f5ff,stroke:#333
+    style AR fill:#e1ffe1,stroke:#333
+    style UR fill:#fff4e1,stroke:#333
+    style VQ fill:#f0f0f0,stroke:#333
 ```
 
 A read I/O request uses a chain of three descriptors:
 
-```
-Descriptor chain for a READ request:
+```mermaid
+flowchart TD
+    D0["desc[0]: addr=req_hdr, len=16, flags=0 (readable)<br/><br/>struct virtio_blk_req {<br/>&nbsp; type = VIRTIO_BLK_T_IN (0)<br/>&nbsp; ioprio = 0<br/>&nbsp; sector = 1024<br/>}"]
+    D1["desc[1]: addr=data_buf, len=4096<br/>flags=WRITE (writable by device)<br/><br/>device writes read data here"]
+    D2["desc[2]: addr=status_buf, len=1<br/>flags=WRITE (writable by device)<br/><br/>device writes 0x00 (OK) or error code"]
 
-desc[0]: addr=req_hdr, len=16, flags=0 (readable)
-  struct virtio_blk_req {
-    type   = VIRTIO_BLK_T_IN  (0)
-    ioprio = 0
-    sector = 1024
-  }
-  |
-  | (NEXT flag set, next=1)
-  v
-desc[1]: addr=data_buf, len=4096, flags=WRITE (writable by device)
-  <- device writes read data here
-  |
-  | (NEXT flag set, next=2)
-  v
-desc[2]: addr=status_buf, len=1, flags=WRITE (writable by device)
-  <- device writes 0x00 (OK) or error code here
+    D0 -- "NEXT flag set, next=1" --> D1
+    D1 -- "NEXT flag set, next=2" --> D2
+
+    style D0 fill:#e1f5ff,stroke:#333
+    style D1 fill:#e1ffe1,stroke:#333
+    style D2 fill:#fff4e1,stroke:#333
 ```
 
 The virtio descriptor struct from the SPDK source (`vhost_processing.md`):
@@ -185,41 +177,26 @@ struct virtq_desc {
 
 Before any I/O flows, QEMU and SPDK exchange vhost-user messages over the Unix domain socket. This is the control plane.
 
-```
-QEMU (front-end)                    SPDK (back-end server)
-       |                                    |
-       |  connect()                         |
-       |-------------------------------------->  (Unix socket)
-       |                                    |
-       |  VHOST_USER_GET_FEATURES           |
-       |-------------------------------------->
-       |  <features bitmask>                |
-       |<--------------------------------------
-       |                                    |
-       |  VHOST_USER_SET_FEATURES           |
-       |  <negotiated features>             |
-       |-------------------------------------->
-       |                                    |
-       |  VHOST_USER_GET_PROTOCOL_FEATURES  |
-       |-------------------------------------->
-       |  VHOST_USER_SET_PROTOCOL_FEATURES  |
-       |-------------------------------------->
-       |                                    |
-       |  VHOST_USER_SET_MEM_TABLE          |
-       |  <fd[], regions[]>                 |  <- shared memory file descriptors
-       |-------------------------------------->
-       |                                    |  SPDK mmaps each region
-       |  VHOST_USER_SET_VRING_NUM    (x N) |
-       |  VHOST_USER_SET_VRING_ADDR   (x N) |  <- descriptor/avail/used ring GPA
-       |  VHOST_USER_SET_VRING_BASE   (x N) |
-       |  VHOST_USER_SET_VRING_KICK   (x N) |  <- eventfd for VM kick (unused by SPDK poll)
-       |  VHOST_USER_SET_VRING_CALL   (x N) |  <- eventfd for SPDK->VM IRQ
-       |-------------------------------------->
-       |                                    |
-       |  VHOST_USER_SET_VRING_ENABLE (x N) |  <- enable multiqueue virtqueues
-       |-------------------------------------->
-       |                                    |
-       ==  I/O CAN NOW FLOW  ==
+```mermaid
+sequenceDiagram
+    participant Q as QEMU (front-end)
+    participant S as SPDK (back-end server)
+
+    Q->>S: connect() (Unix socket)
+    Q->>S: VHOST_USER_GET_FEATURES
+    S-->>Q: features bitmask
+    Q->>S: VHOST_USER_SET_FEATURES (negotiated)
+    Q->>S: VHOST_USER_GET_PROTOCOL_FEATURES
+    Q->>S: VHOST_USER_SET_PROTOCOL_FEATURES
+    Q->>S: VHOST_USER_SET_MEM_TABLE (fd[], regions[])
+    Note right of S: SPDK mmaps each region
+    Q->>S: VHOST_USER_SET_VRING_NUM (x N)
+    Q->>S: VHOST_USER_SET_VRING_ADDR (x N, desc/avail/used GPA)
+    Q->>S: VHOST_USER_SET_VRING_BASE (x N)
+    Q->>S: VHOST_USER_SET_VRING_KICK (x N, eventfd)
+    Q->>S: VHOST_USER_SET_VRING_CALL (x N, eventfd for IRQ)
+    Q->>S: VHOST_USER_SET_VRING_ENABLE (x N)
+    Note over Q,S: I/O CAN NOW FLOW
 ```
 
 Key features negotiated by SPDK (from `vhost_internal.h`):
@@ -252,16 +229,19 @@ Additional blk-specific features:
 
 The guest places buffer addresses in descriptors as guest physical addresses (GPA). SPDK must translate these to addresses it can access — vhost virtual addresses (VVA).
 
-```
-Guest Physical Address (GPA)
-         |
-         | lookup in mem region table
-         v
-  mem_region[i].guest_phys_addr <= GPA < guest_phys_addr + size ?
-         |
-         | offset = GPA - mem_region[i].guest_phys_addr
-         v
-  VVA = mem_region[i].mmap_addr + offset
+```mermaid
+flowchart TD
+    GPA["Guest Physical Address (GPA)"]
+    Lookup["Lookup in mem region table:<br/>mem_region[i].guest_phys_addr <= GPA<br/>< guest_phys_addr + size ?"]
+    Offset["offset = GPA - mem_region[i].guest_phys_addr"]
+    VVA["VVA = mem_region[i].mmap_addr + offset"]
+
+    GPA --> Lookup --> Offset --> VVA
+
+    style GPA fill:#e1f5ff,stroke:#333
+    style Lookup fill:#fff4e1,stroke:#333
+    style Offset fill:#ffe1f5,stroke:#333
+    style VVA fill:#e1ffe1,stroke:#333
 ```
 
 SPDK's translation function (from `vhost_internal.h`):
@@ -281,34 +261,21 @@ This is called for every buffer in every descriptor. The implementation walks `v
 
 The vhost subsystem has a clear three-level hierarchy:
 
-```
-spdk_vhost_dev (abstract device)
-  |-- name, path (socket path)
-  |-- thread (assigned SPDK thread)
-  |-- virtio_features, protocol_features
-  |-- backend (ops: get_config, set_config, dump_info_json, ...)
-  |-- ctxt -> spdk_vhost_user_dev
-                |-- lock (pthread mutex)
-                |-- vsessions (TAILQ of active connections)
-                |-- user_backend (start/stop session callbacks)
+```mermaid
+graph TD
+    VD["spdk_vhost_dev (abstract device)<br/><br/>name, path (socket path)<br/>thread (assigned SPDK thread)<br/>virtio_features, protocol_features<br/>backend (ops: get_config, set_config, ...)"]
+    UD["spdk_vhost_user_dev<br/><br/>lock (pthread mutex)<br/>vsessions (TAILQ of active connections)<br/>user_backend (start/stop session callbacks)"]
+    VS["spdk_vhost_session (one per QEMU connection)<br/><br/>vid (rte_vhost connection ID)<br/>mem (mapped memory regions)<br/>negotiated_features, max_queues<br/>virtqueue[256 max]<br/>coalescing_delay_time_base<br/>dpdk_sem (synchronization semaphore)"]
+    VQ["spdk_vhost_virtqueue (one per virtqueue)<br/><br/>vring (desc, avail, used pointers)<br/>last_avail_idx, last_used_idx<br/>packed (avail_phase, used_phase)<br/>tasks (pre-allocated task pool)<br/>req_cnt, used_req_cnt (coalescing)<br/>irq_delay_time, next_event_time"]
 
-spdk_vhost_session (one per QEMU connection)
-  |-- vid (rte_vhost connection ID)
-  |-- mem (mapped memory regions)
-  |-- negotiated_features
-  |-- max_queues
-  |-- virtqueue[SPDK_VHOST_MAX_VQUEUES] (256 max)
-  |-- coalescing_delay_time_base
-  |-- dpdk_sem (synchronization semaphore)
+    VD -- "ctxt" --> UD
+    UD -- "vsessions" --> VS
+    VS -- "virtqueue[]" --> VQ
 
-spdk_vhost_virtqueue (one per virtqueue)
-  |-- vring (rte_vhost_vring: desc, avail, used pointers)
-  |-- last_avail_idx (where SPDK last read from avail ring)
-  |-- last_used_idx  (where SPDK last wrote to used ring)
-  |-- packed (avail_phase, used_phase for packed ring)
-  |-- tasks (pre-allocated task pool, indexed by req_idx)
-  |-- req_cnt, used_req_cnt (for coalescing)
-  |-- irq_delay_time, next_event_time
+    style VD fill:#e1f5ff,stroke:#333
+    style UD fill:#fff4e1,stroke:#333
+    style VS fill:#ffe1f5,stroke:#333
+    style VQ fill:#e1ffe1,stroke:#333
 ```
 
 Key constant limits:
@@ -327,47 +294,30 @@ Key constant limits:
 
 The vhost-blk target exposes a single bdev as a virtio-blk device to the guest. This is the simpler of the two target types.
 
-```
-Architecture: vhost-blk
-================================================
+```mermaid
+flowchart TD
+    subgraph Guest["VM Guest"]
+        VBD["virtio-blk driver"]
+    end
 
-VM Guest                SPDK Process
------------             --------------------------
-virtio-blk driver
-  |
-  | write desc to avail ring
-  | (no kick — SPDK polls)
-  |
-  +----> shared memory ---> spdk_vhost_virtqueue
-                                  |
-                              vhost_blk_poller()
-                                  |
-                              vhost_vq_avail_ring_get()
-                                  | (up to 32 reqs per poll)
-                                  |
-                              for each req_idx:
-                                  |
-                              process_blk_request()
-                                  |
-                              GPA->VVA translation
-                              build iovec array
-                                  |
-                              virtio_blk_process_request()
-                                  | dispatch by type:
-                                  |   VIRTIO_BLK_T_IN  -> bdev_read_blocks()
-                                  |   VIRTIO_BLK_T_OUT -> bdev_write_blocks()
-                                  |   VIRTIO_BLK_T_FLUSH -> bdev_flush()
-                                  |   VIRTIO_BLK_T_GET_ID -> copy serial
-                                  |   VIRTIO_BLK_T_DISCARD -> bdev_unmap()
-                                  |   VIRTIO_BLK_T_WRITE_ZEROES -> bdev_write_zeroes()
-                                  |
-                              bdev completion callback
-                                  |
-                              blk_request_finish()
-                                  |
-                              write status byte
-                              enqueue to used ring
-                              eventfd_write() -> guest IRQ
+    subgraph SPDK["SPDK Process"]
+        VQ["spdk_vhost_virtqueue"]
+        Poll["vhost_blk_poller()"]
+        Avail["vhost_vq_avail_ring_get()<br/>(up to 32 reqs per poll)"]
+        Proc["process_blk_request()<br/>GPA->VVA translation<br/>build iovec array"]
+        Dispatch["virtio_blk_process_request()<br/>dispatch by type:<br/>T_IN -> bdev_read_blocks()<br/>T_OUT -> bdev_write_blocks()<br/>T_FLUSH -> bdev_flush()<br/>T_GET_ID -> copy serial<br/>T_DISCARD -> bdev_unmap()<br/>T_WRITE_ZEROES -> bdev_write_zeroes()"]
+        Complete["bdev completion callback"]
+        Finish["blk_request_finish()<br/>write status byte<br/>enqueue to used ring<br/>eventfd_write() -> guest IRQ"]
+    end
+
+    VBD -- "write desc to avail ring<br/>(no kick - SPDK polls)" --> VQ
+    VQ --> Poll --> Avail --> Proc --> Dispatch --> Complete --> Finish
+
+    style Guest fill:#e1f5ff,stroke:#333
+    style VQ fill:#fff4e1,stroke:#333
+    style Poll fill:#ffe1f5,stroke:#333
+    style Dispatch fill:#e1ffe1,stroke:#333
+    style Finish fill:#fff4e1,stroke:#333
 ```
 
 **Data structures for vhost-blk** (from `vhost_blk.c`):
@@ -466,40 +416,32 @@ virtio_blk_process_request(struct spdk_vhost_dev *vdev,
 
 The vhost-scsi target exposes a SCSI controller with up to 8 targets to the guest. Each target maps to an SPDK bdev via the SCSI layer. This allows hot-attach and hot-detach of storage targets while the VM runs.
 
-```
-Architecture: vhost-scsi
-================================================
+```mermaid
+flowchart TD
+    subgraph Guest["VM Guest"]
+        VSD["virtio-scsi driver<br/>(SCSI controller: 1 request queue<br/>+ 1 event queue + 1 control queue)"]
+    end
 
-VM Guest                SPDK Process
------------             --------------------------
-virtio-scsi driver
-  (sees: SCSI controller)
-  (has: 1 request queue + 1 event queue + 1 control queue)
-  |
-  | submit SCSI CDB to requestq
-  |
-  +----> shared memory ---> spdk_vhost_virtqueue[requestq]
-                                  |
-                              vhost_scsi_vq_worker()
-                                  |
-                              vhost_vq_avail_ring_get()
-                                  |
-                              process_request()
-                                  |
-                              vhost_scsi_task_init_target()
-                                  | parse LUN -> find scsi_dev
-                                  |
-                              task_submit()
-                                  |
-                              spdk_scsi_dev_queue_task()
-                                  |
-                              SCSI layer -> bdev I/O
-                                  |
-                              vhost_scsi_task_cpl()
-                                  |
-                              fill resp->status, resp->sense
-                              vhost_vq_used_ring_enqueue()
-                              eventfd_write() -> guest IRQ
+    subgraph SPDK["SPDK Process"]
+        VQ["spdk_vhost_virtqueue[requestq]"]
+        Worker["vhost_scsi_vq_worker()"]
+        Avail["vhost_vq_avail_ring_get()"]
+        ProcReq["process_request()"]
+        InitTgt["vhost_scsi_task_init_target()<br/>parse LUN -> find scsi_dev"]
+        Submit["task_submit()<br/>spdk_scsi_dev_queue_task()"]
+        SCSI["SCSI layer -> bdev I/O"]
+        Cpl["vhost_scsi_task_cpl()<br/>fill resp->status, resp->sense<br/>vhost_vq_used_ring_enqueue()<br/>eventfd_write() -> guest IRQ"]
+    end
+
+    VSD -- "submit SCSI CDB<br/>to requestq" --> VQ
+    VQ --> Worker --> Avail --> ProcReq --> InitTgt --> Submit --> SCSI --> Cpl
+
+    style Guest fill:#e1f5ff,stroke:#333
+    style VQ fill:#fff4e1,stroke:#333
+    style Worker fill:#ffe1f5,stroke:#333
+    style InitTgt fill:#e1ffe1,stroke:#333
+    style SCSI fill:#e1ffe1,stroke:#333
+    style Cpl fill:#fff4e1,stroke:#333
 ```
 
 **Data structures for vhost-scsi** (from `vhost_scsi.c`):
@@ -586,26 +528,22 @@ static const struct spdk_vhost_dev_backend spdk_vhost_scsi_device_backend = {
 
 The packed ring format, introduced in virtio 1.1, replaces the three-region split ring with a single descriptor ring. This improves cache locality and reduces memory bandwidth.
 
-**Split ring (virtio 1.0)**:
-```
-[Descriptor Table]  ← driver fills
-[Available Ring]    ← driver publishes
-[Used Ring]         ← device publishes
+```mermaid
+graph LR
+    subgraph Split["Split Ring (virtio 1.0)"]
+        DT["Descriptor Table<br/>(driver fills)"]
+        AVR["Available Ring<br/>(driver publishes)"]
+        USR["Used Ring<br/>(device publishes)"]
+        Problem["Problem: 3 separate<br/>memory regions = cache misses"]
+    end
 
-Problem: 3 separate memory regions = cache misses
-```
+    subgraph Packed["Packed Ring (virtio 1.1)"]
+        SDR["Single Descriptor Ring<br/>Each entry: addr, len, id, flags<br/><br/>AVAIL: set by driver when queuing<br/>USED: set by device when completing<br/>NEXT: continues to next descriptor"]
+        Benefit["Benefit: same ring for both<br/>better cache performance at high IOPS"]
+    end
 
-**Packed ring (virtio 1.1)**:
-```
-[Single Descriptor Ring]
-  Each entry contains: addr, len, id, flags
-  flags bits:
-    AVAIL: set by driver when queuing
-    USED:  set by device when completing
-    NEXT:  continues to next descriptor
-
-Benefit: driver and device update the same ring
-         better cache performance at high IOPS
+    style Split fill:#fff4e1,stroke:#333
+    style Packed fill:#e1ffe1,stroke:#333
 ```
 
 SPDK tracks packed ring state in `spdk_vhost_virtqueue`:
@@ -707,31 +645,41 @@ struct spdk_vhost_virtqueue {
 
 SPDK vhost integrates cleanly with SPDK's reactor/thread model.
 
-```
-SPDK Application
-  |
-  +-- Reactor (core 0)
-  |     |
-  |     +-- SPDK Thread "vhost_tgt"
-  |           |
-  |           +-- vhost_user_session management
-  |           |   (socket accept, feature negotiation)
-  |           |
-  |           +-- vhost.0 device
-  |                 |
-  |                 +-- vsession (QEMU connection)
-  |                       |
-  |                       +-- requestq_poller
-  |                             (polls virtqueue[0])
-  |
-  +-- Reactor (core 1)
-        |
-        +-- SPDK Thread "vhost_tgt2"
-              |
-              +-- vhost.1 device (cpumask 0x2)
-                    |
-                    +-- vsession
-                          +-- requestq_poller
+```mermaid
+graph TD
+    App["SPDK Application"]
+
+    subgraph Core0["Reactor (core 0)"]
+        T0["SPDK Thread 'vhost_tgt'"]
+        Sess["vhost_user_session management<br/>(socket accept, feature negotiation)"]
+        V0["vhost.0 device"]
+        VS0["vsession (QEMU connection)"]
+        RQ0["requestq_poller<br/>(polls virtqueue[0])"]
+    end
+
+    subgraph Core1["Reactor (core 1)"]
+        T1["SPDK Thread 'vhost_tgt2'"]
+        V1["vhost.1 device (cpumask 0x2)"]
+        VS1["vsession"]
+        RQ1["requestq_poller"]
+    end
+
+    App --> Core0
+    App --> Core1
+    T0 --> Sess
+    T0 --> V0
+    V0 --> VS0
+    VS0 --> RQ0
+    T1 --> V1
+    V1 --> VS1
+    VS1 --> RQ1
+
+    style Core0 fill:#e1f5ff,stroke:#333
+    style Core1 fill:#e1ffe1,stroke:#333
+    style V0 fill:#fff4e1,stroke:#333
+    style V1 fill:#fff4e1,stroke:#333
+    style RQ0 fill:#ffe1f5,stroke:#333
+    style RQ1 fill:#ffe1f5,stroke:#333
 ```
 
 The `cpumask` parameter controls which reactor core(s) can service a vhost device:
@@ -752,59 +700,59 @@ scripts/rpc.py vhost_create_blk_controller --cpumask 0x2 vhost.1 Malloc0
 
 Full system view from VM guest to NVMe device:
 
-```
-+===========================================================+
-|  QEMU Virtual Machine                                     |
-|  +-----------------------------------------------------+  |
-|  |  Guest OS                                           |  |
-|  |  +---------------+   +---------------+             |  |
-|  |  | virtio-blk    |   | virtio-scsi   |             |  |
-|  |  | driver        |   | driver        |             |  |
-|  |  +-------+-------+   +-------+-------+             |  |
-|  |          |                   |                     |  |
-|  |          +-------------------+                     |  |
-|  |                    |                               |  |
-|  |            virtqueue rings                         |  |
-|  |         (in hugepage memory)                       |  |
-|  +-----------------------------------------------------+  |
-|                        |                                  |
-|              QEMU PCI emulation                           |
-|              (thin broker — setup only)                   |
-+===========================================================+
-                         |
-              Unix socket (control plane: setup)
-              Shared hugepages (data plane: I/O)
-                         |
-+===========================================================+
-|  SPDK Process (user space)                                |
-|                                                           |
-|  +---------------------+  +---------------------+        |
-|  |  vhost-blk target   |  |  vhost-scsi target  |        |
-|  |  (vhost.1)          |  |  (vhost.0)          |        |
-|  |                     |  |                     |        |
-|  |  requestq_poller    |  |  requestq_poller    |        |
-|  |  (no sleep, pure    |  |  eventq_poller      |        |
-|  |   poll mode)        |  |  controlq_poller    |        |
-|  +--------+------------+  +----------+----------+        |
-|           |                          |                   |
-|           |        bdev API          |                   |
-|           |                          |                   |
-|  +--------+----------+  +------------+----------+        |
-|  |  SPDK bdev layer  |  |   SPDK SCSI layer     |        |
-|  +-------------------+  +-----------+-----------+        |
-|                                     |                   |
-|  +-----------------+  +-------------+-----------+        |
-|  |  NVMe bdev      |  |  Malloc bdev            |        |
-|  |  (Nvme0n1)      |  |  (Malloc0)              |        |
-|  +--------+--------+  +-------------------------+        |
-|           |                                              |
-+===========================================================+
-            |
-     PCIe (user space driver, no kernel)
-            |
-+===========================================================+
-|  NVMe SSD                                                 |
-+===========================================================+
+```mermaid
+graph TD
+    subgraph QEMU["QEMU Virtual Machine"]
+        subgraph GuestOS["Guest OS"]
+            VBlk["virtio-blk driver"]
+            VScsi["virtio-scsi driver"]
+            VRings["virtqueue rings<br/>(in hugepage memory)"]
+        end
+        QEmu["QEMU PCI emulation<br/>(thin broker - setup only)"]
+        VBlk --> VRings
+        VScsi --> VRings
+        VRings --> QEmu
+    end
+
+    Conn["Unix socket (control plane: setup)<br/>Shared hugepages (data plane: I/O)"]
+
+    subgraph SPDKProc["SPDK Process (user space)"]
+        subgraph Targets["Vhost Targets"]
+            VHBlk["vhost-blk target (vhost.1)<br/>requestq_poller<br/>(no sleep, pure poll mode)"]
+            VHScsi["vhost-scsi target (vhost.0)<br/>requestq_poller<br/>eventq_poller / controlq_poller"]
+        end
+        BdevAPI["bdev API"]
+        subgraph Layers["Storage Layers"]
+            BdevL["SPDK bdev layer"]
+            ScsiL["SPDK SCSI layer"]
+        end
+        subgraph Bdevs["Block Devices"]
+            NVMeBdev["NVMe bdev (Nvme0n1)"]
+            MallocBdev["Malloc bdev (Malloc0)"]
+        end
+        VHBlk --> BdevAPI
+        VHScsi --> BdevAPI
+        BdevAPI --> BdevL
+        BdevAPI --> ScsiL
+        BdevL --> NVMeBdev
+        BdevL --> MallocBdev
+        ScsiL --> NVMeBdev
+        ScsiL --> MallocBdev
+    end
+
+    PCIe["PCIe (user space driver, no kernel)"]
+    SSD["NVMe SSD"]
+
+    QEmu --> Conn --> Targets
+    NVMeBdev --> PCIe --> SSD
+
+    style QEMU fill:#e1f5ff,stroke:#333
+    style GuestOS fill:#e1f5ff,stroke:#333
+    style SPDKProc fill:#ffe1f5,stroke:#333
+    style Targets fill:#fff4e1,stroke:#333
+    style Layers fill:#fff4e1,stroke:#333
+    style Bdevs fill:#e1ffe1,stroke:#333
+    style SSD fill:#f0f0f0,stroke:#333
 ```
 
 ---
@@ -993,9 +941,17 @@ update-grub
 
 SPDK vhost uses 100% CPU polling by design. Assign dedicated cores:
 
-```
-Host cores 0-1:  SPDK vhost (--mask 0x3)
-Host cores 2-3:  QEMU + guest vCPUs (taskset -c 2,3 qemu-system-x86_64)
+```mermaid
+flowchart LR
+    subgraph Core01["Host cores 0-1"]
+        SPDK["SPDK vhost<br/>(--mask 0x3)"]
+    end
+    subgraph Core23["Host cores 2-3"]
+        QEMU["QEMU + guest vCPUs<br/>(taskset -c 2,3)"]
+    end
+
+    style Core01 fill:#ffe1f5,stroke:#333
+    style Core23 fill:#e1f5ff,stroke:#333
 ```
 
 This prevents SPDK pollers from competing with QEMU scheduling.
@@ -1165,18 +1121,21 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 
 **Indirect descriptors**: When `VIRTIO_RING_F_INDIRECT_DESC` is negotiated, a single descriptor in the main ring can point to a table of additional descriptors in guest memory. This allows I/O requests with many scatter-gather segments without consuming multiple main ring slots.
 
-```
-Main ring descriptor:
-  addr  -> points to indirect table in guest memory
-  len   -> sizeof(struct vring_desc) * N
-  flags -> VRING_DESC_F_INDIRECT
+```mermaid
+flowchart LR
+    Main["Main ring descriptor<br/>addr -> indirect table<br/>len = sizeof(vring_desc) * N<br/>flags = VRING_DESC_F_INDIRECT"]
+    subgraph Indirect["Indirect table (N entries)"]
+        D0["desc[0]: request header"]
+        D1["desc[1]: data buffer 1"]
+        D2["desc[2]: data buffer 2"]
+        DN["desc[N-1]: response status"]
+    end
 
-Indirect table (N entries):
-  desc[0]: request header
-  desc[1]: data buffer 1
-  desc[2]: data buffer 2
-  ...
-  desc[N-1]: response status
+    Main --> Indirect
+    D0 --- D1 --- D2 -.- DN
+
+    style Main fill:#e1f5ff,stroke:#333
+    style Indirect fill:#e1ffe1,stroke:#333
 ```
 
 ---

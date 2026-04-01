@@ -33,34 +33,30 @@ configurability registers its methods at startup via C constructor functions.
 The server is polled on the SPDK app thread, keeping the interface single-threaded
 and lock-free.
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Management Client                         │
-│  scripts/rpc.py   │   Python library   │   curl / netcat        │
-└────────────┬─────────────────────────────────────────────────────┘
-             │  JSON-RPC 2.0 over Unix domain socket
-             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                     spdk_rpc_server (lib/rpc/rpc.c)              │
-│  ┌─────────────┐   ┌─────────────────┐   ┌──────────────────┐   │
-│  │ Unix socket │──▶│  jsonrpc_handler │──▶│ g_rpc_methods    │   │
-│  │ listener    │   │ (dispatch)       │   │ (SLIST)          │   │
-│  └─────────────┘   └─────────────────┘   └──────┬───────────┘   │
-│                                                  │               │
-│                                          ┌───────▼────────┐      │
-│                                          │ spdk_rpc_method│      │
-│                                          │  .name         │      │
-│                                          │  .func         │      │
-│                                          │  .state_mask   │      │
-│                                          └───────┬────────┘      │
-└──────────────────────────────────────────────────┼───────────────┘
-                                                   │ calls handler
-                                                   ▼
-                                        ┌──────────────────────┐
-                                        │  Your RPC handler    │
-                                        │  (decode → work →    │
-                                        │   encode → respond)  │
-                                        └──────────────────────┘
+```mermaid
+graph TD
+    subgraph Client["Management Client"]
+        style Client fill:#e1f5ff,stroke:#333
+        C1["scripts/rpc.py"]
+        C2["Python library"]
+        C3["curl / netcat"]
+    end
+
+    Client -->|"JSON-RPC 2.0 over Unix domain socket"| Server
+
+    subgraph Server["spdk_rpc_server (lib/rpc/rpc.c)"]
+        style Server fill:#fff4e1,stroke:#333
+        Listener["Unix socket<br/>listener"] --> Dispatch["jsonrpc_handler<br/>(dispatch)"]
+        Dispatch --> Methods["g_rpc_methods<br/>(SLIST)"]
+        Methods --> Entry["spdk_rpc_method<br/>.name<br/>.func<br/>.state_mask"]
+    end
+
+    Entry -->|"calls handler"| Handler
+
+    subgraph Handler["Your RPC handler"]
+        style Handler fill:#e1ffe1,stroke:#333
+        Flow["decode → work →<br/>encode → respond"]
+    end
 ```
 
 ### 1.2 Key Source Files
@@ -103,29 +99,29 @@ spdk_rpc_server_close(g_rpc_server);
 The server enforces a two-phase state model. Methods must declare which phase
 they are valid in:
 
-```
- App starts
-     │
-     ▼
- SPDK_RPC_STARTUP (0x1)
- ┌─────────────────────────────────────────┐
- │ Only STARTUP or (STARTUP | RUNTIME)     │
- │ methods are callable.                   │
- │                                         │
- │ Example: scheduler_set_options,         │
- │          sock_impl_set_options          │
- └─────────────────────────────────────────┘
-     │
-     │ framework_start_init RPC called
-     ▼
- SPDK_RPC_RUNTIME (0x2)
- ┌─────────────────────────────────────────┐
- │ Only RUNTIME or (STARTUP | RUNTIME)     │
- │ methods are callable.                   │
- │                                         │
- │ Example: bdev_get_bdevs,               │
- │          spdk_kill_instance             │
- └─────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> STARTUP: App starts
+
+    state "SPDK_RPC_STARTUP (0x1)" as STARTUP {
+        note right of STARTUP
+            Only STARTUP or (STARTUP | RUNTIME)
+            methods are callable.
+            Example: scheduler_set_options,
+            sock_impl_set_options
+        end note
+    }
+
+    STARTUP --> RUNTIME: framework_start_init RPC called
+
+    state "SPDK_RPC_RUNTIME (0x2)" as RUNTIME {
+        note right of RUNTIME
+            Only RUNTIME or (STARTUP | RUNTIME)
+            methods are callable.
+            Example: bdev_get_bdevs,
+            spdk_kill_instance
+        end note
+    }
 ```
 
 The macros that correspond to each phase:

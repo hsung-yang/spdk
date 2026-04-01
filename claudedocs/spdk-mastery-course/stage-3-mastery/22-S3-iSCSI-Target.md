@@ -63,13 +63,20 @@ iSCSI is defined in RFC 3720. Before diving into SPDK's implementation, you need
 
 Every iSCSI entity has an IQN (iSCSI Qualified Name):
 
-```
-iqn.2016-06.io.spdk:target0
-│   │          │     │
-│   │          │     └── Unique string within the naming authority
-│   │          └── Naming authority (reverse domain)
-│   └── Year-month the domain was registered
-└── IQN format indicator
+```mermaid
+graph LR
+    IQN["iqn.2016-06.io.spdk:target0"]
+
+    A["iqn"] -->|"IQN format indicator"| IQN
+    B["2016-06"] -->|"Year-month domain registered"| IQN
+    C["io.spdk"] -->|"Naming authority<br/>(reverse domain)"| IQN
+    D["target0"] -->|"Unique string within<br/>naming authority"| IQN
+
+    style IQN fill:#fff4e1,stroke:#333,stroke-width:2px
+    style A fill:#f0f0f0,stroke:#333
+    style B fill:#f0f0f0,stroke:#333
+    style C fill:#f0f0f0,stroke:#333
+    style D fill:#f0f0f0,stroke:#333
 ```
 
 SPDK's default node base is `iqn.2016-06.io.spdk` (defined in `iscsi.h`):
@@ -768,14 +775,24 @@ graph LR
 
 **LUN Numbers**
 
-```
-┌──────────────────────────────────────────────────┐
-│ Target Node: iqn.2016-06.io.spdk:target0         │
-│                                                  │
-│ LUN 0 ──► spdk_scsi_lun ──► NVMe0n1 (bdev)      │
-│ LUN 1 ──► spdk_scsi_lun ──► Malloc0 (bdev)       │
-│ LUN 2 ──► spdk_scsi_lun ──► AIO0 (bdev)          │
-└──────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    subgraph Target["Target Node: iqn.2016-06.io.spdk:target0"]
+        L0["LUN 0"] --> S0["spdk_scsi_lun"] --> B0["NVMe0n1 (bdev)"]
+        L1["LUN 1"] --> S1["spdk_scsi_lun"] --> B1["Malloc0 (bdev)"]
+        L2["LUN 2"] --> S2["spdk_scsi_lun"] --> B2["AIO0 (bdev)"]
+    end
+
+    style Target fill:#fff4e1,stroke:#333,stroke-width:2px
+    style L0 fill:#ffe1f5,stroke:#333
+    style L1 fill:#ffe1f5,stroke:#333
+    style L2 fill:#ffe1f5,stroke:#333
+    style S0 fill:#e1f5ff,stroke:#333
+    style S1 fill:#e1f5ff,stroke:#333
+    style S2 fill:#e1f5ff,stroke:#333
+    style B0 fill:#e1ffe1,stroke:#333
+    style B1 fill:#e1ffe1,stroke:#333
+    style B2 fill:#e1ffe1,stroke:#333
 ```
 
 ---

@@ -883,26 +883,38 @@ run_test "nvmf_tcp"  test/nvmf/nvmf.sh "tcp"
 
 A typical CI pipeline for an SPDK change:
 
-```
-Stage 1: Build verification (fast, no hardware)
-    ├── make CHECK_FORMAT=1      # Code style check
-    ├── make -j$(nproc)          # Full build
-    └── SPDK_TEST_UNITTEST=1 ./test/unit/unittest.sh
+```mermaid
+flowchart TD
+    subgraph S1["Stage 1: Build verification (fast, no hardware)"]
+        S1A["make CHECK_FORMAT=1<br/>Code style check"]
+        S1B["make -j$(nproc)<br/>Full build"]
+        S1C["SPDK_TEST_UNITTEST=1<br/>./test/unit/unittest.sh"]
+    end
 
-Stage 2: Functional tests (virtual hardware where possible)
-    ├── test/bdev/bdev.sh null   # Null bdev (no hardware)
-    ├── test/bdev/bdev.sh malloc # Malloc bdev
-    └── test/nvmf/nvmf.sh tcp   # NVMe-oF TCP (can use loopback)
+    subgraph S2["Stage 2: Functional tests (virtual hardware)"]
+        S2A["test/bdev/bdev.sh null<br/>Null bdev (no hardware)"]
+        S2B["test/bdev/bdev.sh malloc<br/>Malloc bdev"]
+        S2C["test/nvmf/nvmf.sh tcp<br/>NVMe-oF TCP (loopback)"]
+    end
 
-Stage 3: Hardware tests (nightly, real hardware)
-    ├── SPDK_TEST_NVME=1 test/nvme/nvme.sh
-    ├── SPDK_TEST_NVMF=1 test/nvmf/nvmf.sh rdma
-    └── test/vhost/vhost.sh
+    subgraph S3["Stage 3: Hardware tests (nightly)"]
+        S3A["SPDK_TEST_NVME=1<br/>test/nvme/nvme.sh"]
+        S3B["SPDK_TEST_NVMF=1<br/>test/nvmf/nvmf.sh rdma"]
+        S3C["test/vhost/vhost.sh"]
+    end
 
-Stage 4: Long-running validation (weekly)
-    ├── Fuzz campaigns
-    ├── Performance regression
-    └── SPDK_RUN_VALGRIND=1 full integration tests
+    subgraph S4["Stage 4: Long-running validation (weekly)"]
+        S4A["Fuzz campaigns"]
+        S4B["Performance regression"]
+        S4C["SPDK_RUN_VALGRIND=1<br/>full integration tests"]
+    end
+
+    S1 --> S2 --> S3 --> S4
+
+    style S1 fill:#e1f5ff,stroke:#333
+    style S2 fill:#e1ffe1,stroke:#333
+    style S3 fill:#fff4e1,stroke:#333
+    style S4 fill:#ffe1f5,stroke:#333
 ```
 
 ### 9.4 Adding a New Test to the CI Pipeline

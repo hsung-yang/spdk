@@ -26,18 +26,23 @@
 
 Every bdev in SPDK is backed by a module. The bdev layer is a generic dispatch layer: it receives I/O from the application and routes it to the appropriate module through well-defined callback tables.
 
-```
-Application / NVMe-oF Target / iSCSI
-         |
-   spdk_bdev_read/write/...()
-         |
-   [Generic bdev layer - lib/bdev/bdev.c]
-         |
-   spdk_bdev_fn_table.submit_request()
-         |
-   Your module's I/O implementation
-         |
-   Backend (memory, file, network, hardware)
+```mermaid
+graph TD
+    A["Application / NVMe-oF Target / iSCSI"]
+    B["spdk_bdev_read/write/...()"]
+    C["Generic bdev layer — lib/bdev/bdev.c"]
+    D["spdk_bdev_fn_table.submit_request()"]
+    E["Your module's I/O implementation"]
+    F["Backend (memory, file, network, hardware)"]
+
+    A --> B --> C --> D --> E --> F
+
+    style A fill:#e1f5ff,stroke:#333
+    style B fill:#fff4e1,stroke:#333
+    style C fill:#ffe1f5,stroke:#333
+    style D fill:#ffe1f5,stroke:#333
+    style E fill:#e1ffe1,stroke:#333
+    style F fill:#f0f0f0,stroke:#333
 ```
 
 There are two conceptual kinds of bdev modules:
