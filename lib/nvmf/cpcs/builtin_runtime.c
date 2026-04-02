@@ -54,7 +54,7 @@ struct cs_direct_ns_desc {
 	uint32_t nsid;        /* NVMe namespace ID to read from */
 	uint32_t n_uint64;    /* number of uint64 elements to process */
 	uint64_t lba_offset;  /* starting LBA offset (byte offset into ns) */
-	uint8_t  workload;    /* 0=SUM, 1=MAX, 2=MIN, 3=FILTER_GT */
+	uint8_t  workload;    /* 0=SUM, 1=MAX, 2=MIN, 3=FILTER_GT, 4=DOT_PRODUCT */
 	uint8_t  pad[7];      /* reserved, must be zero */
 };
 
@@ -68,10 +68,11 @@ struct cs_direct_ns_result {
 };
 
 /* Workload codes for cs_direct_ns_desc.workload */
-#define CS_DIRECT_NS_WORKLOAD_SUM       0
-#define CS_DIRECT_NS_WORKLOAD_MAX       1
-#define CS_DIRECT_NS_WORKLOAD_MIN       2
-#define CS_DIRECT_NS_WORKLOAD_FILTER_GT 3
+#define CS_DIRECT_NS_WORKLOAD_SUM         0
+#define CS_DIRECT_NS_WORKLOAD_MAX         1
+#define CS_DIRECT_NS_WORKLOAD_MIN         2
+#define CS_DIRECT_NS_WORKLOAD_FILTER_GT   3
+#define CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT 4
 
 #define CPCS_BUILTIN_IO_CHUNK (64 * 1024)
 
@@ -932,6 +933,56 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	total_bytes = (uint64_t)desc->n_uint64 * sizeof(uint64_t);
 	offset = desc->lba_offset;
 
+	/*
+	 * DOT_PRODUCT needs both vector halves in memory at once, so read
+	 * the entire buffer up-front.  For other workloads the chunked
+	 * streaming path is still used (lower peak memory).
+	 */
+	if (desc->workload == CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT) {
+		uint8_t *full_buf;
+		const float *fvals;
+		double dp = 0.0;
+		size_t half;
+
+		full_buf = spdk_dma_malloc(total_bytes, 4096, NULL);
+		if (full_buf == NULL) {
+			return -ENOMEM;
+		}
+
+		/* Read all data */
+		processed = 0;
+		while (processed < total_bytes) {
+			chunk = total_bytes - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+			}
+			rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
+			if (rc != 0) {
+				spdk_dma_free(full_buf);
+				if (rc == -ENOENT || rc == -ENOTSUP) {
+					return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+				}
+				return rc;
+			}
+			processed += chunk;
+		}
+
+		/* Layout: [a0..a_{dim-1}, b0..b_{dim-1}] as float32 */
+		fvals = (const float *)full_buf;
+		half = total_bytes / (2 * sizeof(float));
+		for (i = 0; i < half; i++) {
+			dp += (double)fvals[i] * (double)fvals[i + half];
+		}
+
+		spdk_dma_free(full_buf);
+
+		/* Pack double result into uint64_t */
+		memcpy(&agg, &dp, sizeof(double));
+		count = half;
+
+		goto write_result;
+	}
+
 	buf = spdk_dma_malloc(CPCS_BUILTIN_IO_CHUNK, 4096, NULL);
 	if (buf == NULL) {
 		return -ENOMEM;
@@ -1002,6 +1053,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 
 	spdk_dma_free(buf);
 
+write_result:
 	result.result = agg;
 	result.count  = count;
 
