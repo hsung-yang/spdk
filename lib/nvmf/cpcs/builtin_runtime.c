@@ -774,6 +774,21 @@ _builtin_execute_cosine_similarity(const struct cpcs_exec_context *ctx, uint64_t
 	return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_COSINE_SIMILARITY, return_value);
 }
 
+/*
+ * MRS-based FILTER_GT descriptor (32 bytes).
+ * Sent inline by the host when data has been pre-staged into SLM.
+ *   - mr_id/off/len identify the input range in SLM
+ *   - threshold is the float comparison value (stored as raw bits)
+ * The result (count of elements > threshold) is returned via cdw0.
+ */
+struct cpcs_builtin_filter_gt_desc {
+	uint64_t mr_id;
+	uint64_t off;
+	uint64_t len;
+	uint32_t threshold_bits;
+	uint32_t _pad;
+};
+
 static int
 _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
@@ -785,6 +800,74 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 	size_t i;
 	size_t out_count = 0;
 	size_t bytes_after_header;
+
+	/*
+	 * MRS path: data resides in SLM, descriptor is inline.
+	 * Stream the input from SLM in chunks and count elements > threshold.
+	 * Returns count via cdw0; no filtered data is written back.
+	 */
+	if (!_builtin_has_direct_data(ctx)) {
+		const struct cpcs_builtin_filter_gt_desc *desc;
+		uint64_t mr_id;
+		uint64_t off;
+		uint64_t len;
+		uint64_t processed = 0;
+		uint64_t chunk;
+		uint8_t *chunk_buf = NULL;
+		uint32_t tbits;
+		float thr;
+		int rc;
+
+		if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+
+		desc = (const struct cpcs_builtin_filter_gt_desc *)ctx->data_buffer;
+		len = from_le64(&desc->len);
+		if (len == 0 || (len % sizeof(float)) != 0) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+
+		mr_id = from_le64(&desc->mr_id);
+		off = from_le64(&desc->off);
+		tbits = from_le32(&desc->threshold_bits);
+		memcpy(&thr, &tbits, sizeof(thr));
+
+		chunk_buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+		if (chunk_buf == NULL) {
+			return -ENOMEM;
+		}
+
+		while (processed < len) {
+			chunk = len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk,
+						   chunk_buf);
+			if (rc != 0) {
+				free(chunk_buf);
+				return rc;
+			}
+
+			{
+				const float *p = (const float *)chunk_buf;
+				size_t nf = chunk / sizeof(float);
+				for (size_t j = 0; j < nf; j++) {
+					if (p[j] > thr) {
+						out_count++;
+					}
+				}
+			}
+			processed += chunk;
+		}
+
+		free(chunk_buf);
+		*return_value = out_count;
+		return 0;
+	}
 
 	if (ctx->data_buffer == NULL || ctx->data_len < (4 + 2 * sizeof(float))) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
