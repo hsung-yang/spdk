@@ -47,8 +47,12 @@ struct cpcs_builtin_multi_agg64_result {
 };
 
 /*
- * Direct namespace aggregation descriptor (24 bytes).
+ * Direct namespace aggregation descriptor (32 bytes).
  * Sent by the host in the data buffer when invoking CS_CSF_DIRECT_NS_AGG.
+ *
+ * `threshold` is consumed by FILTER_GT (uint64 comparison value) and is
+ * ignored by the other workloads.  Host-side definition in
+ * libcs/include/cs_api.h must match this layout exactly.
  */
 struct cs_direct_ns_desc {
 	uint32_t nsid;        /* NVMe namespace ID to read from */
@@ -56,6 +60,7 @@ struct cs_direct_ns_desc {
 	uint64_t lba_offset;  /* starting LBA offset (byte offset into ns) */
 	uint8_t  workload;    /* 0=SUM, 1=MAX, 2=MIN, 3=FILTER_GT, 4=DOT_PRODUCT */
 	uint8_t  pad[7];      /* reserved, must be zero */
+	uint64_t threshold;   /* FILTER_GT comparison value; zero otherwise */
 };
 
 /*
@@ -1117,14 +1122,15 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 				}
 			}
 			break;
-		case CS_DIRECT_NS_WORKLOAD_FILTER_GT:
-			/* Threshold = 0: count all non-zero elements */
+		case CS_DIRECT_NS_WORKLOAD_FILTER_GT: {
+			uint64_t thr = desc->threshold;
 			for (i = 0; i < n; i++) {
-				if (p[i] > 0) {
+				if (p[i] > thr) {
 					agg++;
 				}
 			}
 			break;
+		}
 		default:
 			spdk_dma_free(buf);
 			return -SPDK_NVME_SC_INVALID_FIELD;
