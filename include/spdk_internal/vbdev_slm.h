@@ -23,6 +23,11 @@ struct spdk_vbdev_slm_ops {
 int vbdev_slm_register_ops(const struct spdk_vbdev_slm_ops *ops);
 void vbdev_slm_unregister_ops(const struct spdk_vbdev_slm_ops *ops);
 
+/* Resolve the ops vtable for a bdev once, so hot paths can cache it
+ * and call ops->read_by_bdev / write_by_bdev / get_buffer_ptr_by_bdev
+ * directly without re-acquiring the provider rwlock on every access. */
+const struct spdk_vbdev_slm_ops *vbdev_slm_lookup_ops(struct spdk_bdev *bdev);
+
 int vbdev_slm_get_buffer_ptr_by_bdev(struct spdk_bdev *bdev, uint64_t offset,
 				     uint64_t length, void **ptr);
 int vbdev_slm_read_by_bdev(struct spdk_bdev *bdev, uint64_t offset,

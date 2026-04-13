@@ -49,6 +49,15 @@ vbdev_slm_lookup_ops_by_bdev(struct spdk_bdev *bdev)
 	return ops;
 }
 
+const struct spdk_vbdev_slm_ops *
+vbdev_slm_lookup_ops(struct spdk_bdev *bdev)
+{
+	if (bdev == NULL) {
+		return NULL;
+	}
+	return vbdev_slm_lookup_ops_by_bdev(bdev);
+}
+
 int
 vbdev_slm_register_ops(const struct spdk_vbdev_slm_ops *ops)
 {

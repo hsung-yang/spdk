@@ -15,6 +15,7 @@
 #include "spdk/endian.h"
 #include "spdk/env.h"
 #include "spdk/log.h"
+#include "spdk_internal/vbdev_slm.h"
 #include <math.h>
 
 struct cpcs_builtin_memcpy_desc {
@@ -241,9 +242,10 @@ _builtin_execute_multi_agg64_direct(const struct cpcs_exec_context *ctx, uint64_
 }
 
 static int
-_cpcs_exec_resolve_range(const struct cpcs_exec_context *ctx,
-			 uint64_t mr_id, uint64_t off, uint64_t len,
-			 struct spdk_bdev **bdev_out, uint64_t *absolute_offset_out)
+_cpcs_exec_resolve_range_ex(const struct cpcs_exec_context *ctx,
+			    uint64_t mr_id, uint64_t off, uint64_t len,
+			    struct spdk_bdev **bdev_out, uint64_t *absolute_offset_out,
+			    const struct spdk_vbdev_slm_ops **ops_out)
 {
 	const struct cpcs_exec_resolved_range *mr;
 	uint64_t absolute_offset;
@@ -282,6 +284,9 @@ _cpcs_exec_resolve_range(const struct cpcs_exec_context *ctx,
 	absolute_offset = mr->starting_byte + off;
 	*bdev_out = mr->bdev;
 	*absolute_offset_out = absolute_offset;
+	if (ops_out != NULL) {
+		*ops_out = mr->ops;
+	}
 	return 0;
 }
 
@@ -291,18 +296,25 @@ _cpcs_exec_read_range(const struct cpcs_exec_context *ctx,
 {
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
+	const struct spdk_vbdev_slm_ops *ops;
 	int rc;
 
 	if (len != 0 && buf == NULL) {
 		return -EINVAL;
 	}
 
-	rc = _cpcs_exec_resolve_range(ctx, mr_id, off, len, &bdev, &absolute_offset);
+	rc = _cpcs_exec_resolve_range_ex(ctx, mr_id, off, len, &bdev, &absolute_offset, &ops);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = bdev_slm_read_by_bdev(bdev, absolute_offset, len, buf);
+	/* Fast path: cached ops skip the provider rwlock. Fallback to
+	 * bdev_slm_read_by_bdev for non-SLM (direct NVMe) bdevs. */
+	if (ops != NULL) {
+		rc = ops->read_by_bdev(bdev, absolute_offset, len, buf);
+	} else {
+		rc = bdev_slm_read_by_bdev(bdev, absolute_offset, len, buf);
+	}
 	if (rc == -ENOENT || rc == -ENOTSUP) {
 		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 	}
@@ -318,18 +330,23 @@ _cpcs_exec_write_range(const struct cpcs_exec_context *ctx,
 {
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
+	const struct spdk_vbdev_slm_ops *ops;
 	int rc;
 
 	if (len != 0 && buf == NULL) {
 		return -EINVAL;
 	}
 
-	rc = _cpcs_exec_resolve_range(ctx, mr_id, off, len, &bdev, &absolute_offset);
+	rc = _cpcs_exec_resolve_range_ex(ctx, mr_id, off, len, &bdev, &absolute_offset, &ops);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = bdev_slm_write_by_bdev(bdev, absolute_offset, len, buf);
+	if (ops != NULL) {
+		rc = ops->write_by_bdev(bdev, absolute_offset, len, buf);
+	} else {
+		rc = bdev_slm_write_by_bdev(bdev, absolute_offset, len, buf);
+	}
 	if (rc == -ENOENT || rc == -ENOTSUP) {
 		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 	}
@@ -1018,6 +1035,10 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	SPDK_NOTICELOG("DIRECT_NS_AGG: using bdev=%s for nsid=%u\n",
 		       spdk_bdev_get_name(bdev), desc->nsid);
 
+	/* Resolve SLM ops once outside the chunk loops so reads skip the
+	 * provider-lookup rwlock on every I/O. */
+	const struct spdk_vbdev_slm_ops *slm_ops = vbdev_slm_lookup_ops(bdev);
+
 	total_bytes = (uint64_t)desc->n_uint64 * sizeof(uint64_t);
 	offset = desc->lba_offset;
 
@@ -1044,7 +1065,9 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
 				chunk = CPCS_BUILTIN_IO_CHUNK;
 			}
-			rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
+			rc = slm_ops != NULL
+			     ? slm_ops->read_by_bdev(bdev, offset + processed, chunk, full_buf + processed)
+			     : bdev_slm_read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
 			if (rc != 0) {
 				spdk_dma_free(full_buf);
 				if (rc == -ENOENT || rc == -ENOTSUP) {
@@ -1083,7 +1106,9 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		}
 		chunk -= chunk % sizeof(uint64_t);
 
-		rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf);
+		rc = slm_ops != NULL
+		     ? slm_ops->read_by_bdev(bdev, offset + processed, chunk, buf)
+		     : bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf);
 		if (rc != 0) {
 			SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
 				    desc->nsid, offset + processed, chunk, rc);

@@ -10,6 +10,7 @@
 #include "spdk/log.h"
 #include "spdk/nvmf_cmd.h"
 #include "spdk/nvmf_transport.h"
+#include "spdk_internal/vbdev_slm.h"
 
 static int
 cpcs_execute_acquire_vslm_range(struct cpcs_exec_context *ctx,
@@ -123,6 +124,11 @@ cpcs_execute_resolve_ranges(struct cpcs_exec_context *ctx)
 		}
 
 		resolved_ranges[i].bdev = bdev;
+		/* Cache SLM ops once per resolve so hot paths skip the
+		 * provider-lookup rwlock on every read/write. May be NULL
+		 * for non-SLM bdevs (e.g. direct NVMe namespaces); callers
+		 * fall back to bdev_slm_*_by_bdev in that case. */
+		resolved_ranges[i].ops = vbdev_slm_lookup_ops(bdev);
 		resolved_ranges[i].mnsid = ranges[i].mnsid;
 		resolved_ranges[i].starting_byte = ranges[i].starting_byte;
 		resolved_ranges[i].length = ranges[i].length;

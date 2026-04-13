@@ -149,12 +149,17 @@ cpcs_mrs_delete_all(struct spdk_nvmf_cpcs_ns *ns)
 	pthread_mutex_lock(&ns->lock);
 
 	TAILQ_FOREACH_SAFE(mrs, &ns->mrs_list, link, tmp) {
+		if (__atomic_load_n(&mrs->ref_count, __ATOMIC_ACQUIRE) > 0) {
+			pthread_mutex_unlock(&ns->lock);
+			SPDK_ERRLOG("Cannot delete MRS %u: still in use\n", mrs->rsid);
+			return -SPDK_NVME_CPCS_SC_MEMORY_RANGE_SET_IN_USE;
+		}
 		TAILQ_REMOVE(&ns->mrs_list, mrs, link);
+		ns->mrs_count--;
 		free(mrs->ranges);
 		free(mrs);
 	}
 
-	ns->mrs_count = 0;
 	pthread_mutex_unlock(&ns->lock);
 
 	return 0;
@@ -174,8 +179,9 @@ cpcs_mrs_get(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
 	TAILQ_FOREACH(mrs, &ns->mrs_list, link) {
 		if (mrs->rsid == rsid) {
 			/* Acquire ref while still holding lock to prevent TOCTOU race
-			 * with cpcs_mrs_delete on another thread. */
-			__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
+			 * with cpcs_mrs_delete on another thread. The mutex provides
+			 * ordering, so relaxed is sufficient. */
+			__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_RELAXED);
 			pthread_mutex_unlock(&ns->lock);
 			return mrs;
 		}
@@ -192,7 +198,7 @@ cpcs_mrs_acquire(struct cpcs_memory_range_set *mrs)
 		return -EINVAL;
 	}
 
-	__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
+	__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_ACQUIRE);
 
 	return 0;
 }
@@ -204,7 +210,7 @@ cpcs_mrs_release(struct cpcs_memory_range_set *mrs)
 		return;
 	}
 
-	__atomic_sub_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
+	__atomic_sub_fetch(&mrs->ref_count, 1, __ATOMIC_RELEASE);
 }
 
 int
@@ -240,6 +246,11 @@ cpcs_mrs_validate_locked(struct spdk_nvmf_cpcs_ns *ns,
 
 	for (i = 0; i < num_ranges; i++) {
 		start1 = ranges[i].starting_byte;
+		/* Overflow-safe end computation */
+		if (ranges[i].length > UINT64_MAX - start1) {
+			SPDK_ERRLOG("Memory range overflows address space\n");
+			return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET;
+		}
 		end1 = start1 + ranges[i].length;
 
 		/* Validate granularity alignment */
@@ -321,10 +332,17 @@ cpcs_mrs_get_buffer(struct cpcs_memory_range_set *mrs,
 	range_idx = mr_id - 1;
 	mr = &mrs->ranges[range_idx];
 
-	/* Validate offset and length are within range */
-	if (offset + len > mr->length) {
+	/* Validate offset and length are within range (overflow-safe) */
+	if (len > mr->length || offset > (uint64_t)mr->length - len) {
 		SPDK_ERRLOG("Access out of bounds: offset=%lu len=%lu range_len=%u\n",
 			    offset, len, mr->length);
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	/* Overflow-safe absolute address calculation */
+	if (offset > UINT64_MAX - mr->starting_byte) {
+		SPDK_ERRLOG("Address overflow: starting_byte=%lu offset=%lu\n",
+			    mr->starting_byte, offset);
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 

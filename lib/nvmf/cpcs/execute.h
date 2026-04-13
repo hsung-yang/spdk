@@ -20,9 +20,13 @@ extern "C" {
 #endif
 
 struct spdk_bdev;
+struct spdk_vbdev_slm_ops;
 
 struct cpcs_exec_resolved_range {
 	struct spdk_bdev	*bdev;
+	/* Cached SLM ops pointer so runtime fast paths skip the
+	 * provider-lookup rwlock on every read/write. */
+	const struct spdk_vbdev_slm_ops *ops;
 	uint32_t		mnsid;
 	uint64_t		starting_byte;
 	uint32_t		length;

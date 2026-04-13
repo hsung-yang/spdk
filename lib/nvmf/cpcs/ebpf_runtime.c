@@ -15,6 +15,7 @@
 #include "memory_range_set.h"
 #include "spdk/bdev_slm.h"
 #include "spdk/log.h"
+#include "spdk_internal/vbdev_slm.h"
 
 /* Check if uBPF library is available */
 #ifdef HAVE_UBPF
@@ -45,7 +46,8 @@ static __thread size_t   g_ebpf_vm_mem_size;
 
 static int
 ebpf_resolve_exec_range(struct cpcs_exec_context *exec_ctx, uint64_t mr_id, uint64_t offset,
-			uint64_t len, struct spdk_bdev **bdev_out, uint64_t *absolute_offset_out)
+			uint64_t len, struct spdk_bdev **bdev_out, uint64_t *absolute_offset_out,
+			const struct spdk_vbdev_slm_ops **ops_out)
 {
 	const struct cpcs_exec_resolved_range *mr;
 	uint64_t absolute_offset;
@@ -79,6 +81,9 @@ ebpf_resolve_exec_range(struct cpcs_exec_context *exec_ctx, uint64_t mr_id, uint
 	absolute_offset = mr->starting_byte + offset;
 	*bdev_out = mr->bdev;
 	*absolute_offset_out = absolute_offset;
+	if (ops_out != NULL) {
+		*ops_out = mr->ops;
+	}
 	return 0;
 }
 
@@ -96,6 +101,7 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 	size_t mem_size = g_ebpf_vm_mem_size;
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
+	const struct spdk_vbdev_slm_ops *ops;
 	int rc;
 
 	if (mem == NULL || buf_ptr < (uint64_t)mem ||
@@ -115,14 +121,16 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 		return 0;
 	}
 
-	rc = ebpf_resolve_exec_range(exec_ctx, mr_id, offset, len, &bdev, &absolute_offset);
+	rc = ebpf_resolve_exec_range(exec_ctx, mr_id, offset, len, &bdev, &absolute_offset, &ops);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to resolve memory range: mr_id=%lu offset=%lu len=%lu rc=%d\n",
 			    mr_id, offset, len, rc);
 		return (uint64_t)-1;
 	}
 
-	rc = bdev_slm_read_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr);
+	/* Use cached ops vtable to skip provider rwlock on hot path. */
+	rc = ops != NULL ? ops->read_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr)
+			 : bdev_slm_read_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to read memory namespace: bdev=%p offset=%lu len=%lu rc=%d\n",
 			    bdev, absolute_offset, len, rc);
@@ -146,6 +154,7 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 	size_t mem_size = g_ebpf_vm_mem_size;
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
+	const struct spdk_vbdev_slm_ops *ops;
 	int rc;
 
 	/* Validate buf_ptr is within VM memory sandbox */
@@ -161,14 +170,15 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 		return (uint64_t)-1;
 	}
 
-	rc = ebpf_resolve_exec_range(exec_ctx, mr_id, offset, len, &bdev, &absolute_offset);
+	rc = ebpf_resolve_exec_range(exec_ctx, mr_id, offset, len, &bdev, &absolute_offset, &ops);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to resolve memory range: mr_id=%lu offset=%lu len=%lu rc=%d\n",
 			    mr_id, offset, len, rc);
 		return (uint64_t)-1;
 	}
 
-	rc = bdev_slm_write_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr);
+	rc = ops != NULL ? ops->write_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr)
+			 : bdev_slm_write_by_bdev(bdev, absolute_offset, len, (void *)buf_ptr);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to write memory namespace: bdev=%p offset=%lu len=%lu rc=%d\n",
 			    bdev, absolute_offset, len, rc);
