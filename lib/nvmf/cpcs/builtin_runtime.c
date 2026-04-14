@@ -1038,6 +1038,15 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	/* Resolve SLM ops once outside the chunk loops so reads skip the
 	 * provider-lookup rwlock on every I/O. */
 	const struct spdk_vbdev_slm_ops *slm_ops = vbdev_slm_lookup_ops(bdev);
+	if (slm_ops == NULL) {
+		/* bdev_slm_read_by_bdev also returns -ENOTSUP for non-SLM bdevs —
+		 * fail fast here with a diagnostic so the nsid mismatch is obvious. */
+		SPDK_ERRLOG("DIRECT_NS_AGG: bdev nsid=%u (%s) has no SLM ops."
+			    " desc->nsid must point to an SLM namespace (e.g. 100),"
+			    " not a plain NVMe namespace. Check host-side nsid argument.\n",
+			    desc->nsid, spdk_bdev_get_name(bdev));
+		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+	}
 
 	total_bytes = (uint64_t)desc->n_uint64 * sizeof(uint64_t);
 	offset = desc->lba_offset;
@@ -1065,9 +1074,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
 				chunk = CPCS_BUILTIN_IO_CHUNK;
 			}
-			rc = slm_ops != NULL
-			     ? slm_ops->read_by_bdev(bdev, offset + processed, chunk, full_buf + processed)
-			     : bdev_slm_read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
+			rc = slm_ops->read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
 			if (rc != 0) {
 				spdk_dma_free(full_buf);
 				if (rc == -ENOENT || rc == -ENOTSUP) {
@@ -1106,11 +1113,9 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		}
 		chunk -= chunk % sizeof(uint64_t);
 
-		rc = slm_ops != NULL
-		     ? slm_ops->read_by_bdev(bdev, offset + processed, chunk, buf)
-		     : bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf);
+		rc = slm_ops->read_by_bdev(bdev, offset + processed, chunk, buf);
 		if (rc != 0) {
-			SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+			SPDK_ERRLOG("DIRECT_NS_AGG: slm read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
 				    desc->nsid, offset + processed, chunk, rc);
 			spdk_dma_free(buf);
 			if (rc == -ENOENT || rc == -ENOTSUP) {
