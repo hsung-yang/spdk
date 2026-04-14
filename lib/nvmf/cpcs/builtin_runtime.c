@@ -80,7 +80,7 @@ struct cs_direct_ns_result {
 #define CS_DIRECT_NS_WORKLOAD_FILTER_GT   3
 #define CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT 4
 
-#define CPCS_BUILTIN_IO_CHUNK (64 * 1024)
+#define CPCS_BUILTIN_IO_CHUNK (2 * 1024 * 1024)
 
 static bool
 _builtin_has_direct_data(const struct cpcs_exec_context *ctx)
