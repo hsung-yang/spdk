@@ -5,10 +5,10 @@
 
 /**
  * \file
- * CPCS Passthrough Runtime — substrate-agnostic dispatch PoC
+ * CPCS Passthrough Runtime — hardware-independent dispatch PoC
  *
  * Architectural significance (SDC 2026 talk, slide 11):
- *   The SPDK CPCS dispatch layer is substrate-agnostic by design.  The same
+ *   The SPDK CPCS dispatch layer is hardware-independent by design.  The same
  *   wire protocol (NVMe Execute Program command) can route to:
  *     - target-CPU built-in execution (today, JBOF substrate)
  *     - eBPF programmable execution on the same target CPU
@@ -18,7 +18,7 @@
  *   Registering this runtime under a distinct ptype demonstrates that the
  *   dispatch architecture treats execution location as a routing decision,
  *   not a hard-coded property of the target.  The talk's claim
- *   "substrate-agnostic by design — DEMONSTRATED" rests on this PoC.
+ *   "hardware-independent by design — DEMONSTRATED" rests on this PoC.
  *
  * Forward path:
  *   host issues Execute Program (PIND, ptype=PASSTHROUGH)
@@ -54,7 +54,7 @@
  *     local compute.  A production implementation would issue a real NVMe
  *     Execute Program via spdk_bdev_nvme_io_passthru against a CPCS-capable
  *     backing device.  The substitution does not affect the architectural
- *     claim (dispatch is substrate-agnostic); it does keep the PoC runnable
+ *     claim (dispatch is hardware-independent); it does keep the PoC runnable
  *     on commodity hardware.
  */
 
