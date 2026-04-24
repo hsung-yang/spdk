@@ -229,11 +229,18 @@ dump_nvmf_subsystem(struct spdk_json_write_ctx *w, struct spdk_nvmf_subsystem *s
 			spdk_nvmf_ns_get_opts(ns, &ns_opts, sizeof(ns_opts));
 			spdk_json_write_object_begin(w);
 			spdk_json_write_named_int32(w, "nsid", spdk_nvmf_ns_get_id(ns));
-			spdk_json_write_named_string(w, "bdev_name",
-						     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
-			/* NOTE: "name" is kept for compatibility only - new code should use bdev_name. */
-			spdk_json_write_named_string(w, "name",
-						     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
+			{
+				/*
+				 * CPCS compute namespaces have no backing bdev; guard
+				 * against NULL so spdk_bdev_get_name() doesn't deref
+				 * a NULL pointer during nvmf_get_subsystems RPC dump.
+				 */
+				struct spdk_bdev *_ns_bdev = spdk_nvmf_ns_get_bdev(ns);
+				const char *_ns_bdev_name = _ns_bdev ? spdk_bdev_get_name(_ns_bdev) : "";
+				spdk_json_write_named_string(w, "bdev_name", _ns_bdev_name);
+				/* NOTE: "name" is kept for compatibility only - new code should use bdev_name. */
+				spdk_json_write_named_string(w, "name", _ns_bdev_name);
+			}
 
 			if (!spdk_mem_all_zero(ns_opts.nguid, sizeof(ns_opts.nguid))) {
 				spdk_json_write_name(w, "nguid");
