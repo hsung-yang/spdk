@@ -19,7 +19,7 @@ C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
 	cpcs/execute.c cpcs/memory_range_set.c cpcs/nvmf_cpcs.c \
 	cpcs/program.c cpcs/program_activation.c cpcs/reachability.c \
 	cpcs/builtin_programs.c cpcs/builtin_runtime.c \
-	cpcs/runtime_stub.c
+	cpcs/runtime_stub.c cpcs/passthrough_runtime.c
 
 C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
