@@ -26,6 +26,49 @@ get_cpcs_ns_from_req(struct spdk_nvmf_request *req)
 	return spdk_nvmf_cpcs_ns_get_by_nsid(subsystem, cmd->nsid);
 }
 
+/*
+ * Translate a negative return value (errno or negated NVMe SC) into a
+ * meaningful NVMe completion status.  CPCS / command-specific SCs live in
+ * 0x80+; values below that come from errno-domain returns and need explicit
+ * mapping to a generic NVMe status, otherwise the host sees a meaningless
+ * raw errno number (e.g. SC=22 for -EINVAL).
+ */
+static void
+cpcs_set_rsp_status_from_rc(struct spdk_nvme_cpl *cpl, int rc)
+{
+	uint16_t v;
+
+	if (rc == 0) {
+		cpl->status.sct = SPDK_NVME_SCT_GENERIC;
+		cpl->status.sc = SPDK_NVME_SC_SUCCESS;
+		return;
+	}
+
+	v = (uint16_t)(-rc);
+	cpl->status.dnr = 1;
+
+	if (v >= 0x80) {
+		cpl->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		cpl->status.sc = v;
+		return;
+	}
+
+	switch (rc) {
+	case -EINVAL:
+		cpl->status.sct = SPDK_NVME_SCT_GENERIC;
+		cpl->status.sc = SPDK_NVME_SC_INVALID_FIELD;
+		break;
+	case -ENOMEM:
+	case -ENOSPC:
+	case -EIO:
+	case -EAGAIN:
+	default:
+		cpl->status.sct = SPDK_NVME_SCT_GENERIC;
+		cpl->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		break;
+	}
+}
+
 int
 cpcs_admin_load_program(struct spdk_nvmf_request *req)
 {
@@ -68,8 +111,7 @@ cpcs_admin_load_program(struct spdk_nvmf_request *req)
 		rc = cpcs_program_unload(ns, pind);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to unload program %u: %d\n", pind, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, rc);
 			spdk_nvmf_request_complete(req);
 			return rc;
 		}
@@ -95,7 +137,7 @@ cpcs_admin_load_program(struct spdk_nvmf_request *req)
 		} else {
 			data = malloc(numb);
 			if (!data) {
-				req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+				cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, -ENOMEM);
 				spdk_nvmf_request_complete(req);
 				return -ENOMEM;
 			}
@@ -119,8 +161,7 @@ cpcs_admin_load_program(struct spdk_nvmf_request *req)
 	}
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to load program %u: %d\n", pind, rc);
-		req->rsp->nvme_cpl.status.sc = -rc;
-		req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, rc);
 		spdk_nvmf_request_complete(req);
 		return rc;
 	}
@@ -161,8 +202,7 @@ cpcs_admin_program_activation(struct spdk_nvmf_request *req)
 		rc = cpcs_program_activate(ns, pind);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to activate program %u: %d\n", pind, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, rc);
 		} else {
 			SPDK_DEBUGLOG(nvmf_cpcs, "Program %u activated successfully\n", pind);
 		}
@@ -172,8 +212,7 @@ cpcs_admin_program_activation(struct spdk_nvmf_request *req)
 		rc = cpcs_program_deactivate(ns, pind);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to deactivate program %u: %d\n", pind, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, rc);
 		} else {
 			SPDK_DEBUGLOG(nvmf_cpcs, "Program %u deactivated successfully\n", pind);
 		}
@@ -248,7 +287,7 @@ cpcs_admin_mrs_management(struct spdk_nvmf_request *req)
 			} else {
 				ranges = calloc(numr, sizeof(*ranges));
 				if (!ranges) {
-					req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+					cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, -ENOMEM);
 					rc = -ENOMEM;
 					break;
 				}
@@ -273,8 +312,7 @@ cpcs_admin_mrs_management(struct spdk_nvmf_request *req)
 		}
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to create MRS: %d\n", rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, rc);
 		} else {
 			/* Return RSID in DW0 */
 			req->rsp->nvme_cpl.cdw0 = rsid;
@@ -286,8 +324,7 @@ cpcs_admin_mrs_management(struct spdk_nvmf_request *req)
 		rc = cpcs_mrs_delete(ns, rsid);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to delete MRS %u: %d\n", rsid, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_set_rsp_status_from_rc(&req->rsp->nvme_cpl, rc);
 		} else {
 			SPDK_DEBUGLOG(nvmf_cpcs, "MRS %u deleted successfully\n", rsid);
 		}

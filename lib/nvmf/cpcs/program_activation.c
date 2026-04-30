@@ -166,11 +166,13 @@ cpcs_program_deactivate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 	}
 
 	pthread_mutex_lock(&ns->lock);
-	prog->activated = false;
 	prog->state = CPCS_PROGRAM_STATE_LOADED;
 	if (ns->num_activated == 0) {
+		/* Counter desync: recompute while prog is still marked activated so
+		 * the post-decrement below produces the correct count. */
 		ns->num_activated = cpcs_program_count_activated(ns);
 	}
+	prog->activated = false;
 	if (ns->num_activated > 0) {
 		ns->num_activated--;
 	}

@@ -38,6 +38,14 @@ struct cpcs_passthrough_state {
 
 static struct cpcs_passthrough_state g_passthrough_state;
 
+/*
+ * Backing-bdev round-trip uses a single offset (0) so concurrent execute()
+ * calls on the same backing device would corrupt each other's scratch data.
+ * Serialize the write+read pair with a global mutex.  PoC scope makes the
+ * loss of parallelism acceptable.
+ */
+static pthread_mutex_t g_passthrough_io_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* I/O chunk size for the round-trip; matches builtin runtime convention. */
 #define CPCS_PASSTHROUGH_IO_CHUNK   (2 * 1024 * 1024)
 
@@ -119,12 +127,15 @@ _passthrough_forward_chunk(const void *src, void *scratch, uint64_t len)
 		return -EINVAL;
 	}
 
+	pthread_mutex_lock(&g_passthrough_io_lock);
+
 	if (ops != NULL) {
 		rc = ops->write_by_bdev(bdev, 0, len, src);
 	} else {
 		rc = bdev_slm_write_by_bdev(bdev, 0, len, src);
 	}
 	if (rc != 0) {
+		pthread_mutex_unlock(&g_passthrough_io_lock);
 		SPDK_ERRLOG("Passthrough runtime: backing write failed rc=%d\n", rc);
 		return rc;
 	}
@@ -134,6 +145,7 @@ _passthrough_forward_chunk(const void *src, void *scratch, uint64_t len)
 	} else {
 		rc = bdev_slm_read_by_bdev(bdev, 0, len, scratch);
 	}
+	pthread_mutex_unlock(&g_passthrough_io_lock);
 	if (rc != 0) {
 		SPDK_ERRLOG("Passthrough runtime: backing read failed rc=%d\n", rc);
 		return rc;

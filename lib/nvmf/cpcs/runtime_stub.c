@@ -142,8 +142,13 @@ static const struct cpcs_runtime_ops g_stub_runtime = {
 int
 cpcs_runtime_register(const struct cpcs_runtime_ops *ops)
 {
-	if (!ops || g_runtime_count >= MAX_RUNTIMES) {
+	if (!ops) {
 		return -EINVAL;
+	}
+	if (g_runtime_count >= MAX_RUNTIMES) {
+		SPDK_ERRLOG("Cannot register CPCS runtime '%s': MAX_RUNTIMES (%u) reached\n",
+			    ops->name, MAX_RUNTIMES);
+		return -ENOSPC;
 	}
 
 	g_runtimes[g_runtime_count++] = ops;

@@ -105,6 +105,7 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 	int rc;
 
 	if (mem == NULL || buf_ptr < (uint64_t)mem ||
+	    len > UINT64_MAX - buf_ptr ||
 	    buf_ptr + len > (uint64_t)mem + mem_size) {
 		SPDK_ERRLOG("SLM read: buf_ptr=0x%lx len=%lu outside VM memory\n", buf_ptr, len);
 		return (uint64_t)-1;
@@ -157,8 +158,9 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 	const struct spdk_vbdev_slm_ops *ops;
 	int rc;
 
-	/* Validate buf_ptr is within VM memory sandbox */
+	/* Validate buf_ptr is within VM memory sandbox (overflow-safe) */
 	if (mem == NULL || buf_ptr < (uint64_t)mem ||
+	    len > UINT64_MAX - buf_ptr ||
 	    buf_ptr + len > (uint64_t)mem + mem_size) {
 		SPDK_ERRLOG("SLM write: buf_ptr=0x%lx len=%lu outside VM memory\n", buf_ptr, len);
 		return (uint64_t)-1;
@@ -224,8 +226,9 @@ helper_log(void *ctx, uint64_t level, uint64_t msg_ptr,
 	char msg[256];
 	size_t copy_len = msg_len < sizeof(msg) - 1 ? msg_len : sizeof(msg) - 1;
 
-	/* Validate msg_ptr is within VM memory sandbox */
+	/* Validate msg_ptr is within VM memory sandbox (overflow-safe) */
 	if (mem == NULL || msg_ptr < (uint64_t)mem ||
+	    msg_len > UINT64_MAX - msg_ptr ||
 	    msg_ptr + msg_len > (uint64_t)mem + mem_size) {
 		SPDK_ERRLOG("eBPF log: msg_ptr=0x%lx len=%lu outside VM memory\n", msg_ptr, msg_len);
 		return (uint64_t)-1;
