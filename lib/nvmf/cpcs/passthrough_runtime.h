@@ -12,13 +12,22 @@
  *   wire protocol (NVMe Execute Program command) can route to:
  *     - target-CPU built-in execution (today, JBOF substrate)
  *     - eBPF programmable execution on the same target CPU
- *     - **another NVMe device via this passthrough runtime** — modelling the
- *       on-device CSD substrate without requiring a hardware CSD
+ *     - **another NVMe device via this passthrough runtime** — exercising
+ *       the runtime-indirection interface end-to-end without requiring a
+ *       hardware CSD
  *
  *   Registering this runtime under a distinct ptype demonstrates that the
  *   dispatch architecture treats execution location as a routing decision,
  *   not a hard-coded property of the target.  The talk's claim
  *   "hardware-independent by design — DEMONSTRATED" rests on this PoC.
+ *
+ *   This runtime is NOT a cost proxy for any real CSD substrate.  The
+ *   backing-bdev round-trip captures only the cost of dispatching through
+ *   this particular runtime path; absolute latency reflects the chosen
+ *   backing bdev (plain NVMe, malloc, null, ...) and does not approximate
+ *   in-package CSD silicon, fabric-attached CSD, or any specific device.
+ *   Treat the measured delta as a property of the bench configuration, not
+ *   a hardware estimate.
  *
  * Forward path:
  *   host issues Execute Program (PIND, ptype=PASSTHROUGH)
@@ -27,8 +36,8 @@
  *         -> cpcs_passthrough_runtime.execute() forwards the workload to a
  *            backing namespace (configured at registration time)
  *           -> backing namespace executes (in this PoC: data is round-tripped
- *              through a backing SLM bdev to model the device hop, then
- *              SUM64 is computed locally)
+ *              through a backing SLM bdev to exercise the routing path,
+ *              then SUM64 is computed locally)
  *         <- 64-bit aggregate result
  *       <- cpcs_execute_complete() packs into NVMe completion DW0/DW1
  *     <- host driver receives completion

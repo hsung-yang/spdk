@@ -6,8 +6,9 @@
 /*
  * Passthrough runtime — see passthrough_runtime.h for architectural rationale
  * and the slide-11 mapping.  This file implements struct cpcs_runtime_ops by
- * forwarding SUM64 execute() requests through a backing SLM bdev to model the
- * cost of dispatching to a different substrate (e.g. an on-device CSD).
+ * forwarding SUM64 execute() requests through a backing SLM bdev to exercise
+ * the runtime-indirection routing path end-to-end.  Not a cost proxy for any
+ * real CSD substrate (see header for the disclaimer).
  */
 
 #include "passthrough_runtime.h"
@@ -54,7 +55,7 @@ _passthrough_resolve_backing(void)
 	name = getenv(CPCS_PASSTHROUGH_BACKING_BDEV_ENV);
 	if (name == NULL || name[0] == '\0') {
 		SPDK_NOTICELOG("Passthrough runtime: %s unset; "
-			       "execute() will run local-only (no device hop modelled)\n",
+			       "execute() will run local-only (no backing-bdev round-trip)\n",
 			       CPCS_PASSTHROUGH_BACKING_BDEV_ENV);
 		return;
 	}
@@ -84,10 +85,11 @@ _passthrough_resolve_backing(void)
 }
 
 /*
- * Forward a chunk of `len` bytes through the backing bdev to model the
- * passthrough hop.  Writes the input into the backing namespace at offset 0,
- * then reads it back into a scratch buffer.  This faithfully captures the
- * dominant cost of dispatching to a different substrate (the data crossing).
+ * Forward a chunk of `len` bytes through the backing bdev to exercise the
+ * routing path.  Writes the input into the backing namespace at offset 0,
+ * then reads it back into a scratch buffer.  Captures the cost of dispatching
+ * through this runtime indirection with the configured backing bdev — not a
+ * proxy for any specific CSD substrate.
  *
  * Returns 0 on success, negative errno on failure.  When no backing bdev is
  * configured, returns 0 without doing any I/O so the dispatch wiring can
@@ -103,7 +105,7 @@ _passthrough_forward_chunk(const void *src, void *scratch, uint64_t len)
 	if (bdev == NULL) {
 		if (!g_passthrough_state.backing_warned) {
 			SPDK_WARNLOG("Passthrough runtime: forwarding without backing bdev "
-				     "(local-only mode); %s to enable a real device hop\n",
+				     "(local-only mode); set %s to enable the backing-bdev round-trip\n",
 				     CPCS_PASSTHROUGH_BACKING_BDEV_ENV);
 			g_passthrough_state.backing_warned = true;
 		}
@@ -314,7 +316,7 @@ cpcs_passthrough_runtime_register(void)
 	}
 
 	SPDK_NOTICELOG("Passthrough runtime registered (ptype=0x%02x); "
-		       "set %s to a backing SLM bdev to enable the device hop\n",
+		       "set %s to a backing SLM bdev to enable the backing-bdev round-trip\n",
 		       CPCS_PTYPE_PASSTHROUGH, CPCS_PASSTHROUGH_BACKING_BDEV_ENV);
 	return 0;
 }
