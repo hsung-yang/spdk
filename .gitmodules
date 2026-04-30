@@ -1,21 +1,21 @@
 [submodule "dpdk"]
 	path = dpdk
-	url = https://github.com/spdk/dpdk.git
+	url = https://github.samsungds.net/hsung-yang/dpdk.git
 [submodule "intel-ipsec-mb"]
 	path = intel-ipsec-mb
-	url = https://github.com/spdk/intel-ipsec-mb.git
+	url = https://github.samsungds.net/hsung-yang/intel-ipsec-mb.git
 [submodule "isa-l"]
 	path = isa-l
-	url = https://github.com/spdk/isa-l.git
+	url = https://github.samsungds.net/hsung-yang/isa-l.git
 [submodule "ocf"]
 	path = ocf
-	url = https://github.com/Open-CAS/ocf.git
+	url = https://github.samsungds.net/hsung-yang/ocf.git
 [submodule "libvfio-user"]
 	path = libvfio-user
-	url = https://github.com/nutanix/libvfio-user.git
+	url = https://github.samsungds.net/hsung-yang/libvfio-user.git
 [submodule "xnvme"]
 	path = xnvme
-	url = https://github.com/xnvme/xnvme.git
+	url = https://github.samsungds.net/hsung-yang/xnvme.git
 [submodule "isa-l-crypto"]
 	path = isa-l-crypto
-	url = https://github.com/intel/isa-l_crypto
+	url = https://github.samsungds.net/hsung-yang/isa-l_crypto
