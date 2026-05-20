@@ -336,6 +336,100 @@ cleanup:
 SPDK_RPC_REGISTER("cpcs_program_install_builtins", rpc_cpcs_program_install_builtins,
 		  SPDK_RPC_RUNTIME)
 
+/* RPC: cpcs_program_install_passthrough */
+struct rpc_cpcs_program_install_passthrough {
+	char *subsystem_nqn;
+	uint32_t nsid;
+	uint32_t pind;
+};
+
+static void
+free_rpc_cpcs_program_install_passthrough(struct rpc_cpcs_program_install_passthrough *req)
+{
+	free(req->subsystem_nqn);
+}
+
+static const struct spdk_json_object_decoder rpc_cpcs_program_install_passthrough_decoders[] = {
+	{"subsystem_nqn", offsetof(struct rpc_cpcs_program_install_passthrough, subsystem_nqn), spdk_json_decode_string},
+	{"nsid", offsetof(struct rpc_cpcs_program_install_passthrough, nsid), spdk_json_decode_uint32},
+	{"pind", offsetof(struct rpc_cpcs_program_install_passthrough, pind), spdk_json_decode_uint32},
+};
+
+static void
+rpc_cpcs_program_install_passthrough(struct spdk_jsonrpc_request *request,
+				     const struct spdk_json_val *params)
+{
+	struct rpc_cpcs_program_install_passthrough req = {};
+	struct spdk_nvmf_cpcs_ns *ns;
+	struct cpcs_program *prog;
+
+	if (spdk_json_decode_object(params, rpc_cpcs_program_install_passthrough_decoders,
+				     SPDK_COUNTOF(rpc_cpcs_program_install_passthrough_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+
+	struct spdk_nvmf_subsystem *subsystem = get_subsystem_by_nqn(req.subsystem_nqn);
+	if (!subsystem) {
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						      "Subsystem not found: %s", req.subsystem_nqn);
+		goto cleanup;
+	}
+
+	ns = spdk_nvmf_cpcs_ns_get_by_nsid(subsystem, req.nsid);
+	if (!ns) {
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						      "Namespace not found: NSID %u", req.nsid);
+		goto cleanup;
+	}
+
+	if (req.pind >= ns->max_programs) {
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						      "PIND %u exceeds max_programs", req.pind);
+		goto cleanup;
+	}
+
+	pthread_mutex_lock(&ns->lock);
+	if (ns->programs[req.pind] != NULL) {
+		pthread_mutex_unlock(&ns->lock);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						      "PIND %u already occupied", req.pind);
+		goto cleanup;
+	}
+
+	prog = calloc(1, sizeof(*prog));
+	if (prog == NULL) {
+		pthread_mutex_unlock(&ns->lock);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Memory allocation failed");
+		goto cleanup;
+	}
+
+	pthread_mutex_init(&prog->lock, NULL);
+	prog->pind = (uint16_t)req.pind;
+	prog->ptype = 0xC2; /* CPCS_PTYPE_PASSTHROUGH */
+	prog->pit = 0;
+	prog->puid = 0;
+	prog->peocc = SPDK_NVME_CPCS_PEOCC_DEVICE_DEFINED;
+	prog->state = CPCS_PROGRAM_STATE_ACTIVATED;
+	prog->activated = true;
+	prog->ns = ns;
+
+	ns->programs[req.pind] = prog;
+	ns->num_programs++;
+	ns->num_activated++;
+	pthread_mutex_unlock(&ns->lock);
+
+	SPDK_NOTICELOG("Installed passthrough program at PIND %u (ptype=0xC2)\n", req.pind);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_cpcs_program_install_passthrough(&req);
+}
+SPDK_RPC_REGISTER("cpcs_program_install_passthrough", rpc_cpcs_program_install_passthrough,
+		  SPDK_RPC_RUNTIME)
+
 /* RPC: cpcs_mrs_list */
 struct rpc_cpcs_mrs_list {
 	char *subsystem_nqn;

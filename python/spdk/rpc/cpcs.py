@@ -74,3 +74,13 @@ def cpcs_mrs_list(client, subsystem_nqn, nsid):
         'nsid': nsid,
     }
     return client.call('cpcs_mrs_list', params)
+
+
+def cpcs_program_install_passthrough(client, subsystem_nqn, nsid, pind):
+    """Install a passthrough (ptype=0xC2) program at the specified PIND."""
+    params = {
+        'subsystem_nqn': subsystem_nqn,
+        'nsid': nsid,
+        'pind': pind,
+    }
+    return client.call('cpcs_program_install_passthrough', params)
