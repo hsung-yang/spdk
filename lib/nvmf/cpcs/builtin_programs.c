@@ -5,6 +5,7 @@
 
 #include "builtin_programs.h"
 #include "nvmf_cpcs.h"
+#include "passthrough_runtime.h"
 #include "program.h"
 
 #include "spdk/log.h"
@@ -169,4 +170,61 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 	}
 
 	return rc;
+}
+
+int
+cpcs_program_install_passthrough(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
+{
+	struct cpcs_program *prog;
+	int rc;
+
+	if (ns == NULL) {
+		return -EINVAL;
+	}
+
+	pthread_mutex_lock(&ns->lock);
+
+	if (pind >= ns->max_programs) {
+		pthread_mutex_unlock(&ns->lock);
+		return -EINVAL;
+	}
+
+	prog = ns->programs[pind];
+	if (prog != NULL) {
+		/* already installed at this slot */
+		pthread_mutex_unlock(&ns->lock);
+		return 0;
+	}
+
+	prog = calloc(1, sizeof(*prog));
+	if (prog == NULL) {
+		pthread_mutex_unlock(&ns->lock);
+		return -ENOMEM;
+	}
+
+	rc = pthread_mutex_init(&prog->lock, NULL);
+	if (rc != 0) {
+		free(prog);
+		pthread_mutex_unlock(&ns->lock);
+		return -rc;
+	}
+
+	prog->pind      = pind;
+	prog->ptype     = CPCS_PTYPE_PASSTHROUGH;
+	prog->pit       = SPDK_NVME_CPCS_PIT_PUID;
+	prog->puid      = 0;
+	prog->peocc     = SPDK_NVME_CPCS_PEOCC_DEVICE_DEFINED;
+	prog->state     = CPCS_PROGRAM_STATE_ACTIVATED;
+	prog->activated = true;
+	prog->ns        = ns;
+
+	ns->programs[pind] = prog;
+	ns->num_programs++;
+	ns->num_activated++;
+
+	pthread_mutex_unlock(&ns->lock);
+
+	SPDK_NOTICELOG("Passthrough program installed at PIND %u (ptype=0x%02x)\n",
+		       pind, CPCS_PTYPE_PASSTHROUGH);
+	return 0;
 }

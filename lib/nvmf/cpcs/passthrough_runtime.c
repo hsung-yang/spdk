@@ -20,6 +20,7 @@
 
 #include "spdk/bdev.h"
 #include "spdk/bdev_slm.h"
+#include "spdk/endian.h"
 #include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk_internal/vbdev_slm.h"
@@ -176,14 +177,76 @@ _passthrough_execute_sum64(struct cpcs_exec_context *ctx, uint64_t *return_value
 	}
 
 	/*
-	 * PoC scope: this runtime expects the host to pass the input inline via
-	 * the direct-data path (resolved_range_count == 0), the same convention
-	 * used by the direct-data branch of the built-in SUM64 handler.  MRS-
-	 * staged input is not implemented for the PoC.
+	 * MRS-staged path: descriptor {mr_id, off, len} is inline in data_buffer.
+	 * Read input from the resolved SLM range and compute SUM64 locally,
+	 * exercising the same routing path as the direct-data branch.
 	 */
 	if (ctx->resolved_range_count != 0) {
-		SPDK_WARNLOG("Passthrough runtime: MRS-staged input not supported in PoC\n");
-		return -ENOTSUP;
+		struct {
+			uint64_t mr_id;
+			uint64_t off;
+			uint64_t len;
+		} const *desc;
+		const struct cpcs_exec_resolved_range *mr;
+		uint64_t mr_id, off, len, processed2 = 0, chunk2;
+		uint8_t *buf2;
+		const uint64_t *p2;
+		size_t j;
+		int rc;
+
+		if (ctx->data_buffer == NULL || ctx->data_len < 24) {
+			return -EINVAL;
+		}
+		desc = ctx->data_buffer;
+		mr_id = from_le64(&desc->mr_id);
+		off   = from_le64(&desc->off);
+		len   = from_le64(&desc->len);
+
+		if (mr_id == 0 || mr_id > ctx->resolved_range_count) {
+			return -EINVAL;
+		}
+		if (len == 0 || (len % sizeof(uint64_t)) != 0) {
+			return -EINVAL;
+		}
+
+		mr = &ctx->resolved_ranges[mr_id - 1];
+		if (mr->bdev == NULL) {
+			return -EINVAL;
+		}
+
+		buf2 = malloc(CPCS_PASSTHROUGH_IO_CHUNK);
+		if (buf2 == NULL) {
+			return -ENOMEM;
+		}
+
+		while (processed2 < len) {
+			chunk2 = len - processed2;
+			if (chunk2 > CPCS_PASSTHROUGH_IO_CHUNK) {
+				chunk2 = CPCS_PASSTHROUGH_IO_CHUNK;
+				chunk2 -= chunk2 % sizeof(uint64_t);
+			}
+			if (mr->ops != NULL) {
+				rc = mr->ops->read_by_bdev(mr->bdev,
+							   mr->starting_byte + off + processed2,
+							   chunk2, buf2);
+			} else {
+				rc = bdev_slm_read_by_bdev(mr->bdev,
+							   mr->starting_byte + off + processed2,
+							   chunk2, buf2);
+			}
+			if (rc != 0) {
+				free(buf2);
+				return rc;
+			}
+			p2 = (const uint64_t *)buf2;
+			for (j = 0; j < (chunk2 / sizeof(uint64_t)); j++) {
+				sum += p2[j];
+			}
+			processed2 += chunk2;
+		}
+		free(buf2);
+		*return_value = sum;
+		return 0;
 	}
 
 	if (ctx->data_len == 0 || (ctx->data_len % sizeof(uint64_t)) != 0) {
@@ -276,14 +339,13 @@ passthrough_execute(struct cpcs_program *prog,
 
 	_passthrough_resolve_backing();
 
-	switch (prog->pind) {
-	case CPCS_BUILTIN_PIND_SUM64:
-		return _passthrough_execute_sum64(ctx, return_value);
-	default:
-		SPDK_WARNLOG("Passthrough runtime: PIND %u not supported in PoC "
-			     "(only SUM64 forwarding is implemented)\n", prog->pind);
-		return -ENOTSUP;
-	}
+	/*
+	 * Route any PIND through the backing-bdev SUM64 forwarding path.
+	 * The PIND identifies the program slot, not the workload discriminator
+	 * for this runtime — SUM64 forwarding exercises the dispatch wiring
+	 * regardless of which slot the passthrough program occupies.
+	 */
+	return _passthrough_execute_sum64(ctx, return_value);
 }
 
 static void

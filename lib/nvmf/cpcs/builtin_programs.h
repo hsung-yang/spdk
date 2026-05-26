@@ -71,6 +71,7 @@ enum cpcs_builtin_program {
 
 bool cpcs_program_index_is_builtin(uint16_t pind);
 int cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns);
+int cpcs_program_install_passthrough(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind);
 
 #ifdef __cplusplus
 }

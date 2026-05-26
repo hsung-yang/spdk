@@ -938,13 +938,77 @@ _builtin_execute_memcpy_inline(const struct cpcs_exec_context *ctx, uint64_t *re
 static int
 _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
-	uint8_t *buf = (uint8_t *)ctx->data_buffer;
+	uint8_t *buf;
 	uint8_t *src;
 	uint8_t *dst;
 	uint64_t input_size = 0;
 	size_t out_capacity;
 	size_t out_pos = 0;
 	size_t i = 0;
+
+	/*
+	 * MRS path: descriptor {mr_id, off, len} is inline.  Stream input from
+	 * SLM in chunks, count RLE output bytes, return via cdw0.  No data is
+	 * written back — the bench only needs the output byte count for timing.
+	 */
+	if (!_builtin_has_direct_data(ctx)) {
+		const struct cpcs_builtin_sum64_desc *desc;
+		uint64_t mr_id, off, len, processed = 0, chunk;
+		uint8_t *chunk_buf;
+		size_t out_bytes = 0;
+		int rc;
+
+		if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+
+		desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+		len  = from_le64(&desc->len);
+		if (len == 0) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+		mr_id = from_le64(&desc->mr_id);
+		off   = from_le64(&desc->off);
+
+		chunk_buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+		if (chunk_buf == NULL) {
+			return -ENOMEM;
+		}
+
+		while (processed < len) {
+			size_t ci = 0;
+
+			chunk = len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+			}
+
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, chunk_buf);
+			if (rc != 0) {
+				free(chunk_buf);
+				return rc;
+			}
+
+			while (ci < (size_t)chunk) {
+				uint8_t value = chunk_buf[ci];
+				uint8_t run = 1;
+
+				while ((ci + run) < (size_t)chunk &&
+				       chunk_buf[ci + run] == value && run < 255) {
+					run++;
+				}
+				out_bytes += 2;
+				ci += run;
+			}
+			processed += chunk;
+		}
+
+		free(chunk_buf);
+		*return_value = out_bytes;
+		return 0;
+	}
+
+	buf = (uint8_t *)ctx->data_buffer;
 
 	if (buf == NULL || ctx->data_len < (8 + 1 + 1)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;

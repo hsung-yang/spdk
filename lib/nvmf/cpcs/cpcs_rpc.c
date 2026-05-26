@@ -336,6 +336,74 @@ cleanup:
 SPDK_RPC_REGISTER("cpcs_program_install_builtins", rpc_cpcs_program_install_builtins,
 		  SPDK_RPC_RUNTIME)
 
+/* RPC: cpcs_program_install_passthrough */
+struct rpc_cpcs_program_install_passthrough {
+	char *subsystem_nqn;
+	uint32_t nsid;
+	uint32_t pind;
+};
+
+static void
+free_rpc_cpcs_program_install_passthrough(struct rpc_cpcs_program_install_passthrough *req)
+{
+	free(req->subsystem_nqn);
+}
+
+static const struct spdk_json_object_decoder rpc_cpcs_program_install_passthrough_decoders[] = {
+	{"subsystem_nqn", offsetof(struct rpc_cpcs_program_install_passthrough, subsystem_nqn), spdk_json_decode_string},
+	{"nsid", offsetof(struct rpc_cpcs_program_install_passthrough, nsid), spdk_json_decode_uint32},
+	{"pind", offsetof(struct rpc_cpcs_program_install_passthrough, pind), spdk_json_decode_uint32},
+};
+
+static void
+rpc_cpcs_program_install_passthrough(struct spdk_jsonrpc_request *request,
+				     const struct spdk_json_val *params)
+{
+	struct rpc_cpcs_program_install_passthrough req = {};
+	struct spdk_nvmf_cpcs_ns *ns;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cpcs_program_install_passthrough_decoders,
+				     SPDK_COUNTOF(rpc_cpcs_program_install_passthrough_decoders), &req)) {
+		SPDK_ERRLOG("Failed to decode RPC parameters\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+
+	struct spdk_nvmf_subsystem *subsystem = get_subsystem_by_nqn(req.subsystem_nqn);
+	if (!subsystem) {
+		SPDK_ERRLOG("Subsystem not found: %s\n", req.subsystem_nqn);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						      "Subsystem not found: %s", req.subsystem_nqn);
+		goto cleanup;
+	}
+
+	ns = spdk_nvmf_cpcs_ns_get_by_nsid(subsystem, req.nsid);
+	if (!ns) {
+		SPDK_ERRLOG("Namespace not found: NSID %u\n", req.nsid);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						      "Namespace not found: NSID %u", req.nsid);
+		goto cleanup;
+	}
+
+	rc = cpcs_program_install_passthrough(ns, (uint16_t)req.pind);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to install passthrough at PIND %u: %d\n", req.pind, rc);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						      "Failed to install passthrough at PIND %u: %d",
+						      req.pind, rc);
+		goto cleanup;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_cpcs_program_install_passthrough(&req);
+}
+SPDK_RPC_REGISTER("cpcs_program_install_passthrough", rpc_cpcs_program_install_passthrough,
+		  SPDK_RPC_RUNTIME)
+
 /* RPC: cpcs_mrs_list */
 struct rpc_cpcs_mrs_list {
 	char *subsystem_nqn;
