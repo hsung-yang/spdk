@@ -80,7 +80,15 @@ struct cs_direct_ns_result {
 #define CS_DIRECT_NS_WORKLOAD_FILTER_GT   3
 #define CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT 4
 
-#define CPCS_BUILTIN_IO_CHUNK (2 * 1024 * 1024)
+/* SLM reads are local DRAM memcpy — no transport limit. A larger chunk
+ * eliminates loop overhead and enables the compiler to auto-vectorize
+ * the inner reduction without cross-iteration spills. 16 MiB matches
+ * the common benchmark data size so most ops complete in one pass. */
+#define CPCS_BUILTIN_IO_CHUNK (16 * 1024 * 1024)
+
+/* Allocate only as much as needed; avoids 16MB malloc for small inputs. */
+#define CPCS_ALLOC_CHUNK(data_len) \
+	((data_len) < CPCS_BUILTIN_IO_CHUNK ? (data_len) : CPCS_BUILTIN_IO_CHUNK)
 
 static bool
 _builtin_has_direct_data(const struct cpcs_exec_context *ctx)
@@ -500,7 +508,7 @@ _builtin_execute_sum64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	buf = malloc(CPCS_ALLOC_CHUNK(len));
 	if (buf == NULL) {
 		return -ENOMEM;
 	}
@@ -563,7 +571,7 @@ _builtin_execute_max64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	buf = malloc(CPCS_ALLOC_CHUNK(len));
 	if (buf == NULL) {
 		return -ENOMEM;
 	}
@@ -629,7 +637,7 @@ _builtin_execute_min64(const struct cpcs_exec_context *ctx, uint64_t *return_val
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	buf = malloc(CPCS_ALLOC_CHUNK(len));
 	if (buf == NULL) {
 		return -ENOMEM;
 	}
@@ -677,7 +685,7 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 {
 	const struct cpcs_builtin_sum64_desc *desc;
 	const float *p;
-	uint8_t *buf;
+	uint8_t *buf = NULL;
 	uint64_t mr_id;
 	uint64_t off;
 	uint64_t processed = 0;
@@ -709,61 +717,75 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	off = from_le64(&desc->off);
 	half_len = len / 2;
 
-	/* Read vector A (first half) into buf_a */
-	buf_a = malloc(half_len);
+	/* Read both vectors in one contiguous buffer when possible (saves one
+	 * SLM read call at the common 16MB size). Falls back to two-pass for
+	 * very large inputs that exceed IO_CHUNK. */
+	buf_a = malloc(len <= CPCS_BUILTIN_IO_CHUNK ? len : half_len);
 	if (buf_a == NULL) {
 		return -ENOMEM;
 	}
 
-	processed = 0;
-	while (processed < half_len) {
-		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
-			chunk -= chunk % sizeof(float);
-		}
-
-		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk,
-					   buf_a + processed);
+	if (len <= CPCS_BUILTIN_IO_CHUNK) {
+		rc = _cpcs_exec_read_range(ctx, mr_id, off, len, buf_a);
 		if (rc != 0) {
 			free(buf_a);
 			return rc;
 		}
-		processed += chunk;
-	}
 
-	/* Stream vector B (second half) and accumulate dot product */
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
-	if (buf == NULL) {
+		p = (const float *)buf_a;
+		for (i = 0; i < (half_len / sizeof(float)); i++) {
+			sum_d += (double)p[i] * (double)p[i + half_len / sizeof(float)];
+		}
+
 		free(buf_a);
-		return -ENOMEM;
-	}
-
-	processed = 0;
-	while (processed < half_len) {
-		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
-			chunk -= chunk % sizeof(float);
+	} else {
+		processed = 0;
+		while (processed < half_len) {
+			chunk = half_len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk,
+						   buf_a + processed);
+			if (rc != 0) {
+				free(buf_a);
+				return rc;
+			}
+			processed += chunk;
 		}
 
-		rc = _cpcs_exec_read_range(ctx, mr_id, off + half_len + processed,
-					   chunk, buf);
-		if (rc != 0) {
-			free(buf);
+		buf = malloc(CPCS_ALLOC_CHUNK(half_len));
+		if (buf == NULL) {
 			free(buf_a);
-			return rc;
+			return -ENOMEM;
 		}
 
-		p = (const float *)buf;
-		for (i = 0; i < (chunk / sizeof(float)); i++) {
-			sum_d += (double)((const float *)buf_a)[processed / sizeof(float) + i] * (double)p[i];
+		processed = 0;
+		while (processed < half_len) {
+			chunk = half_len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + half_len + processed,
+						   chunk, buf);
+			if (rc != 0) {
+				free(buf);
+				free(buf_a);
+				return rc;
+			}
+
+			p = (const float *)buf;
+			for (i = 0; i < (chunk / sizeof(float)); i++) {
+				sum_d += (double)((const float *)buf_a)[processed / sizeof(float) + i] * (double)p[i];
+			}
+			processed += chunk;
 		}
-		processed += chunk;
+
+		free(buf);
+		free(buf_a);
 	}
-
-	free(buf);
-	free(buf_a);
 
 	sum = (float)sum_d;
 	memcpy(&sum_bits, &sum, sizeof(sum_bits));
@@ -802,7 +824,7 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	buf = malloc(CPCS_ALLOC_CHUNK(len));
 	if (buf == NULL) {
 		return -ENOMEM;
 	}
@@ -886,61 +908,78 @@ _builtin_execute_l2_distance_sq(const struct cpcs_exec_context *ctx, uint64_t *r
 	off = from_le64(&desc->off);
 	half_len = len / 2;
 
-	/* Read vector A (first half) */
-	buf_a = malloc(half_len);
+	buf_a = malloc(len <= CPCS_BUILTIN_IO_CHUNK ? len : half_len);
 	if (buf_a == NULL) {
 		return -ENOMEM;
 	}
 
-	processed = 0;
-	while (processed < half_len) {
-		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
-			chunk -= chunk % sizeof(float);
-		}
-		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, buf_a + processed);
+	if (len <= CPCS_BUILTIN_IO_CHUNK) {
+		rc = _cpcs_exec_read_range(ctx, mr_id, off, len, buf_a);
 		if (rc != 0) {
-			free(buf_a);
-			return rc;
-		}
-		processed += chunk;
-	}
-
-	/* Stream vector B and accumulate L2 distance squared */
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
-	if (buf == NULL) {
-		free(buf_a);
-		return -ENOMEM;
-	}
-
-	processed = 0;
-	while (processed < half_len) {
-		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
-			chunk -= chunk % sizeof(float);
-		}
-		rc = _cpcs_exec_read_range(ctx, mr_id, off + half_len + processed, chunk, buf);
-		if (rc != 0) {
-			free(buf);
 			free(buf_a);
 			return rc;
 		}
 
 		{
-			const float *pb = (const float *)buf;
-			const float *pa = (const float *)(buf_a + processed);
-			for (i = 0; i < (chunk / sizeof(float)); i++) {
+			const float *pa = (const float *)buf_a;
+			const float *pb = pa + half_len / sizeof(float);
+			for (i = 0; i < (half_len / sizeof(float)); i++) {
 				float diff = pa[i] - pb[i];
 				sum_d += (double)diff * (double)diff;
 			}
 		}
-		processed += chunk;
-	}
 
-	free(buf);
-	free(buf_a);
+		free(buf_a);
+	} else {
+		processed = 0;
+		while (processed < half_len) {
+			chunk = half_len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, buf_a + processed);
+			if (rc != 0) {
+				free(buf_a);
+				return rc;
+			}
+			processed += chunk;
+		}
+
+		buf = malloc(CPCS_ALLOC_CHUNK(half_len));
+		if (buf == NULL) {
+			free(buf_a);
+			return -ENOMEM;
+		}
+
+		processed = 0;
+		while (processed < half_len) {
+			chunk = half_len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + half_len + processed, chunk, buf);
+			if (rc != 0) {
+				free(buf);
+				free(buf_a);
+				return rc;
+			}
+
+			{
+				const float *pb = (const float *)buf;
+				const float *pa = (const float *)(buf_a + processed);
+				for (i = 0; i < (chunk / sizeof(float)); i++) {
+					float diff = pa[i] - pb[i];
+					sum_d += (double)diff * (double)diff;
+				}
+			}
+			processed += chunk;
+		}
+
+		free(buf);
+		free(buf_a);
+	}
 
 	result_f = (float)sum_d;
 	memcpy(&result_bits, &result_f, sizeof(result_bits));
@@ -981,52 +1020,22 @@ _builtin_execute_cosine_similarity(const struct cpcs_exec_context *ctx, uint64_t
 	off = from_le64(&desc->off);
 	half_len = len / 2;
 
-	/* Read vector A (first half) */
-	buf_a = malloc(half_len);
+	buf_a = malloc(len <= CPCS_BUILTIN_IO_CHUNK ? len : half_len);
 	if (buf_a == NULL) {
 		return -ENOMEM;
 	}
 
-	processed = 0;
-	while (processed < half_len) {
-		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
-			chunk -= chunk % sizeof(float);
-		}
-		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, buf_a + processed);
+	if (len <= CPCS_BUILTIN_IO_CHUNK) {
+		rc = _cpcs_exec_read_range(ctx, mr_id, off, len, buf_a);
 		if (rc != 0) {
-			free(buf_a);
-			return rc;
-		}
-		processed += chunk;
-	}
-
-	/* Stream vector B and accumulate dot, norms */
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
-	if (buf == NULL) {
-		free(buf_a);
-		return -ENOMEM;
-	}
-
-	processed = 0;
-	while (processed < half_len) {
-		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
-			chunk -= chunk % sizeof(float);
-		}
-		rc = _cpcs_exec_read_range(ctx, mr_id, off + half_len + processed, chunk, buf);
-		if (rc != 0) {
-			free(buf);
 			free(buf_a);
 			return rc;
 		}
 
 		{
-			const float *pb = (const float *)buf;
-			const float *pa = (const float *)(buf_a + processed);
-			for (i = 0; i < (chunk / sizeof(float)); i++) {
+			const float *pa = (const float *)buf_a;
+			const float *pb = pa + half_len / sizeof(float);
+			for (i = 0; i < (half_len / sizeof(float)); i++) {
 				double a = (double)pa[i];
 				double b = (double)pb[i];
 				dot += a * b;
@@ -1034,11 +1043,61 @@ _builtin_execute_cosine_similarity(const struct cpcs_exec_context *ctx, uint64_t
 				rhs_norm += b * b;
 			}
 		}
-		processed += chunk;
-	}
 
-	free(buf);
-	free(buf_a);
+		free(buf_a);
+	} else {
+		processed = 0;
+		while (processed < half_len) {
+			chunk = half_len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, buf_a + processed);
+			if (rc != 0) {
+				free(buf_a);
+				return rc;
+			}
+			processed += chunk;
+		}
+
+		buf = malloc(CPCS_ALLOC_CHUNK(half_len));
+		if (buf == NULL) {
+			free(buf_a);
+			return -ENOMEM;
+		}
+
+		processed = 0;
+		while (processed < half_len) {
+			chunk = half_len - processed;
+			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+			rc = _cpcs_exec_read_range(ctx, mr_id, off + half_len + processed, chunk, buf);
+			if (rc != 0) {
+				free(buf);
+				free(buf_a);
+				return rc;
+			}
+
+			{
+				const float *pb = (const float *)buf;
+				const float *pa = (const float *)(buf_a + processed);
+				for (i = 0; i < (chunk / sizeof(float)); i++) {
+					double a = (double)pa[i];
+					double b = (double)pb[i];
+					dot += a * b;
+					lhs_norm += a * a;
+					rhs_norm += b * b;
+				}
+			}
+			processed += chunk;
+		}
+
+		free(buf);
+		free(buf_a);
+	}
 
 	{
 		double denom = sqrt(lhs_norm * rhs_norm);
@@ -1115,7 +1174,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		tbits = from_le32(&desc->threshold_bits);
 		memcpy(&thr, &tbits, sizeof(thr));
 
-		chunk_buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+		chunk_buf = malloc(CPCS_ALLOC_CHUNK(len));
 		if (chunk_buf == NULL) {
 			return -ENOMEM;
 		}
@@ -1243,10 +1302,9 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 		return 0;
 	}
 
-	/* MRS path: read input from SLM, compress in-place */
+	/* MRS path: read input from SLM, count compressed size */
 	const struct cpcs_builtin_sum64_desc *desc;
 	uint8_t *src_buf = NULL;
-	uint8_t *dst_buf = NULL;
 	uint64_t mr_id, off, len;
 	uint64_t processed = 0, chunk;
 	size_t out_pos = 0;
@@ -1265,14 +1323,8 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
-	src_buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	src_buf = malloc(CPCS_ALLOC_CHUNK(len));
 	if (src_buf == NULL) {
-		return -ENOMEM;
-	}
-	/* Worst-case RLE output: 2 bytes per input byte (no runs) */
-	dst_buf = malloc(2 * len);
-	if (dst_buf == NULL) {
-		free(src_buf);
 		return -ENOMEM;
 	}
 
@@ -1291,7 +1343,6 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 		rc = _cpcs_exec_read_range(ctx, mr_id, off + processed, chunk, src_buf);
 		if (rc != 0) {
 			free(src_buf);
-			free(dst_buf);
 			return rc;
 		}
 
@@ -1302,8 +1353,7 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 				prev_run++;
 			} else {
 				if (has_prev) {
-					dst_buf[out_pos++] = prev_run;
-					dst_buf[out_pos++] = prev_value;
+					out_pos += 2;
 				}
 				prev_value = value;
 				prev_run = 1;
@@ -1314,12 +1364,10 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	}
 
 	if (has_prev) {
-		dst_buf[out_pos++] = prev_run;
-		dst_buf[out_pos++] = prev_value;
+		out_pos += 2;
 	}
 
 	free(src_buf);
-	free(dst_buf);
 	*return_value = out_pos;
 	return 0;
 }
