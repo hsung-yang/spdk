@@ -408,7 +408,9 @@ def add_parser(subparsers):
             fault_batch=args.fault_batch,
             prefetch_batch=args.prefetch_batch,
             background_cleaner=args.background_cleaner,
-            streaming_mode=args.streaming_mode))
+            streaming_mode=args.streaming_mode,
+            force_dma_fallback=args.force_dma_fallback,
+            disable_cow_bypass=args.disable_cow_bypass))
 
     p = subparsers.add_parser('bdev_vslm_set_debug',
                               help='Apply vSLM debug/benchmark overrides (ablation only)')
@@ -419,7 +421,9 @@ def add_parser(subparsers):
                          ('fault-batch', 'batched fault-in'),
                          ('prefetch-batch', 'async prefetch batches'),
                          ('background-cleaner', 'background cleaner'),
-                         ('streaming-mode', 'streaming mode')):
+                         ('streaming-mode', 'streaming mode'),
+                         ('force-dma-fallback', 'forced DMA ring-buffer fallback'),
+                         ('disable-cow-bypass', 'disabling CoW full-overwrite media-bypass')):
         _dest = _knob.replace('-', '_')
         _g = p.add_mutually_exclusive_group()
         _g.add_argument('--%s-enabled' % _knob, dest=_dest, action='store_true',

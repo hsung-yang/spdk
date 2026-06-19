@@ -12744,9 +12744,12 @@ This method is experimental.
 ### bdev_vslm_set_debug
 
 Apply vSLM debug/benchmark overrides for mechanism-ablation studies: the
-partitioned-MMU shard count and the asynchronous execute / batching knobs that
-have no production RPC. Intended for an idle bdev (right after create); a
-shard-count change requires an empty MMU.
+partitioned-MMU shard count, the asynchronous execute / batching knobs, and two
+axes that are normally auto-selected with no production RPC -- `force_dma_fallback`
+(force the static DMA ring-buffer fallback even when the backing supports a native
+block-vector readv) and `disable_cow_bypass` (force a full backing read on a
+full-page overwrite instead of skipping it). Intended for an idle bdev (right
+after create); a shard-count change requires an empty MMU.
 
 This method is experimental.
 

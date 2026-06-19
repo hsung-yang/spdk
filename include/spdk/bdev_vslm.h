@@ -327,10 +327,12 @@ int bdev_vslm_get_policy(const char *name, struct spdk_bdev_vslm_policy *policy)
 /**
  * Debug/benchmark overrides for ablation studies (paper Sec. 5 mechanism
  * ablation). These reach internal knobs that have no production-facing RPC:
- * the partitioned-MMU shard count (normally adapted from the SRAM size) and
- * the asynchronous execution / batching paths. Intended to be called on an
- * IDLE bdev (immediately after create, before any I/O); changing the shard
- * count requires the MMU to be empty and returns -EBUSY otherwise.
+ * the partitioned-MMU shard count (normally adapted from the SRAM size), the
+ * asynchronous execution / batching paths, and two mechanisms that are
+ * normally auto-selected with no runtime knob -- the static DMA ring-buffer
+ * fallback (paper 4.5) and the CoW full-overwrite media-bypass. Intended to be
+ * called on an IDLE bdev (immediately after create, before any I/O); changing
+ * the shard count requires the MMU to be empty and returns -EBUSY otherwise.
  *
  * Tri-state integer fields: -1 leaves the knob unchanged, 0 disables, 1
  * enables. num_shards == 0 leaves the shard count unchanged.
@@ -342,6 +344,8 @@ struct spdk_bdev_vslm_debug {
 	int prefetch_batch;
 	int background_cleaner;
 	int streaming_mode;
+	int force_dma_fallback;		/* 1 = force DMA ring-buffer fallback (paper 4.5) */
+	int disable_cow_bypass;		/* 1 = disable CoW full-overwrite media-bypass */
 };
 
 /** Initialize a debug-override struct to "change nothing". */

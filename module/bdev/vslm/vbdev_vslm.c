@@ -378,6 +378,17 @@ struct vbdev_vslm {
 	uint32_t streaming_io_pages;
 	bool async_exec_enabled;
 
+	/*
+	 * Ablation overrides for mechanisms that are normally auto-selected with no
+	 * runtime knob (paper Sec. 5 mechanism ablation). Defaults preserve normal
+	 * behavior. force_dma_fallback forces the static DMA ring-buffer fallback
+	 * (paper 4.5) on the batched fault-in path even when the backing supports a
+	 * native block-vector readv. disable_cow_bypass forces a full backing read
+	 * on a full-page compute/host overwrite instead of skipping it.
+	 */
+	bool force_dma_fallback;
+	bool disable_cow_bypass;
+
 	/* Endurance/FDP policy and telemetry */
 	struct spdk_bdev_vslm_policy policy;
 	bool fdp_mode_enabled;
@@ -1900,6 +1911,8 @@ vslm_init_mmu(struct vbdev_vslm *vslm)
 	vslm_init_dma_ring_pool(vslm);
 
 	vslm->async_exec_enabled = true;
+	vslm->force_dma_fallback = false;
+	vslm->disable_cow_bypass = false;
 	vslm_debug_validate_page_lists(vslm);
 	return 0;
 }
@@ -2487,6 +2500,14 @@ vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *bas
 	thread = spdk_get_thread();
 	if (thread == NULL) {
 		return -EINVAL;
+	}
+
+	/*
+	 * Ablation override: pretend the backing cannot do a native block-vector
+	 * readv so the caller takes the static DMA ring-buffer fallback (paper 4.5).
+	 */
+	if (vslm->force_dma_fallback) {
+		return -ENOTSUP;
 	}
 
 	rc = spdk_bdev_readv_blocks(vslm->base_desc, base_ch,
@@ -3132,6 +3153,14 @@ vslm_resolve_page_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 	VSLM_PERF_INC(vslm, resolve_total);
 	*out_page = NULL;
 
+	/*
+	 * CoW full-overwrite media-bypass ablation override: never skip the backing
+	 * read on a full-page overwrite when disable_cow_bypass is set.
+	 */
+	if (vslm->disable_cow_bypass) {
+		skip_fault_in = false;
+	}
+
 	max_vpn = vslm->virtual_size_bytes / VSLM_PAGE_SIZE;
 	if (vpn >= max_vpn) {
 		rc = -EINVAL;
@@ -3320,7 +3349,13 @@ vslm_reserve_page_for_fault_locked(struct vbdev_vslm *vslm,
 	fault_ctx->lpage = lpage;
 	fault_ctx->pre_fault_state = lpage != NULL ? lpage->state :
 				     SPDK_BDEV_VSLM_LPAGE_CLEAN_RESIDENT;
-	fault_ctx->skip_fault_in = for_write && full_page_overwrite;
+	/*
+	 * CoW full-overwrite media-bypass: a full-page overwrite skips the backing
+	 * read and prepares a blank frame. The disable_cow_bypass ablation override
+	 * forces the read so the page is always faulted in first.
+	 */
+	fault_ctx->skip_fault_in = for_write && full_page_overwrite &&
+				   !vslm->disable_cow_bypass;
 	fault_ctx->needs_fault_in = !fault_ctx->skip_fault_in;
 	return 0;
 }
@@ -7650,12 +7685,20 @@ vslm_apply_debug(struct vbdev_vslm *vslm, const struct spdk_bdev_vslm_debug *dbg
 	if (dbg->streaming_mode >= 0) {
 		vslm->streaming_mode_enabled = (dbg->streaming_mode != 0);
 	}
+	if (dbg->force_dma_fallback >= 0) {
+		vslm->force_dma_fallback = (dbg->force_dma_fallback != 0);
+	}
+	if (dbg->disable_cow_bypass >= 0) {
+		vslm->disable_cow_bypass = (dbg->disable_cow_bypass != 0);
+	}
 
 	SPDK_NOTICELOG("vslm[%s] debug: num_shards=%u async=%d fault_batch=%d "
-		       "prefetch_batch=%d cleaner=%d streaming=%d\n",
+		       "prefetch_batch=%d cleaner=%d streaming=%d force_dma_fallback=%d "
+		       "disable_cow_bypass=%d\n",
 		       vslm->vbdev.name, vslm->num_shards, vslm->async_exec_enabled,
 		       vslm->fault_batch_enabled, vslm->prefetch_batch_enabled,
-		       vslm->background_cleaner_enabled, vslm->streaming_mode_enabled);
+		       vslm->background_cleaner_enabled, vslm->streaming_mode_enabled,
+		       vslm->force_dma_fallback, vslm->disable_cow_bypass);
 out:
 	pthread_mutex_unlock(&vslm->policy_lock);
 	return rc;
@@ -7673,6 +7716,8 @@ bdev_vslm_debug_init(struct spdk_bdev_vslm_debug *dbg)
 	dbg->prefetch_batch = -1;
 	dbg->background_cleaner = -1;
 	dbg->streaming_mode = -1;
+	dbg->force_dma_fallback = -1;
+	dbg->disable_cow_bypass = -1;
 }
 
 int

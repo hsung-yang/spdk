@@ -470,6 +470,14 @@ static const struct spdk_json_object_decoder rpc_bdev_vslm_set_debug_decoders[] 
 		"streaming_mode", offsetof(struct rpc_bdev_vslm_set_debug, dbg.streaming_mode),
 		rpc_decode_vslm_tristate, true
 	},
+	{
+		"force_dma_fallback", offsetof(struct rpc_bdev_vslm_set_debug, dbg.force_dma_fallback),
+		rpc_decode_vslm_tristate, true
+	},
+	{
+		"disable_cow_bypass", offsetof(struct rpc_bdev_vslm_set_debug, dbg.disable_cow_bypass),
+		rpc_decode_vslm_tristate, true
+	},
 };
 
 static void

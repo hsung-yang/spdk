@@ -438,7 +438,8 @@ def bdev_vslm_set_policy(client, name, semantics_mode, writeback_policy,
 
 def bdev_vslm_set_debug(client, name, num_shards=None, async_exec=None,
                         fault_batch=None, prefetch_batch=None,
-                        background_cleaner=None, streaming_mode=None):
+                        background_cleaner=None, streaming_mode=None,
+                        force_dma_fallback=None, disable_cow_bypass=None):
     """Apply vSLM debug/benchmark overrides (mechanism-ablation studies only).
 
     Reaches internal knobs with no production RPC. Call on an IDLE bdev (right
@@ -451,6 +452,8 @@ def bdev_vslm_set_debug(client, name, num_shards=None, async_exec=None,
         prefetch_batch: enable/disable async prefetch batches (bool, None = unchanged)
         background_cleaner: enable/disable background cleaner (bool, None = unchanged)
         streaming_mode: enable/disable streaming mode (bool, None = unchanged)
+        force_dma_fallback: force DMA ring-buffer fallback (bool, None = unchanged)
+        disable_cow_bypass: disable CoW full-overwrite media-bypass (bool, None = unchanged)
     """
     params = dict()
     params['name'] = name
@@ -459,7 +462,9 @@ def bdev_vslm_set_debug(client, name, num_shards=None, async_exec=None,
     for key, val in (('async_exec', async_exec), ('fault_batch', fault_batch),
                      ('prefetch_batch', prefetch_batch),
                      ('background_cleaner', background_cleaner),
-                     ('streaming_mode', streaming_mode)):
+                     ('streaming_mode', streaming_mode),
+                     ('force_dma_fallback', force_dma_fallback),
+                     ('disable_cow_bypass', disable_cow_bypass)):
         if val is not None:
             params[key] = 1 if val else 0
     return client.call('bdev_vslm_set_debug', params)
