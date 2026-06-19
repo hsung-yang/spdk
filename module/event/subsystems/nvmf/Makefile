@@ -10,6 +10,7 @@ SO_VER := 7
 SO_MINOR := 0
 
 C_SRCS = nvmf_rpc.c nvmf_tgt.c
+CFLAGS += -I$(SPDK_ROOT_DIR)/lib
 LIBNAME = event_nvmf
 
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map

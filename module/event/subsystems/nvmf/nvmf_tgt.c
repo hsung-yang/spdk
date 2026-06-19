@@ -12,6 +12,7 @@
 #include "spdk/nvme.h"
 #include "spdk/nvmf_cmd.h"
 #include "spdk_internal/usdt.h"
+#include "nvmf/cpcs/builtin_runtime.h"
 
 enum nvmf_tgt_state {
 	NVMF_TGT_INIT_NONE = 0,
@@ -147,11 +148,20 @@ nvmf_tgt_destroy_poll_groups(void)
 static uint32_t
 nvmf_get_cpuset_count(void)
 {
-	if (g_poll_groups_mask) {
-		return spdk_cpuset_count(g_poll_groups_mask);
-	} else {
-		return spdk_env_get_core_count();
+	uint32_t cpu;
+	uint32_t count = 0;
+
+	SPDK_ENV_FOREACH_CORE(cpu) {
+		if (g_poll_groups_mask && !spdk_cpuset_get_cpu(g_poll_groups_mask, cpu)) {
+			continue;
+		}
+		if (cpcs_builtin_runtime_is_compute_core(cpu)) {
+			continue;
+		}
+		count++;
 	}
+
+	return count;
 }
 
 static void
@@ -201,20 +211,44 @@ nvmf_tgt_create_poll_group(void *ctx)
 static void
 nvmf_tgt_create_poll_groups(void)
 {
+	const struct spdk_cpuset *compute_mask;
+	struct spdk_cpuset poll_group_mask = {};
+	struct spdk_cpuset thread_mask = {};
 	uint32_t cpu, count = 0;
 	char thread_name[32];
 	struct spdk_thread *thread;
 
 	g_tgt_init_thread = spdk_get_thread();
 	assert(g_tgt_init_thread != NULL);
+	compute_mask = cpcs_builtin_runtime_get_compute_core_mask();
 
 	SPDK_ENV_FOREACH_CORE(cpu) {
 		if (g_poll_groups_mask && !spdk_cpuset_get_cpu(g_poll_groups_mask, cpu)) {
 			continue;
 		}
-		snprintf(thread_name, sizeof(thread_name), "nvmf_tgt_poll_group_%03u", count++);
+		if (cpcs_builtin_runtime_is_compute_core(cpu)) {
+			continue;
+		}
+		spdk_cpuset_set_cpu(&poll_group_mask, cpu, true);
+	}
 
-		thread = spdk_thread_create(thread_name, g_poll_groups_mask);
+	if (spdk_cpuset_count(&poll_group_mask) == 0) {
+		SPDK_ERRLOG("No NVMf poll-group cores remain after excluding CPCS compute core mask 0x%s\n",
+			    compute_mask != NULL ? spdk_cpuset_fmt((struct spdk_cpuset *)compute_mask) : "0");
+		g_tgt_state = NVMF_TGT_ERROR;
+		nvmf_tgt_advance_state();
+		return;
+	}
+
+	SPDK_ENV_FOREACH_CORE(cpu) {
+		if (!spdk_cpuset_get_cpu(&poll_group_mask, cpu)) {
+			continue;
+		}
+		snprintf(thread_name, sizeof(thread_name), "nvmf_tgt_poll_group_%03u", count++);
+		spdk_cpuset_zero(&thread_mask);
+		spdk_cpuset_set_cpu(&thread_mask, cpu, true);
+
+		thread = spdk_thread_create(thread_name, &thread_mask);
 		assert(thread != NULL);
 
 		spdk_thread_send_msg(thread, nvmf_tgt_create_poll_group, NULL);
