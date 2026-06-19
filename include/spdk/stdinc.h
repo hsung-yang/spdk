@@ -69,6 +69,39 @@ extern "C" {
 #include <sys/syscall.h>
 #include <sys/file.h>
 
+/*
+ * Darwin libc does not provide pthread spinlocks. Provide a narrow fallback
+ * for local macOS builds used by automation/test workflows.
+ */
+#if defined(__APPLE__)
+typedef pthread_mutex_t pthread_spinlock_t;
+
+static inline int
+pthread_spin_init(pthread_spinlock_t *lock, int pshared)
+{
+	(void)pshared;
+	return pthread_mutex_init(lock, NULL);
+}
+
+static inline int
+pthread_spin_destroy(pthread_spinlock_t *lock)
+{
+	return pthread_mutex_destroy(lock);
+}
+
+static inline int
+pthread_spin_lock(pthread_spinlock_t *lock)
+{
+	return pthread_mutex_lock(lock);
+}
+
+static inline int
+pthread_spin_unlock(pthread_spinlock_t *lock)
+{
+	return pthread_mutex_unlock(lock);
+}
+#endif
+
 /* GNU extension */
 #include <getopt.h>
 

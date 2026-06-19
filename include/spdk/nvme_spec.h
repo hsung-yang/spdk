@@ -1,5 +1,6 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (C) 2015 Intel Corporation. All rights reserved.
+ *   Copyright (C) 2024 CPCS Implementation Team. All rights reserved.
  *   Copyright (c) 2024 Samsung Electronics Co., Ltd. All rights reserved.
  */
 
@@ -1087,6 +1088,38 @@ union spdk_nvme_feat_fdp_events_cdw12 {
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_fdp_events_cdw12) == 4, "Incorrect size");
 
+union spdk_nvme_cmd_cdw2 {
+	uint32_t raw;
+
+	struct {
+		/* Program Index */
+		uint32_t pind      : 16;
+		/* Memory Range Set ID */
+		uint32_t rsid      : 16;
+	} cpcs_execute_program;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw2) == 4, "Incorrect size");
+
+union spdk_nvme_cmd_cdw3 {
+	uint32_t raw;
+
+	struct {
+		/* Number of Memory Ranges */
+		uint32_t numr;
+	} cpcs_execute_program;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw3) == 4, "Incorrect size");
+
+union spdk_nvme_cmd_cdw4 {
+	uint32_t raw;
+
+	struct {
+		/* DPTR Data Length */
+		uint32_t dlen;
+	} cpcs_execute_program;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw4) == 4, "Incorrect size");
+
 union spdk_nvme_cmd_cdw10 {
 	uint32_t raw;
 	struct {
@@ -1212,6 +1245,34 @@ union spdk_nvme_cmd_cdw10 {
 		/* Management Operation Specific */
 		uint32_t mos       : 16;
 	} mgmt_send_recv;
+
+	struct {
+		/* Program Index */
+		uint32_t pind      : 16;
+		/* Program Type */
+		uint32_t ptype     : 8;
+		/* Select */
+		uint32_t sel       : 1;
+		/* Program Identifier Type */
+		uint32_t pit       : 3;
+		uint32_t reserved  : 4;
+	} cpcs_load_program;
+
+	struct {
+		/* Program Index */
+		uint32_t pind      : 16;
+		/* Select */
+		uint32_t sel       : 4;
+		uint32_t reserved  : 12;
+	} cpcs_program_activation;
+
+	struct {
+		/* Select */
+		uint32_t sel       : 4;
+		uint32_t reserved  : 12;
+		/* Memory Range Set ID */
+		uint32_t rsid      : 16;
+	} cpcs_mrs_management;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw10) == 4, "Incorrect size");
 
@@ -1267,6 +1328,17 @@ union spdk_nvme_cmd_cdw11 {
 		uint32_t eds      : 1;
 		uint32_t reserved : 31;
 	} resv_report;
+
+	struct {
+		/* Program Size */
+		uint32_t psize;
+	} cpcs_load_program;
+
+	struct {
+		/* Number of Memory Ranges */
+		uint32_t numr      : 8;
+		uint32_t reserved  : 24;
+	} cpcs_mrs_management;
 
 	union spdk_nvme_feat_arbitration feat_arbitration;
 	union spdk_nvme_feat_power_management feat_power_management;
@@ -1434,6 +1506,7 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_cmd) == 64, "Incorrect size");
 /**
  * SLM Memory Copy - Source Range Entry (Descriptor Format 4h)
  */
+#pragma pack(push, 1)
 struct spdk_nvme_slm_copy_desc_format_4 {
 	uint32_t	snsid;
 	uint32_t	reserved0;
@@ -1443,7 +1516,8 @@ struct spdk_nvme_slm_copy_desc_format_4 {
 	uint16_t	sopt;
 	uint32_t	reserved3;
 	uint32_t	reserved4;
-} __attribute__((packed));
+};
+#pragma pack(pop)
 
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_slm_copy_desc_format_4) == 32,
 		   "Incorrect size");
@@ -1454,6 +1528,7 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_slm_copy_desc_format_4) == 32,
  * SLM Memory Copy - Source Range Entry (Descriptor Format 2h/3h)
  * Source data is described using LBAs.
  */
+#pragma pack(push, 1)
 struct spdk_nvme_slm_copy_desc_format_2_3 {
 	uint32_t	snsid;
 	uint32_t	reserved0;
@@ -1464,7 +1539,8 @@ struct spdk_nvme_slm_copy_desc_format_2_3 {
 	uint32_t	eilbrt;
 	uint16_t	elbat;
 	uint16_t	elbatm;
-} __attribute__((packed));
+};
+#pragma pack(pop)
 
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_slm_copy_desc_format_2_3) == 32,
 		   "Incorrect size");
@@ -1703,6 +1779,28 @@ enum spdk_nvme_slm_command_specific_status_code {
 	SPDK_NVME_SLM_SC_NAMESPACE_NOT_REACHABLE		= 0x88,
 };
 
+/* CPCS command set specific status codes (SCT = Command Specific) */
+enum spdk_nvme_cpcs_status {
+	SPDK_NVME_CPCS_SC_INSUFFICIENT_PROGRAM_RESOURCES	= 0x8A,
+	SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE		= 0x8B,
+	SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET		= 0x8C,
+	SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET_ID		= 0x8D,
+	SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA			= 0x8E,
+	SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX		= 0x8F,
+	SPDK_NVME_CPCS_SC_INVALID_PROGRAM_TYPE			= 0x90,
+	SPDK_NVME_CPCS_SC_MAX_MEMORY_RANGES_EXCEEDED		= 0x91,
+	SPDK_NVME_CPCS_SC_MAX_MEMORY_RANGE_SETS_EXCEEDED	= 0x92,
+	SPDK_NVME_CPCS_SC_MAX_PROGRAMS_ACTIVATED		= 0x93,
+	SPDK_NVME_CPCS_SC_MAX_PROGRAM_BYTES_EXCEEDED		= 0x94,
+	SPDK_NVME_CPCS_SC_MEMORY_RANGE_SET_IN_USE		= 0x95,
+	SPDK_NVME_CPCS_SC_NO_PROGRAM				= 0x96,
+	SPDK_NVME_CPCS_SC_OVERLAPPING_MEMORY_RANGES		= 0x97,
+	SPDK_NVME_CPCS_SC_PROGRAM_NOT_ACTIVATED		= 0x98,
+	SPDK_NVME_CPCS_SC_PROGRAM_IN_USE			= 0x99,
+	SPDK_NVME_CPCS_SC_PROGRAM_INDEX_NOT_DOWNLOADABLE	= 0x9A,
+	SPDK_NVME_CPCS_SC_PROGRAM_TOO_BIG			= 0x9B,
+};
+
 /**
  * Media error status codes
  */
@@ -1775,8 +1873,12 @@ enum spdk_nvme_admin_opcode {
 	SPDK_NVME_OPC_SECURITY_RECEIVE			= 0x82,
 
 	SPDK_NVME_OPC_SANITIZE				= 0x84,
+	SPDK_NVME_OPC_CPCS_LOAD_PROGRAM			= 0x85,
 
 	SPDK_NVME_OPC_GET_LBA_STATUS			= 0x86,
+	/* 0x87 - reserved */
+	SPDK_NVME_OPC_CPCS_PROGRAM_ACTIVATION		= 0x88,
+	SPDK_NVME_OPC_CPCS_MRS_MANAGEMENT		= 0x89,
 	SPDK_NVME_OPC_VENDOR_SPECIFIC_START		= 0xC0,
 };
 
@@ -1827,6 +1929,13 @@ enum spdk_nvme_slm_opcode {
 	SPDK_NVME_SLM_OPC_MEMORY_READ			= 0x02,
 	SPDK_NVME_SLM_OPC_MEMORY_FILL			= 0x04,
 	SPDK_NVME_SLM_OPC_MEMORY_WRITE			= 0x05,
+};
+
+/**
+ * Computational Programs command set opcodes
+ */
+enum spdk_nvme_cpcs_opcode {
+	SPDK_NVME_OPC_CPCS_EXECUTE_PROGRAM		= 0x01,
 };
 
 /**
@@ -3516,7 +3625,16 @@ enum spdk_nvme_log_page {
 	/** Sanitize status (optional) */
 	SPDK_NVME_LOG_SANITIZE_STATUS = 0x81,
 
-	/* 0x82-0xBE - I/O command set specific */
+	/** CPCS program list (optional) */
+	SPDK_NVME_LOG_CPCS_PROGRAM_LIST		= 0x82,
+
+	/** CPCS downloadable program types (optional) */
+	SPDK_NVME_LOG_CPCS_DOWNLOADABLE_TYPES	= 0x83,
+
+	/** CPCS memory range set list (optional) */
+	SPDK_NVME_LOG_CPCS_MRS_LIST		= 0x84,
+
+	/* 0x85-0xBE - I/O command set specific */
 
 	/** Changed zone list (refer to Zoned Namespace command set) */
 	SPDK_NVME_LOG_CHANGED_ZONE_LIST = 0xBF,
@@ -4143,6 +4261,38 @@ enum spdk_nvme_csi {
 	SPDK_NVME_CSI_KV	= 0x1,
 	SPDK_NVME_CSI_ZNS	= 0x2,
 	SPDK_NVME_CSI_SLM	= 0x3,
+	SPDK_NVME_CSI_CPCS  = 0x4,
+};
+
+/* CPCS program types */
+#define SPDK_NVME_CPCS_PTYPE_DEVICE_DEFINED		0x00
+#define SPDK_NVME_CPCS_PTYPE_VENDOR_MIN			0xC0
+#define SPDK_NVME_CPCS_PTYPE_VENDOR_MAX			0xFF
+
+enum spdk_nvme_cpcs_peocc {
+	SPDK_NVME_CPCS_PEOCC_EMPTY			= 0x00,
+	SPDK_NVME_CPCS_PEOCC_DOWNLOADED		= 0x01,
+	SPDK_NVME_CPCS_PEOCC_DEVICE_DEFINED		= 0x02,
+};
+
+enum spdk_nvme_cpcs_pit {
+	SPDK_NVME_CPCS_PIT_NOT_USED			= 0x00,
+	SPDK_NVME_CPCS_PIT_PUID				= 0x01,
+};
+
+enum spdk_nvme_cpcs_mrs_op {
+	SPDK_NVME_CPCS_MRS_OP_CREATE			= 0x00,
+	SPDK_NVME_CPCS_MRS_OP_DELETE			= 0x01,
+};
+
+enum spdk_nvme_cpcs_activation_op {
+	SPDK_NVME_CPCS_ACT_OP_DEACTIVATE		= 0x00,
+	SPDK_NVME_CPCS_ACT_OP_ACTIVATE			= 0x01,
+};
+
+enum spdk_nvme_cpcs_load_op {
+	SPDK_NVME_CPCS_LOAD_OP_LOAD			= 0x00,
+	SPDK_NVME_CPCS_LOAD_OP_UNLOAD			= 0x01,
 };
 
 enum spdk_nvme_secure_erase_setting {
