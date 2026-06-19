@@ -280,11 +280,200 @@ def bdev_malloc_delete(client, name):
 
 
 @deprecated_method
+def bdev_slm_create(client, name, nsid, size_mb, granularity=4):
+    """Construct an SLM block device.
+    Args:
+        name: name of SLM bdev
+        nsid: namespace ID
+        size_mb: size in MiB
+        granularity: granularity in MiB (optional)
+    """
+    params = dict()
+    params['name'] = name
+    params['nsid'] = nsid
+    params['size_mb'] = size_mb
+    params['granularity'] = granularity
+    return client.call('bdev_slm_create', params)
+
+
+@deprecated_method
+def bdev_slm_delete(client, name):
+    """Delete SLM block device.
+    Args:
+        name: name of SLM bdev to delete
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_slm_delete', params)
+
+
+@deprecated_method
+def bdev_vslm_create(client, name, base_bdev_name, sram_size_mb, nsid=None,
+                     semantics_mode=None, writeback_policy=None,
+                     admission_enabled=None, admission_faults_per_sec_threshold=None,
+                     readahead_enabled=None, readahead_pages=None,
+                     fdp_mode_enabled=None, fdp_dspec=None):
+    """Construct a vSLM block device.
+    Args:
+        name: name of vSLM bdev
+        base_bdev_name: backing bdev name
+        sram_size_mb: SRAM cache size in MiB
+        nsid: namespace ID (optional)
+        semantics_mode: semantics mode ("lease") (optional)
+        writeback_policy: writeback policy ("on_evict") (optional)
+        admission_enabled: enable admission control (optional)
+        admission_faults_per_sec_threshold: faults/sec threshold when admission control is enabled (optional)
+        readahead_enabled: enable execute-view synchronous readahead (optional)
+        readahead_pages: execute-view readahead window in pages (optional)
+        fdp_mode_enabled: enable FDP placement tagging at create time (optional)
+        fdp_dspec: FDP directive specific value (optional)
+    """
+    params = dict()
+    params['name'] = name
+    params['base_bdev_name'] = base_bdev_name
+    params['sram_size_mb'] = sram_size_mb
+    if nsid is not None:
+        params['nsid'] = nsid
+    if semantics_mode is not None:
+        params['semantics_mode'] = semantics_mode
+    if writeback_policy is not None:
+        params['writeback_policy'] = writeback_policy
+    if admission_enabled is not None:
+        params['admission_enabled'] = admission_enabled
+    if admission_faults_per_sec_threshold is not None:
+        params['admission_faults_per_sec_threshold'] = admission_faults_per_sec_threshold
+    if readahead_enabled is not None:
+        params['readahead_enabled'] = readahead_enabled
+    if readahead_pages is not None:
+        params['readahead_pages'] = readahead_pages
+    if fdp_mode_enabled is not None:
+        params['fdp_mode_enabled'] = fdp_mode_enabled
+    if fdp_dspec is not None:
+        params['fdp_dspec'] = fdp_dspec
+    return client.call('bdev_vslm_create', params)
+
+
+@deprecated_method
+def bdev_vslm_delete(client, name):
+    """Delete vSLM block device.
+    Args:
+        name: name of vSLM bdev to delete
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_vslm_delete', params)
+
+
+@deprecated_method
+def bdev_vslm_lease_acquire(client, lease_id, nsid, offset, length):
+    """Acquire a vSLM lease.
+    Args:
+        lease_id: caller-provided lease ID
+        nsid: vSLM namespace ID
+        offset: byte offset
+        length: byte length
+    """
+    params = dict()
+    params['lease_id'] = lease_id
+    params['nsid'] = nsid
+    params['offset'] = offset
+    params['length'] = length
+    return client.call('bdev_vslm_lease_acquire', params)
+
+
+@deprecated_method
+def bdev_vslm_lease_release(client, lease_id):
+    """Release a vSLM lease by lease_id.
+    Args:
+        lease_id: caller-provided lease ID
+    """
+    params = dict()
+    params['lease_id'] = lease_id
+    return client.call('bdev_vslm_lease_release', params)
+
+
+@deprecated_method
+def bdev_vslm_set_fdp_mode(client, name, enabled, dspec=None):
+    """Set vSLM FDP placement mode.
+    Args:
+        name: name of vSLM bdev
+        enabled: true to enable FDP tagging, false to disable
+        dspec: FDP directive specific value (optional)
+    """
+    params = dict()
+    params['name'] = name
+    params['enabled'] = enabled
+    if dspec is not None:
+        params['dspec'] = dspec
+    return client.call('bdev_vslm_set_fdp_mode', params)
+
+
+@deprecated_method
+def bdev_vslm_set_policy(client, name, semantics_mode, writeback_policy,
+                         admission_enabled, admission_faults_per_sec_threshold=None,
+                         readahead_enabled=None, readahead_pages=None):
+    """Set vSLM runtime policy.
+    Args:
+        name: name of vSLM bdev
+        semantics_mode: semantics mode ("lease")
+        writeback_policy: writeback policy ("on_evict")
+        admission_enabled: enable admission control
+        admission_faults_per_sec_threshold: faults/sec threshold when admission control is enabled (optional)
+        readahead_enabled: enable execute-view synchronous readahead (optional)
+        readahead_pages: execute-view readahead window in pages (optional)
+    """
+    params = dict()
+    params['name'] = name
+    params['semantics_mode'] = semantics_mode
+    params['writeback_policy'] = writeback_policy
+    params['admission_enabled'] = admission_enabled
+    if admission_faults_per_sec_threshold is not None:
+        params['admission_faults_per_sec_threshold'] = admission_faults_per_sec_threshold
+    if readahead_enabled is not None:
+        params['readahead_enabled'] = readahead_enabled
+    if readahead_pages is not None:
+        params['readahead_pages'] = readahead_pages
+    return client.call('bdev_vslm_set_policy', params)
+
+
+@deprecated_method
+def bdev_vslm_get_policy(client, name):
+    """Get vSLM runtime policy.
+    Args:
+        name: name of vSLM bdev
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_vslm_get_policy', params)
+
+
+@deprecated_method
+def bdev_vslm_get_stats(client, name):
+    """Get vSLM statistics.
+    Args:
+        name: name of vSLM bdev
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_vslm_get_stats', params)
+
+
+@deprecated_method
+def bdev_vslm_reset_stats(client, name):
+    """Reset vSLM statistics.
+    Args:
+        name: name of vSLM bdev
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_vslm_reset_stats', params)
+
+
+@deprecated_method
 def bdev_null_create(client, num_blocks, block_size, name, physical_block_size=None, uuid=None, md_size=None,
                      dif_type=None, dif_is_head_of_md=None, dif_pi_format=None,
                      preferred_write_alignment=None, preferred_write_granularity=None, optimal_write_size=None,
                      preferred_unmap_alignment=None, preferred_unmap_granularity=None):
-
     """Construct a null block device.
     Args:
         num_blocks: size of block device in blocks
