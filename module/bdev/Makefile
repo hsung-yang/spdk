@@ -6,7 +6,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += delay error gpt lvol malloc null nvme passthru raid split vslm zone_block
+DIRS-y += delay error gpt lvol malloc null nvme passthru raid slm split vslm zone_block
 
 DIRS-$(CONFIG_XNVME) += xnvme
 
