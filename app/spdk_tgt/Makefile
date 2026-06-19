@@ -10,6 +10,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 APP = spdk_tgt
 
 C_SRCS := spdk_tgt.c
+CFLAGS += -I$(SPDK_ROOT_DIR)/lib
 
 SPDK_LIB_LIST = $(ALL_MODULES_LIST)
 
