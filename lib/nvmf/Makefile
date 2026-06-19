@@ -9,10 +9,17 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 SO_VER := 21
 SO_MINOR := 0
 
+CFLAGS += -I$(SPDK_ROOT_DIR)/lib/nvmf
+
 C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
 	 subsystem.c nvmf.c nvmf_rpc.c transport.c tcp.c \
 	 stubs.c mdns_server.c \
-	slm/slm_cmd.c
+	slm/slm_cmd.c \
+	cpcs/admin_cmd.c cpcs/cpcs_cmd.c cpcs/cpcs_rpc.c cpcs/ebpf_runtime.c \
+	cpcs/execute.c cpcs/memory_range_set.c cpcs/nvmf_cpcs.c \
+	cpcs/program.c cpcs/program_activation.c cpcs/reachability.c \
+	cpcs/builtin_programs.c cpcs/builtin_runtime.c \
+	cpcs/runtime_stub.c
 
 C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
