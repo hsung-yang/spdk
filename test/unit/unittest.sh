@@ -30,6 +30,7 @@ function unittest_bdev() {
 	$valgrind $testdir/lib/bdev/scsi_nvme.c/scsi_nvme_ut
 	$valgrind $testdir/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut
 	$valgrind $testdir/lib/bdev/vbdev_zone_block.c/vbdev_zone_block_ut
+	$valgrind $testdir/lib/bdev/vslm/vslm_ut
 	$valgrind $testdir/lib/bdev/mt/bdev.c/bdev_ut
 }
 
