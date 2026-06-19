@@ -400,6 +400,35 @@ def add_parser(subparsers):
     p.add_argument('--name', help='vSLM bdev name', required=True)
     p.set_defaults(func=bdev_vslm_reset_stats)
 
+    def bdev_vslm_set_debug(args):
+        print_json(args.client.bdev_vslm_set_debug(
+            name=args.name,
+            num_shards=args.num_shards,
+            async_exec=args.async_exec,
+            fault_batch=args.fault_batch,
+            prefetch_batch=args.prefetch_batch,
+            background_cleaner=args.background_cleaner,
+            streaming_mode=args.streaming_mode))
+
+    p = subparsers.add_parser('bdev_vslm_set_debug',
+                              help='Apply vSLM debug/benchmark overrides (ablation only)')
+    p.add_argument('--name', help='vSLM bdev name', required=True)
+    p.add_argument('--num-shards', dest='num_shards', type=int,
+                   help='Override partitioned-MMU shard count (idle MMU only)')
+    for _knob, _help in (('async-exec', 'asynchronous execute path'),
+                         ('fault-batch', 'batched fault-in'),
+                         ('prefetch-batch', 'async prefetch batches'),
+                         ('background-cleaner', 'background cleaner'),
+                         ('streaming-mode', 'streaming mode')):
+        _dest = _knob.replace('-', '_')
+        _g = p.add_mutually_exclusive_group()
+        _g.add_argument('--%s-enabled' % _knob, dest=_dest, action='store_true',
+                        help='Enable %s' % _help)
+        _g.add_argument('--%s-disabled' % _knob, dest=_dest, action='store_false',
+                        help='Disable %s' % _help)
+        p.set_defaults(**{_dest: None})
+    p.set_defaults(func=bdev_vslm_set_debug)
+
     def bdev_null_create(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
         if args.dif_type and not args.md_size:

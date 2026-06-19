@@ -408,6 +408,75 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_vslm_get_policy", rpc_bdev_vslm_get_policy, SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_vslm_set_debug {
+	char *name;
+	struct spdk_bdev_vslm_debug dbg;
+};
+
+static void
+free_rpc_bdev_vslm_set_debug(struct rpc_bdev_vslm_set_debug *req)
+{
+	free(req->name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_vslm_set_debug_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_vslm_set_debug, name), spdk_json_decode_string},
+	{
+		"num_shards", offsetof(struct rpc_bdev_vslm_set_debug, dbg.num_shards),
+		spdk_json_decode_uint32, true
+	},
+	{
+		"async_exec", offsetof(struct rpc_bdev_vslm_set_debug, dbg.async_exec),
+		spdk_json_decode_int32, true
+	},
+	{
+		"fault_batch", offsetof(struct rpc_bdev_vslm_set_debug, dbg.fault_batch),
+		spdk_json_decode_int32, true
+	},
+	{
+		"prefetch_batch", offsetof(struct rpc_bdev_vslm_set_debug, dbg.prefetch_batch),
+		spdk_json_decode_int32, true
+	},
+	{
+		"background_cleaner", offsetof(struct rpc_bdev_vslm_set_debug, dbg.background_cleaner),
+		spdk_json_decode_int32, true
+	},
+	{
+		"streaming_mode", offsetof(struct rpc_bdev_vslm_set_debug, dbg.streaming_mode),
+		spdk_json_decode_int32, true
+	},
+};
+
+static void
+rpc_bdev_vslm_set_debug(struct spdk_jsonrpc_request *request,
+			const struct spdk_json_val *params)
+{
+	struct rpc_bdev_vslm_set_debug req = {0};
+	int rc;
+
+	bdev_vslm_debug_init(&req.dbg);
+	if (spdk_json_decode_object(params, rpc_bdev_vslm_set_debug_decoders,
+				    SPDK_COUNTOF(rpc_bdev_vslm_set_debug_decoders),
+				    &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	rc = bdev_vslm_set_debug(req.name, &req.dbg);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_vslm_set_debug(&req);
+}
+SPDK_RPC_REGISTER("bdev_vslm_set_debug", rpc_bdev_vslm_set_debug, SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_vslm_set_fdp_mode {
 	char *name;
 	bool enabled;

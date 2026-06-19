@@ -12741,6 +12741,15 @@ Reset vSLM runtime statistics.
 
 This method is experimental.
 
+### bdev_vslm_set_debug
+
+Apply vSLM debug/benchmark overrides for mechanism-ablation studies: the
+partitioned-MMU shard count and the asynchronous execute / batching knobs that
+have no production RPC. Intended for an idle bdev (right after create); a
+shard-count change requires an empty MMU.
+
+This method is experimental.
+
 ### bdev_slm_create
 
 Create a Subsystem Local Memory (SLM) bdev.

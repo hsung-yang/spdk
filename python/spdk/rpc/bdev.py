@@ -436,6 +436,35 @@ def bdev_vslm_set_policy(client, name, semantics_mode, writeback_policy,
     return client.call('bdev_vslm_set_policy', params)
 
 
+def bdev_vslm_set_debug(client, name, num_shards=None, async_exec=None,
+                        fault_batch=None, prefetch_batch=None,
+                        background_cleaner=None, streaming_mode=None):
+    """Apply vSLM debug/benchmark overrides (mechanism-ablation studies only).
+
+    Reaches internal knobs with no production RPC. Call on an IDLE bdev (right
+    after create); changing num_shards requires an empty MMU.
+    Args:
+        name: name of vSLM bdev
+        num_shards: override partitioned-MMU shard count (None = unchanged)
+        async_exec: enable/disable asynchronous execute path (bool, None = unchanged)
+        fault_batch: enable/disable batched fault-in (bool, None = unchanged)
+        prefetch_batch: enable/disable async prefetch batches (bool, None = unchanged)
+        background_cleaner: enable/disable background cleaner (bool, None = unchanged)
+        streaming_mode: enable/disable streaming mode (bool, None = unchanged)
+    """
+    params = dict()
+    params['name'] = name
+    if num_shards is not None:
+        params['num_shards'] = num_shards
+    for key, val in (('async_exec', async_exec), ('fault_batch', fault_batch),
+                     ('prefetch_batch', prefetch_batch),
+                     ('background_cleaner', background_cleaner),
+                     ('streaming_mode', streaming_mode)):
+        if val is not None:
+            params[key] = 1 if val else 0
+    return client.call('bdev_vslm_set_debug', params)
+
+
 @deprecated_method
 def bdev_vslm_get_policy(client, name):
     """Get vSLM runtime policy.

@@ -374,6 +374,58 @@ test_vslm_hash_lookup(void)
 }
 
 static void
+test_vslm_reshard_idle(void)
+{
+	struct vbdev_vslm vslm = {};
+	struct vslm_page *p;
+	uint64_t i, counted;
+	int rc;
+
+	/* 4096 frames -> a multi-shard MMU under the adaptive policy. */
+	vslm.sram_size_bytes = (uint64_t)VSLM_PAGE_SIZE * 4096;
+	CU_ASSERT(pthread_mutex_init(&vslm.policy_lock, NULL) == 0);
+	rc = vslm_init_mmu(&vslm);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(vslm.num_sram_pages == 4096);
+
+	/* Collapse to a single shard; all frames land on shard 0's free list. */
+	rc = vslm_reshard_idle(&vslm, 1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(vslm.num_shards == 1);
+	counted = 0;
+	TAILQ_FOREACH(p, &vslm.shards[0].free_list, lru_link) {
+		counted++;
+	}
+	CU_ASSERT(counted == 4096);
+
+	/* Re-shard to 8; every frame appears on exactly one shard's free list. */
+	rc = vslm_reshard_idle(&vslm, 8);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(vslm.num_shards == 8);
+	counted = 0;
+	for (i = 0; i < vslm.num_shards; i++) {
+		TAILQ_FOREACH(p, &vslm.shards[i].free_list, lru_link) {
+			counted++;
+		}
+	}
+	CU_ASSERT(counted == 4096);
+
+	/* A request above the cap clamps to VSLM_MMU_MAX_SHARDS. */
+	rc = vslm_reshard_idle(&vslm, 10000);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(vslm.num_shards == VSLM_MMU_MAX_SHARDS);
+
+	/* A non-idle MMU refuses to re-shard and keeps its shard count. */
+	vslm.page_array[0].load_state = VSLM_PAGE_LOAD_RESIDENT;
+	rc = vslm_reshard_idle(&vslm, 2);
+	CU_ASSERT(rc == -EBUSY);
+	CU_ASSERT(vslm.num_shards == VSLM_MMU_MAX_SHARDS);
+	vslm.page_array[0].load_state = VSLM_PAGE_LOAD_FREE;
+
+	cleanup_vslm(&vslm);
+}
+
+static void
 test_vslm_copy_range_read_miss(void)
 {
 	struct vbdev_vslm vslm = {};
@@ -1744,6 +1796,7 @@ main(int argc, char **argv)
 	CU_initialize_registry();
 	suite = CU_add_suite("vslm", NULL, NULL);
 	CU_ADD_TEST(suite, test_vslm_hash_lookup);
+	CU_ADD_TEST(suite, test_vslm_reshard_idle);
 	CU_ADD_TEST(suite, test_vslm_copy_range_read_miss);
 	CU_ADD_TEST(suite, test_vslm_copy_range_write_evict);
 	CU_ADD_TEST(suite, test_vslm_readahead_exec_read_prefetches_next);

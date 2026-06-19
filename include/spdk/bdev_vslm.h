@@ -324,6 +324,40 @@ int bdev_vslm_set_policy(const char *name, const struct spdk_bdev_vslm_policy *p
  */
 int bdev_vslm_get_policy(const char *name, struct spdk_bdev_vslm_policy *policy);
 
+/**
+ * Debug/benchmark overrides for ablation studies (paper Sec. 5 mechanism
+ * ablation). These reach internal knobs that have no production-facing RPC:
+ * the partitioned-MMU shard count (normally adapted from the SRAM size) and
+ * the asynchronous execution / batching paths. Intended to be called on an
+ * IDLE bdev (immediately after create, before any I/O); changing the shard
+ * count requires the MMU to be empty and returns -EBUSY otherwise.
+ *
+ * Tri-state integer fields: -1 leaves the knob unchanged, 0 disables, 1
+ * enables. num_shards == 0 leaves the shard count unchanged.
+ */
+struct spdk_bdev_vslm_debug {
+	uint32_t num_shards;		/* 0 = unchanged; else re-shard idle MMU (clamped) */
+	int async_exec;			/* -1 unchanged / 0 off / 1 on */
+	int fault_batch;
+	int prefetch_batch;
+	int background_cleaner;
+	int streaming_mode;
+};
+
+/** Initialize a debug-override struct to "change nothing". */
+void bdev_vslm_debug_init(struct spdk_bdev_vslm_debug *dbg);
+
+/**
+ * Apply debug/benchmark overrides to a vSLM bdev (see struct
+ * spdk_bdev_vslm_debug). For ablation experiments only.
+ *
+ * \param name vSLM bdev name.
+ * \param dbg Overrides to apply.
+ * \return 0 on success, negative errno on failure (-EBUSY if a shard-count
+ *         change is requested while the MMU is not idle).
+ */
+int bdev_vslm_set_debug(const char *name, const struct spdk_bdev_vslm_debug *dbg);
+
 #ifdef __cplusplus
 }
 #endif

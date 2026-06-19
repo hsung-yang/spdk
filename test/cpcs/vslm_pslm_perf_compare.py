@@ -813,6 +813,36 @@ def cleanup_common(args: argparse.Namespace, rpc: RpcClient) -> None:
         rpc.quiet("bdev_nvme_detach_controller", args.controller_name)
 
 
+def _apply_vslm_debug(rpc: RpcClient, bdev_name: str) -> None:
+    """Apply optional vSLM debug/ablation overrides from the environment, right
+    after create while the MMU is idle (used by the E-E5 mechanism ablation).
+
+    Env knobs (unset = leave unchanged): VSLM_DEBUG_NUM_SHARDS (int),
+    VSLM_DEBUG_ASYNC, VSLM_DEBUG_FAULT_BATCH, VSLM_DEBUG_PREFETCH_BATCH,
+    VSLM_DEBUG_BACKGROUND_CLEANER, VSLM_DEBUG_STREAMING (enable=1 / disable=0).
+    """
+    import os
+
+    cmd = ["bdev_vslm_set_debug", "--name", bdev_name]
+    num_shards = os.environ.get("VSLM_DEBUG_NUM_SHARDS")
+    if num_shards:
+        cmd += ["--num-shards", str(int(num_shards))]
+    for env_key, knob in (
+        ("VSLM_DEBUG_ASYNC", "async-exec"),
+        ("VSLM_DEBUG_FAULT_BATCH", "fault-batch"),
+        ("VSLM_DEBUG_PREFETCH_BATCH", "prefetch-batch"),
+        ("VSLM_DEBUG_BACKGROUND_CLEANER", "background-cleaner"),
+        ("VSLM_DEBUG_STREAMING", "streaming-mode"),
+    ):
+        val = os.environ.get(env_key)
+        if not val:
+            continue
+        off = val.lower() in ("0", "false", "off", "no")
+        cmd.append("--%s-disabled" % knob if off else "--%s-enabled" % knob)
+    if len(cmd) > 3:
+        rpc.call(*cmd)
+
+
 def create_vslm_bench_bdev(args: argparse.Namespace, rpc: RpcClient, bdev_name: str) -> None:
     cmd = [
         "bdev_vslm_create",
@@ -830,6 +860,7 @@ def create_vslm_bench_bdev(args: argparse.Namespace, rpc: RpcClient, bdev_name: 
         cmd.append("--readahead-disabled")
 
     rpc.call(*cmd)
+    _apply_vslm_debug(rpc, bdev_name)
     add_ns(args, rpc, args.nqn, bdev_name, args.slm_nsid)
 
 

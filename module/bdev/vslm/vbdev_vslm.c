@@ -1780,46 +1780,40 @@ vslm_dma_ring_release(struct vbdev_vslm *vslm, int idx)
 	pthread_mutex_unlock(&vslm->dma_ring_lock);
 }
 
+/*
+ * Build (or rebuild) the partitioned MMU shards over the already-allocated
+ * page_array, partitioning num_sram_pages frames across num_shards. Expects
+ * vslm->shards == NULL on entry (callers free it first). On failure the shards
+ * are torn down (page_array/sram are owned by the caller). Factored out of
+ * vslm_init_mmu so the debug/benchmark path can re-shard an idle MMU.
+ */
 static int
-vslm_init_mmu(struct vbdev_vslm *vslm)
+vslm_build_shards(struct vbdev_vslm *vslm, uint32_t num_shards)
 {
 	uint64_t i;
 	uint32_t s;
 	uint64_t assigned;
 	struct vslm_page *page;
 
-	vslm->num_sram_pages = vslm->sram_size_bytes / VSLM_PAGE_SIZE;
-
-	vslm->sram_buffer = spdk_dma_malloc(vslm->sram_size_bytes, VSLM_PAGE_SIZE, NULL);
-	if (!vslm->sram_buffer) {
-		return -1;
+	if (num_shards < 1) {
+		num_shards = 1;
 	}
 
-	vslm->page_array = calloc(vslm->num_sram_pages, sizeof(*vslm->page_array));
-	if (!vslm->page_array) {
-		spdk_dma_free(vslm->sram_buffer);
-		vslm->sram_buffer = NULL;
-		return -1;
-	}
-
-	vslm->num_shards = vslm_compute_num_shards(vslm->num_sram_pages);
-	vslm->shards = calloc(vslm->num_shards, sizeof(*vslm->shards));
+	vslm->num_shards = num_shards;
+	vslm->shards = calloc(num_shards, sizeof(*vslm->shards));
 	if (!vslm->shards) {
-		free(vslm->page_array);
-		vslm->page_array = NULL;
-		spdk_dma_free(vslm->sram_buffer);
-		vslm->sram_buffer = NULL;
+		vslm->num_shards = 0;
 		return -1;
 	}
 
 	/* Partition frames into disjoint per-shard slices and per-shard hash tables. */
 	assigned = 0;
-	for (s = 0; s < vslm->num_shards; s++) {
+	for (s = 0; s < num_shards; s++) {
 		struct vslm_mmu_shard *shard = &vslm->shards[s];
-		uint64_t frames = vslm->num_sram_pages / vslm->num_shards;
+		uint64_t frames = vslm->num_sram_pages / num_shards;
 
 		/* Hand any remainder frames to the final shard. */
-		if (s == vslm->num_shards - 1) {
+		if (s == num_shards - 1) {
 			frames = vslm->num_sram_pages - assigned;
 		}
 
@@ -1831,10 +1825,6 @@ vslm_init_mmu(struct vbdev_vslm *vslm)
 		if (pthread_mutex_init(&shard->lock, NULL) != 0) {
 			vslm->num_shards = s; /* only [0, s) are initialized */
 			vslm_free_shards(vslm);
-			free(vslm->page_array);
-			vslm->page_array = NULL;
-			spdk_dma_free(vslm->sram_buffer);
-			vslm->sram_buffer = NULL;
 			return -1;
 		}
 
@@ -1844,10 +1834,6 @@ vslm_init_mmu(struct vbdev_vslm *vslm)
 		if (shard->hash_table == NULL || shard->lpage_hash_table == NULL) {
 			vslm->num_shards = s + 1; /* free [0, s] */
 			vslm_free_shards(vslm);
-			free(vslm->page_array);
-			vslm->page_array = NULL;
-			spdk_dma_free(vslm->sram_buffer);
-			vslm->sram_buffer = NULL;
 			return -1;
 		}
 
@@ -1881,6 +1867,34 @@ vslm_init_mmu(struct vbdev_vslm *vslm)
 			}
 		}
 		TAILQ_INSERT_TAIL(&vslm->shards[page->shard_id].free_list, page, lru_link);
+	}
+
+	return 0;
+}
+
+static int
+vslm_init_mmu(struct vbdev_vslm *vslm)
+{
+	vslm->num_sram_pages = vslm->sram_size_bytes / VSLM_PAGE_SIZE;
+
+	vslm->sram_buffer = spdk_dma_malloc(vslm->sram_size_bytes, VSLM_PAGE_SIZE, NULL);
+	if (!vslm->sram_buffer) {
+		return -1;
+	}
+
+	vslm->page_array = calloc(vslm->num_sram_pages, sizeof(*vslm->page_array));
+	if (!vslm->page_array) {
+		spdk_dma_free(vslm->sram_buffer);
+		vslm->sram_buffer = NULL;
+		return -1;
+	}
+
+	if (vslm_build_shards(vslm, vslm_compute_num_shards(vslm->num_sram_pages)) != 0) {
+		free(vslm->page_array);
+		vslm->page_array = NULL;
+		spdk_dma_free(vslm->sram_buffer);
+		vslm->sram_buffer = NULL;
+		return -1;
 	}
 
 	vslm_init_dma_ring_pool(vslm);
@@ -7551,6 +7565,130 @@ bdev_vslm_set_policy(const char *name, const struct spdk_bdev_vslm_policy *polic
 		}
 
 		return vslm_apply_policy(vslm, policy);
+	}
+
+	return -ENOENT;
+}
+
+/*
+ * Re-shard an IDLE MMU to num_shards. Debug/benchmark only: the page_array and
+ * SRAM buffer are kept; only the shard partitioning is rebuilt. Requires every
+ * frame to be FREE (no resident/private/pinned pages). Caller holds policy_lock
+ * and must have verified no active leases.
+ */
+static int
+vslm_reshard_idle(struct vbdev_vslm *vslm, uint32_t num_shards)
+{
+	uint64_t i;
+	int rc;
+
+	if (num_shards > VSLM_MMU_MAX_SHARDS) {
+		num_shards = VSLM_MMU_MAX_SHARDS;
+	}
+	if (num_shards < 1) {
+		num_shards = 1;
+	}
+	if (num_shards == vslm->num_shards) {
+		return 0;
+	}
+
+	for (i = 0; i < vslm->num_sram_pages; i++) {
+		struct vslm_page *page = &vslm->page_array[i];
+
+		if (page->load_state != VSLM_PAGE_LOAD_FREE ||
+		    page->location != VSLM_PAGE_LOC_FREE ||
+		    page->on_hash || page->pin_count != 0) {
+			return -EBUSY;
+		}
+	}
+
+	vslm_free_shards(vslm);
+	rc = vslm_build_shards(vslm, num_shards);
+	if (rc != 0) {
+		SPDK_ERRLOG("vslm: re-shard to %u failed; bdev left without shards\n",
+			    num_shards);
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+static int
+vslm_apply_debug(struct vbdev_vslm *vslm, const struct spdk_bdev_vslm_debug *dbg)
+{
+	int rc = 0;
+
+	pthread_mutex_lock(&vslm->policy_lock);
+
+	if (dbg->num_shards != 0 && dbg->num_shards != vslm->num_shards) {
+		bool leases_empty;
+
+		pthread_mutex_lock(&vslm->lease_lock);
+		leases_empty = TAILQ_EMPTY(&vslm->leases);
+		pthread_mutex_unlock(&vslm->lease_lock);
+		if (!leases_empty) {
+			rc = -EBUSY;
+			goto out;
+		}
+		rc = vslm_reshard_idle(vslm, dbg->num_shards);
+		if (rc != 0) {
+			goto out;
+		}
+	}
+
+	if (dbg->async_exec >= 0) {
+		vslm->async_exec_enabled = (dbg->async_exec != 0);
+	}
+	if (dbg->fault_batch >= 0) {
+		vslm->fault_batch_enabled = (dbg->fault_batch != 0);
+	}
+	if (dbg->prefetch_batch >= 0) {
+		vslm->prefetch_batch_enabled = (dbg->prefetch_batch != 0);
+	}
+	if (dbg->background_cleaner >= 0) {
+		vslm->background_cleaner_enabled = (dbg->background_cleaner != 0);
+	}
+	if (dbg->streaming_mode >= 0) {
+		vslm->streaming_mode_enabled = (dbg->streaming_mode != 0);
+	}
+
+	SPDK_NOTICELOG("vslm[%s] debug: num_shards=%u async=%d fault_batch=%d "
+		       "prefetch_batch=%d cleaner=%d streaming=%d\n",
+		       vslm->vbdev.name, vslm->num_shards, vslm->async_exec_enabled,
+		       vslm->fault_batch_enabled, vslm->prefetch_batch_enabled,
+		       vslm->background_cleaner_enabled, vslm->streaming_mode_enabled);
+out:
+	pthread_mutex_unlock(&vslm->policy_lock);
+	return rc;
+}
+
+void
+bdev_vslm_debug_init(struct spdk_bdev_vslm_debug *dbg)
+{
+	if (dbg == NULL) {
+		return;
+	}
+	dbg->num_shards = 0;
+	dbg->async_exec = -1;
+	dbg->fault_batch = -1;
+	dbg->prefetch_batch = -1;
+	dbg->background_cleaner = -1;
+	dbg->streaming_mode = -1;
+}
+
+int
+bdev_vslm_set_debug(const char *name, const struct spdk_bdev_vslm_debug *dbg)
+{
+	struct vbdev_vslm *vslm;
+
+	if (name == NULL || dbg == NULL) {
+		return -EINVAL;
+	}
+
+	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
+		if (strcmp(vslm->vbdev.name, name) != 0) {
+			continue;
+		}
+		return vslm_apply_debug(vslm, dbg);
 	}
 
 	return -ENOENT;
