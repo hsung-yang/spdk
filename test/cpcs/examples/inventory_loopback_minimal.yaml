@@ -1,0 +1,27 @@
+#  SPDX-License-Identifier: BSD-3-Clause
+#  Copyright (C) 2024 CPCS Implementation Team. All rights reserved.
+hosts:
+  local:
+    mode: local
+    repo_path: /home/user/spdk
+
+roles:
+  initiator: local
+  target: local
+
+runtime:
+  # Optional: forwarded as --core-mask (or --target-core-mask for vector-eval).
+  # target_core_mask: "0xF"
+  # Optional: subset of target_core_mask reserved for CPCS builtin compute work.
+  # target_compute_core_mask: "0xC"
+  # Optional: forwarded as --passthru-lcores to scenario runners.
+  # initiator_passthru_lcores: "1,2,3,4"
+  # Optional: forwarded as --prefill-workers for vector-eval prefill.
+  # vector_prefill_workers: 4
+
+nvmeof:
+  trtype: TCP
+  traddr: 127.0.0.1
+  trsvcid: "4420"
+  nqn: nqn.2026-03.io.spdk:cpcs-exp
+  hostnqn: nqn.2026-03.io.spdk:cpcs-exp-host

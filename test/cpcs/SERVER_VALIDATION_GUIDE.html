@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CPCS Server Validation Guide</title>
+  <style>
+    :root {
+      --bg: #f7f9fc;
+      --card: #ffffff;
+      --ink: #111827;
+      --muted: #4b5563;
+      --line: #d1d5db;
+      --accent: #0f766e;
+      --accent-soft: #ccfbf1;
+      --code-bg: #0b1020;
+      --code-ink: #e5e7eb;
+      --warn-bg: #fff7ed;
+      --warn-line: #fdba74;
+      --ok-bg: #ecfdf5;
+      --ok-line: #6ee7b7;
+      --shadow: 0 10px 30px rgba(2, 6, 23, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at 10% 10%, #e0f2fe 0%, var(--bg) 45%) fixed;
+      line-height: 1.5;
+    }
+
+    .shell {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px 20px 80px;
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      gap: 20px;
+    }
+
+    @media (max-width: 1024px) {
+      .shell { grid-template-columns: 1fr; }
+      .toc { position: static; }
+    }
+
+    .toc {
+      position: sticky;
+      top: 16px;
+      align-self: start;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+    }
+
+    .toc h2 {
+      margin: 0 0 10px;
+      font-size: 0.95rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .toc ol {
+      margin: 0;
+      padding-left: 18px;
+      display: grid;
+      gap: 8px;
+      font-size: 0.95rem;
+    }
+
+    .toc a {
+      text-decoration: none;
+      color: #1f2937;
+    }
+
+    .toc a:hover { color: var(--accent); }
+
+    .main {
+      display: grid;
+      gap: 16px;
+    }
+
+    .hero {
+      background: linear-gradient(135deg, #0f766e 0%, #164e63 100%);
+      color: #f8fafc;
+      border-radius: 16px;
+      padding: 22px;
+      box-shadow: var(--shadow);
+    }
+
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: 1.8rem;
+      line-height: 1.2;
+    }
+
+    .hero p {
+      margin: 0;
+      color: #dbeafe;
+      max-width: 980px;
+    }
+
+    .tags {
+      margin-top: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .tag {
+      font-size: 0.82rem;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.14);
+      border: 1px solid rgba(255, 255, 255, 0.24);
+    }
+
+    .step {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .step h2 {
+      margin: 0 0 8px;
+      font-size: 1.2rem;
+      line-height: 1.3;
+    }
+
+    .step h3 {
+      margin: 16px 0 8px;
+      font-size: 1rem;
+    }
+
+    .step p { margin: 8px 0; color: var(--muted); }
+
+    ul {
+      margin: 8px 0;
+      padding-left: 20px;
+    }
+
+    code {
+      font-family: "JetBrains Mono", Consolas, Menlo, monospace;
+      font-size: 0.92em;
+      background: #eef2ff;
+      border-radius: 4px;
+      padding: 0 4px;
+      color: #312e81;
+    }
+
+    pre {
+      margin: 10px 0;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border: 1px solid #263048;
+      border-radius: 10px;
+      padding: 14px;
+      overflow: auto;
+      position: relative;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+    }
+
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+      font-size: 0.87rem;
+      white-space: pre;
+      display: block;
+    }
+
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      border: 1px solid #475569;
+      background: #111827;
+      color: #e5e7eb;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }
+
+    .copy-btn:hover { background: #1f2937; }
+
+    .callout {
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--warn-line);
+      background: var(--warn-bg);
+      color: #9a3412;
+      font-size: 0.95rem;
+    }
+
+    .ok {
+      border-color: var(--ok-line);
+      background: var(--ok-bg);
+      color: #065f46;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.94rem;
+      overflow: hidden;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f1f5f9;
+      color: #334155;
+      font-weight: 600;
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    .footer {
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+      padding-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="toc">
+      <h2>Run Order</h2>
+      <ol>
+        <li><a href="#step0">Choose Topology</a></li>
+        <li><a href="#step1">Install Prerequisites</a></li>
+        <li><a href="#step2">Set Inventory</a></li>
+        <li><a href="#step3">Preflight Variables</a></li>
+        <li><a href="#step4">Prepare Hosts</a></li>
+        <li><a href="#step5">Run Required Suite</a></li>
+        <li><a href="#step6">Run Optional Depth</a></li>
+        <li><a href="#step7">Validate Results</a></li>
+        <li><a href="#step8">Failure Triage</a></li>
+      </ol>
+    </aside>
+
+    <main class="main">
+      <section class="hero">
+        <h1>CPCS Server Validation Guide</h1>
+        <p>Step-by-step server runbook for the unified CPCS orchestrator. Use this to execute claim-coverage validation on loopback or split initiator/target deployments.</p>
+        <div class="tags">
+          <span class="tag">Entrypoint: <code>spdk/test/cpcs/cpcs_experiments.py</code></span>
+          <span class="tag">Mode: Loopback / Split</span>
+          <span class="tag">Required target: <code>under_supported_claims=[]</code></span>
+        </div>
+      </section>
+
+      <section class="step" id="step0">
+        <h2>Step 0. Choose Topology</h2>
+        <p>Use one of the two supported deployment models:</p>
+        <ul>
+          <li>Loopback: initiator and target are the same host.</li>
+          <li>Split: initiator is local orchestrator, target is remote via SSH.</li>
+        </ul>
+        <div class="callout">Hard contract: <code>roles.initiator</code> must be <code>mode: local</code>.</div>
+      </section>
+
+      <section class="step" id="step1">
+        <h2>Step 1. Install Prerequisites</h2>
+        <ul>
+          <li><code>python3</code>, <code>python3-yaml</code></li>
+          <li>Build tools (<code>make</code>, compiler)</li>
+          <li>Passwordless sudo strongly recommended</li>
+          <li>Same SPDK repo path available on all hosts in your inventory</li>
+        </ul>
+        <pre><code>sudo apt-get install -y python3-yaml</code></pre>
+      </section>
+
+      <section class="step" id="step2">
+        <h2>Step 2. Set Inventory</h2>
+        <p>Start from examples:</p>
+        <ul>
+          <li>Split: <code>spdk/test/cpcs/examples/inventory_split.yaml</code></li>
+          <li>Loopback: <code>spdk/test/cpcs/examples/inventory_loopback.yaml</code></li>
+        </ul>
+
+        <h3>Required fields to verify</h3>
+        <ul>
+          <li><code>hosts.&lt;name&gt;.repo_path</code></li>
+          <li><code>roles.initiator</code>, <code>roles.target</code></li>
+          <li><code>nvmeof.trtype</code>, <code>traddr</code>, <code>trsvcid</code>, <code>nqn</code>, <code>hostnqn</code></li>
+        </ul>
+
+        <h3>Recommended defaults (physical backends)</h3>
+        <ul>
+          <li><code>nvmeof.pcie_bdf</code></li>
+          <li><code>nvmeof.dataset_bdev</code></li>
+          <li><code>nvmeof.backing_bdev</code></li>
+        </ul>
+
+        <h3>Optional runtime overrides</h3>
+        <ul>
+          <li><code>runtime.target_core_mask</code></li>
+          <li><code>runtime.initiator_passthru_lcores</code></li>
+          <li><code>runtime.vector_prefill_workers</code></li>
+        </ul>
+      </section>
+
+      <section class="step" id="step3">
+        <h2>Step 3. Preflight Variables</h2>
+        <pre><code>export REPO=/path/to/spdk
+export INV=$REPO/test/cpcs/examples/inventory_split.yaml    # or inventory_loopback.yaml
+export ART_ROOT=/tmp/cpcs_server_eval_$(date +%Y%m%d_%H%M%S)
+export RUNLOG=$ART_ROOT/run.log
+export TLOG=/var/log/spdk.log
+mkdir -p "$ART_ROOT"
+cd "$REPO"</code></pre>
+
+        <h3>Split-mode connectivity check</h3>
+        <pre><code>ssh &lt;target-user&gt;@&lt;target-host&gt; 'hostname; test -d /path/to/spdk && echo repo_ok'</code></pre>
+      </section>
+
+      <section class="step" id="step4">
+        <h2>Step 4. Prepare Hosts</h2>
+        <h3>Standard prepare</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" \
+  --artifacts-root "$ART_ROOT" \
+  --run-log "$RUNLOG" \
+  prepare --hugepages 2048</code></pre>
+
+        <h3>Skip build (if already built)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" \
+  --artifacts-root "$ART_ROOT" \
+  --run-log "$RUNLOG" \
+  prepare --skip-build</code></pre>
+      </section>
+
+      <section class="step" id="step5">
+        <h2>Step 5. Run Required Claim-Coverage Suite</h2>
+        <p>Run in this order to produce required evidence for <code>RQ0/RQ1/RQ2/ANN</code>.</p>
+
+        <h3>5.1 transport-bottleneck (RQ0 required)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" \
+  transport-bottleneck -- \
+  --backend vslm \
+  --dataset-size-mb 128 \
+  --pslm-size-mb 128 \
+  --sram-mb 8 \
+  --builtin-program max64 \
+  --builtin-exec-max-mb 1 \
+  --host-read-chunk-mb 0.125 \
+  --vslm-backing-min-gb 0</code></pre>
+
+        <h3>5.2 capacity-gap (RQ1 required)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" \
+  capacity-gap -- \
+  --dataset-size-mb 128 \
+  --physical-slm-mb 16 \
+  --sram-mb 8 \
+  --fullfit-pslm-mb 128 \
+  --fullfit-chunk-mb 16 \
+  --builtin-program max64 \
+  --builtin-exec-max-mb 1 \
+  --vslm-max-copy-mb 1 \
+  --vslm-backing-min-gb 0</code></pre>
+
+        <h3>5.3 locality (RQ1 required)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" \
+  locality -- \
+  --patterns sequential,clustered,strided,random \
+  --base-chunk-mb 8 \
+  --runs-per-pattern 1</code></pre>
+
+        <h3>5.4 lease-correctness (RQ2 required)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" \
+  lease-correctness</code></pre>
+
+        <h3>5.5 lease-contention (RQ2 required)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" \
+  lease-contention -- \
+  --attempts-none 1 --attempts-light 2 --attempts-moderate 4 --attempts-heavy 6 \
+  --parallel-none 1 --parallel-light 2 --parallel-moderate 3 --parallel-heavy 4</code></pre>
+
+        <h3>5.6 ann-search (ANN required)</h3>
+        <p>Start OpenSearch:</p>
+        <pre><code>bash ./experiments/real_apps/opensearch/bringup_opensearch.sh</code></pre>
+
+        <p>Generate synthetic ANN docs/queries:</p>
+        <pre><code>python3 - <<'PY'
+import json, os, pathlib
+root = pathlib.Path(os.environ["ART_ROOT"]) / "ann_prep"
+root.mkdir(parents=True, exist_ok=True)
+docs = root / "documents.jsonl"
+queries = root / "queries_real.json"
+dim = 16
+n_docs = 1024
+n_queries = 128
+with docs.open("w", encoding="utf-8") as f:
+    for i in range(n_docs):
+        base = i + 1
+        vec = [round(((base * (j + 3)) % 97) / 97.0 + 1e-3, 6) for j in range(dim)]
+        row = {
+            "id": i,
+            "vector": vec,
+            "payload": {
+                "doc_id": i,
+                "category_id": i % 8,
+                "flags": i % 4,
+                "region_id": i % 16,
+                "price": float((i % 100) + 1),
+                "timestamp_bucket": 1700000000 + i,
+                "vector_index": i,
+            },
+        }
+        f.write(json.dumps(row, separators=(",", ":")) + "\\n")
+query_rows = []
+for q in range(n_queries):
+    base = q + 1
+    vec = [round(((base * (j + 3)) % 97) / 97.0 + 1e-3, 6) for j in range(dim)]
+    query_rows.append({
+        "query_id": q,
+        "outer_request_id": q,
+        "round": 0,
+        "metric": "cosine",
+        "k": 10,
+        "vector": vec,
+        "filters": [{"op": "eq", "field": "flags", "value": q % 4}],
+        "target_selectivity_hint": f"flags_eq_{q % 4}",
+    })
+queries.write_text(json.dumps({"version": 1, "query_count": len(query_rows), "queries": query_rows}, indent=2), encoding="utf-8")
+print("wrote", docs)
+print("wrote", queries)
+PY</code></pre>
+
+        <p>Run ANN scenario:</p>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py \
+  --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" \
+  ann-search -- \
+  --system opensearch \
+  --host http://127.0.0.1:9200 \
+  --index cpcs_server_ann \
+  --docs-jsonl "$ART_ROOT/ann_prep/documents.jsonl" \
+  --queries-json "$ART_ROOT/ann_prep/queries_real.json" \
+  --load-index --recreate-index \
+  --top-k 10 --limit-queries 64 \
+  --recall-threshold 0.90 --overlap-threshold 0.80 \
+  --no-configure-index-flag</code></pre>
+      </section>
+
+      <section class="step" id="step6">
+        <h2>Step 6. Optional Depth Suite (Recommended)</h2>
+        <h3>6.1 perf-compare (RQ1 optional)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" perf-compare -- --dataset-size-mb 128 --chunk-size-mb 16 --pslm-size-mb 16 --sram-mb 8 --builtin-program sum64 --builtin-exec-max-mb 1 --vslm-max-copy-mb 1 --vslm-backing-min-gb 0 --runs 3</code></pre>
+
+        <h3>6.2 vector-eval (RQ2 optional)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" vector-eval -- --skip-nvme-attach --dataset-size-mb 64 --slm-size-mb 32 --count 1024 --query-count 32 --query-limit 10 --tier T3</code></pre>
+
+        <h3>6.3 realapp-b1b2/r3/r4 (ANN optional)</h3>
+        <pre><code>sudo -E python3 ./test/cpcs/cpcs_experiments.py --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" realapp-b1b2 -- --system opensearch --host http://127.0.0.1:9200 --index cpcs_server_ann --docs-jsonl "$ART_ROOT/ann_prep/documents.jsonl" --queries-json "$ART_ROOT/ann_prep/queries_real.json" --load-index --recreate-index --bandwidths-gbps 10 --modes baseline,cpcs_vslm --exact-match-min 0.90 --no-configure-index-flag
+
+sudo -E python3 ./test/cpcs/cpcs_experiments.py --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" realapp-r3 -- --system opensearch --host http://127.0.0.1:9200 --index cpcs_server_ann --docs-jsonl "$ART_ROOT/ann_prep/documents.jsonl" --source-queries-json "$ART_ROOT/ann_prep/queries_real.json" --flags-values 0,1,2,3 --max-queries-per-bucket 16 --modes baseline,cpcs_vslm --exact-match-min 0.90 --no-configure-index-flag
+
+sudo -E python3 ./test/cpcs/cpcs_experiments.py --inventory "$INV" --artifacts-root "$ART_ROOT" --target-log "$TLOG" realapp-r4 -- --system opensearch --host http://127.0.0.1:9200 --index cpcs_server_ann --docs-jsonl "$ART_ROOT/ann_prep/documents.jsonl" --source-queries-json "$ART_ROOT/ann_prep/queries_real.json" --outer-count 16 --inner-rounds 4 --modes baseline,cpcs_vslm --exact-match-min 0.90 --no-configure-index-flag</code></pre>
+      </section>
+
+      <section class="step" id="step7">
+        <h2>Step 7. Validate Artifacts and Closure</h2>
+
+        <h3>Per-scenario outputs (must exist)</h3>
+        <table>
+          <thead>
+            <tr><th>Artifact</th><th>Path Pattern</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Run manifest</td><td><code>$ART_ROOT/&lt;scenario&gt;/run_manifest.json</code></td></tr>
+            <tr><td>Metrics summary</td><td><code>$ART_ROOT/&lt;scenario&gt;/metrics_summary.json</code></td></tr>
+            <tr><td>Validation report</td><td><code>$ART_ROOT/&lt;scenario&gt;/validation_report.json</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>Suite-level closure check</h3>
+        <pre><code>python3 - <<'PY'
+import json, os
+root = os.environ['ART_ROOT']
+r = json.load(open(f"{root}/paper_validity_report.json"))
+print("under_supported_claims=", r.get("under_supported_claims"))
+print("total_scenarios_seen=", r.get("total_scenarios_seen"))
+print("claims=", {k: v.get("supported") for k, v in r.get("claim_coverage", {}).items()})
+PY</code></pre>
+
+        <div class="callout ok">Pass target: <code>under_supported_claims=[]</code></div>
+      </section>
+
+      <section class="step" id="step8">
+        <h2>Step 8. Failure Triage</h2>
+        <table>
+          <thead>
+            <tr><th>Symptom</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>roles.initiator must use mode=local</code></td>
+              <td>Fix inventory so initiator host uses <code>mode: local</code>.</td>
+            </tr>
+            <tr>
+              <td><code>sudo -n</code> failures on target</td>
+              <td>Enable passwordless sudo, or set <code>use_sudo: false</code> and manage runtime manually.</td>
+            </tr>
+            <tr>
+              <td>Transport baseline max-I/O size errors</td>
+              <td>Reduce <code>--host-read-chunk-mb</code> (e.g., <code>0.125</code>).</td>
+            </tr>
+            <tr>
+              <td>OpenSearch rejects <code>index.knn.ndp.cpcs.enabled</code></td>
+              <td>Use <code>--no-configure-index-flag</code> for <code>ann-search</code> and <code>realapp-*</code>.</td>
+            </tr>
+            <tr>
+              <td><code>capacity-gap</code> full-fit allocation failure</td>
+              <td>Increase RAM/hugepages. Do not relax full-fit scenario contracts.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Fast smoke path</h3>
+        <ol>
+          <li><code>prepare --skip-build</code></li>
+          <li><code>transport-bottleneck</code> (small dataset)</li>
+          <li><code>lease-correctness</code></li>
+          <li><code>ann-search --limit-queries 8</code></li>
+        </ol>
+      </section>
+
+      <p class="footer">Generated for server execution of the unified CPCS orchestrator. Keep this HTML and <code>SERVER_VALIDATION_GUIDE.md</code> in sync when command contracts change.</p>
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      var blocks = document.querySelectorAll('pre');
+      blocks.forEach(function (pre) {
+        var btn = document.createElement('button');
+        btn.className = 'copy-btn';
+        btn.type = 'button';
+        btn.textContent = 'Copy';
+        btn.addEventListener('click', function () {
+          var code = pre.querySelector('code');
+          var text = code ? code.innerText : pre.innerText;
+          navigator.clipboard.writeText(text).then(function () {
+            btn.textContent = 'Copied';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 1200);
+          }).catch(function () {
+            btn.textContent = 'Failed';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 1200);
+          });
+        });
+        pre.appendChild(btn);
+      });
+    })();
+  </script>
+</body>
+</html>

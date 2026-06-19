@@ -272,7 +272,8 @@ def setup_virtualbox(config, vmcpu, vmram)
     vb.cpus = vmcpu
 
     nvme_disk=(ENV['NVME_FILE'] || "nvme_disk.img")
-    unless File.exist? (nvme_disk)
+    vagrant_machine_id=".vagrant/machines/default/virtualbox/id"
+    unless File.exist? (nvme_disk) || File.exist?(vagrant_machine_id)
       vb.customize ["createhd", "--filename", nvme_disk, "--variant", "Fixed", "--size", "1024"]
       vb.customize ["storagectl", :id, "--name", "nvme", "--add", "pcie", "--controller", "NVMe", "--portcount", "1", "--bootable", "off"]
       vb.customize ["storageattach", :id, "--storagectl", "nvme", "--type", "hdd", "--medium", nvme_disk, "--port", "0"]
