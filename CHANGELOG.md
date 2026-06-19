@@ -2,6 +2,12 @@
 
 ## v25.09.1: (Upcoming Release)
 
+### nvmf
+
+Added the Computational Programs Command Set (CPCS) and Subsystem Local
+Memory (SLM) support: the SLM and vSLM bdev backends, the CPCS controller
+command path and runtime, and their RPC interfaces.
+
 ## v25.09
 
 ### bdev
