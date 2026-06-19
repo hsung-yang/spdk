@@ -48,6 +48,9 @@ endif
 ifneq ($(filter freebsd%,$(TARGET_TRIPLET_WORDS)),)
 OS = FreeBSD
 endif
+ifneq ($(filter darwin%,$(TARGET_TRIPLET_WORDS)),)
+OS = Darwin
+endif
 ifneq ($(filter mingw% windows%,$(TARGET_TRIPLET_WORDS)),)
 OS = Windows
 endif
@@ -433,12 +436,18 @@ endef
 BUILD_LINKERNAME_LIB=\
 	ln -sf $(notdir $<) $@
 
+ifeq ($(OS),Darwin)
+SPDK_ARFLAGS_STATIC_LIB := crs
+else
+SPDK_ARFLAGS_STATIC_LIB := crDs
+endif
+
 # Archive $(OBJS) into $@ (.a)
 LIB_C=\
 	$(Q)echo "  LIB $(notdir $@)"; \
 	rm -f $@; \
 	mkdir -p $(dir $@); \
-	$(AR) crDs $@ $(OBJS)
+	$(AR) $(SPDK_ARFLAGS_STATIC_LIB) $@ $(OBJS)
 
 # Clean up generated files listed as arguments plus a default list
 CLEAN_C=\
