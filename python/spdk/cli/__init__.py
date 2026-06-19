@@ -4,6 +4,7 @@
 from . import accel
 from . import app
 from . import bdev
+from . import cpcs
 from . import fsdev
 from . import iscsi
 from . import keyring
