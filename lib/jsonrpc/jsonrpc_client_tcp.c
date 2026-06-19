@@ -202,12 +202,13 @@ jsonrpc_client_connect(struct spdk_jsonrpc_client *client, int domain, int proto
 {
 	int rc;
 
-	client->sockfd = socket(domain, SOCK_STREAM | SOCK_NONBLOCK, protocol);
-	if (client->sockfd < 0) {
-		rc = errno;
+	rc = jsonrpc_socket_create(domain, protocol, true, true);
+	if (rc < 0) {
+		rc = -rc;
 		SPDK_ERRLOG("socket() failed\n");
 		return -rc;
 	}
+	client->sockfd = rc;
 
 	rc = connect(client->sockfd, server_addr, addrlen);
 	if (rc != 0) {

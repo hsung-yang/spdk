@@ -11,7 +11,7 @@
 #include <openssl/evp.h>
 #endif /* SPDK_CONFIG_HAVE_UUID_GENERATE_SHA1 */
 
-#if defined(SPDK_CONFIG_HAVE_LIBUUID)
+#if defined(SPDK_CONFIG_HAVE_LIBUUID) || defined(__APPLE__)
 
 #include <uuid/uuid.h>
 

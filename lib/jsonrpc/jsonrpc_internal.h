@@ -7,6 +7,7 @@
 #define SPDK_JSONRPC_INTERNAL_H_
 
 #include "spdk/stdinc.h"
+#include "spdk/fd.h"
 
 #include "spdk/jsonrpc.h"
 
@@ -110,6 +111,60 @@ struct spdk_jsonrpc_client {
 	struct spdk_jsonrpc_client_response_internal *resp;
 	struct spdk_jsonrpc_client_request *request;
 };
+
+static inline int
+jsonrpc_socket_create(int domain, int protocol, bool nonblock, bool cloexec)
+{
+	int fd;
+	int type = SOCK_STREAM;
+
+#ifdef SOCK_NONBLOCK
+	if (nonblock) {
+		type |= SOCK_NONBLOCK;
+	}
+#endif
+
+#ifdef SOCK_CLOEXEC
+	if (cloexec) {
+		type |= SOCK_CLOEXEC;
+	}
+#endif
+
+	fd = socket(domain, type, protocol);
+	if (fd < 0) {
+		return -errno;
+	}
+
+#ifndef SOCK_NONBLOCK
+	if (nonblock) {
+		int rc = spdk_fd_set_nonblock(fd);
+		if (rc < 0) {
+			close(fd);
+			return rc;
+		}
+	}
+#endif
+
+#ifndef SOCK_CLOEXEC
+	if (cloexec) {
+		int rc;
+		int flag = fcntl(fd, F_GETFD);
+		if (flag < 0) {
+			rc = -errno;
+			close(fd);
+			return rc;
+		}
+
+		if (fcntl(fd, F_SETFD, flag | FD_CLOEXEC) < 0) {
+			rc = -errno;
+			close(fd);
+			return rc;
+		}
+	}
+#endif
+
+	return fd;
+}
 
 /* jsonrpc_server_tcp */
 void jsonrpc_server_handle_request(struct spdk_jsonrpc_request *request,
