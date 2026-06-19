@@ -419,6 +419,31 @@ free_rpc_bdev_vslm_set_debug(struct rpc_bdev_vslm_set_debug *req)
 	free(req->name);
 }
 
+/*
+ * Decode a tri-state debug knob. The CLI sends a JSON boolean (true/false) via
+ * the generic client dispatcher, while programmatic callers (the Python binding,
+ * the benchmark harness) may send a JSON number (0/1). Accept either and
+ * normalize to the int tri-state (1 = on, 0 = off). Absence leaves the field at
+ * its bdev_vslm_debug_init() default of -1 (unchanged).
+ */
+static int
+rpc_decode_vslm_tristate(const struct spdk_json_val *val, void *out)
+{
+	int *dst = out;
+	bool enabled;
+	int32_t num;
+
+	if (spdk_json_decode_bool(val, &enabled) == 0) {
+		*dst = enabled ? 1 : 0;
+		return 0;
+	}
+	if (spdk_json_decode_int32(val, &num) == 0) {
+		*dst = num ? 1 : 0;
+		return 0;
+	}
+	return -EINVAL;
+}
+
 static const struct spdk_json_object_decoder rpc_bdev_vslm_set_debug_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_vslm_set_debug, name), spdk_json_decode_string},
 	{
@@ -427,23 +452,23 @@ static const struct spdk_json_object_decoder rpc_bdev_vslm_set_debug_decoders[] 
 	},
 	{
 		"async_exec", offsetof(struct rpc_bdev_vslm_set_debug, dbg.async_exec),
-		spdk_json_decode_int32, true
+		rpc_decode_vslm_tristate, true
 	},
 	{
 		"fault_batch", offsetof(struct rpc_bdev_vslm_set_debug, dbg.fault_batch),
-		spdk_json_decode_int32, true
+		rpc_decode_vslm_tristate, true
 	},
 	{
 		"prefetch_batch", offsetof(struct rpc_bdev_vslm_set_debug, dbg.prefetch_batch),
-		spdk_json_decode_int32, true
+		rpc_decode_vslm_tristate, true
 	},
 	{
 		"background_cleaner", offsetof(struct rpc_bdev_vslm_set_debug, dbg.background_cleaner),
-		spdk_json_decode_int32, true
+		rpc_decode_vslm_tristate, true
 	},
 	{
 		"streaming_mode", offsetof(struct rpc_bdev_vslm_set_debug, dbg.streaming_mode),
-		spdk_json_decode_int32, true
+		rpc_decode_vslm_tristate, true
 	},
 };
 
