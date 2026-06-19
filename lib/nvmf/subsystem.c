@@ -8,6 +8,7 @@
 
 #include "nvmf_internal.h"
 #include "transport.h"
+#include "cpcs/nvmf_cpcs.h"
 
 #include "spdk/assert.h"
 #include "spdk/likely.h"
@@ -430,6 +431,18 @@ _nvmf_subsystem_destroy(struct spdk_nvmf_subsystem *subsystem)
 	}
 
 	return 0;
+}
+
+static struct spdk_nvmf_ns *
+_nvmf_subsystem_get_first_bdev_ns(struct spdk_nvmf_subsystem *subsystem)
+{
+	struct spdk_nvmf_ns *ns = spdk_nvmf_subsystem_get_first_ns(subsystem);
+
+	while (ns != NULL && ns->bdev == NULL) {
+		ns = spdk_nvmf_subsystem_get_next_ns(subsystem, ns);
+	}
+
+	return ns;
 }
 
 static struct spdk_nvmf_ns *
@@ -1785,6 +1798,7 @@ spdk_nvmf_subsystem_remove_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t ns
 	struct spdk_nvmf_ns *ns;
 	struct spdk_nvmf_host *host, *tmp;
 	struct spdk_nvmf_ctrlr *ctrlr;
+	bool has_bdev;
 
 	if (!(subsystem->state == SPDK_NVMF_SUBSYSTEM_INACTIVE ||
 	      subsystem->state == SPDK_NVMF_SUBSYSTEM_PAUSED)) {
@@ -1800,6 +1814,7 @@ spdk_nvmf_subsystem_remove_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t ns
 	if (!ns) {
 		return -1;
 	}
+	has_bdev = (ns->bdev != NULL);
 
 	subsystem->ns[nsid - 1] = NULL;
 
@@ -1815,20 +1830,29 @@ spdk_nvmf_subsystem_remove_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t ns
 
 	free(ns->ptpl_file);
 	nvmf_ns_reservation_clear_all_registrants(ns);
-	spdk_bdev_module_release_bdev(ns->bdev);
-	spdk_bdev_close(ns->desc);
+	if (ns->cpcs_ns != NULL) {
+		spdk_nvmf_cpcs_ns_fini(ns->cpcs_ns);
+		ns->cpcs_ns = NULL;
+	}
+
+	if (has_bdev) {
+		spdk_bdev_module_release_bdev(ns->bdev);
+		spdk_bdev_close(ns->desc);
+	}
 	free(ns);
 
-	if (subsystem->fdp_supported && !spdk_nvmf_subsystem_get_first_ns(subsystem)) {
+	if (subsystem->fdp_supported && _nvmf_subsystem_get_first_bdev_ns(subsystem) == NULL) {
 		subsystem->fdp_supported = false;
 		SPDK_DEBUGLOG(nvmf, "Subsystem with id: %u doesn't have FDP capability.\n",
 			      subsystem->id);
 	}
 
-	for (transport = spdk_nvmf_transport_get_first(subsystem->tgt); transport;
-	     transport = spdk_nvmf_transport_get_next(transport)) {
-		if (transport->ops->subsystem_remove_ns) {
-			transport->ops->subsystem_remove_ns(transport, subsystem, nsid);
+	if (has_bdev) {
+		for (transport = spdk_nvmf_transport_get_first(subsystem->tgt); transport;
+		     transport = spdk_nvmf_transport_get_next(transport)) {
+			if (transport->ops->subsystem_remove_ns) {
+				transport->ops->subsystem_remove_ns(transport, subsystem, nsid);
+			}
 		}
 	}
 
@@ -2093,7 +2117,8 @@ nvmf_subsystem_zone_append_supported(struct spdk_nvmf_subsystem *subsystem)
 	for (ns = spdk_nvmf_subsystem_get_first_ns(subsystem);
 	     ns != NULL;
 	     ns = spdk_nvmf_subsystem_get_next_ns(subsystem, ns)) {
-		if (spdk_bdev_is_zoned(ns->bdev) &&
+		if (ns->bdev != NULL &&
+		    spdk_bdev_is_zoned(ns->bdev) &&
 		    spdk_bdev_io_type_supported(ns->bdev, SPDK_BDEV_IO_TYPE_ZONE_APPEND)) {
 			return true;
 		}
@@ -2254,9 +2279,11 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 		}
 
 		subsystem->max_zone_append_size_kib = max_zone_append_size_kib;
+	} else if (spdk_bdev_is_slm(ns->bdev)) {
+		ns->csi = SPDK_NVME_CSI_SLM;
 	}
 
-	first_ns = spdk_nvmf_subsystem_get_first_ns(subsystem);
+	first_ns = _nvmf_subsystem_get_first_bdev_ns(subsystem);
 	if (!first_ns) {
 		if (spdk_bdev_get_nvme_ctratt(ns->bdev).bits.fdps) {
 			SPDK_DEBUGLOG(nvmf, "Subsystem with id: %u has FDP capability.\n",

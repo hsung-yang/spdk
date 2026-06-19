@@ -3519,7 +3519,8 @@ nvmf_tcp_req_complete(struct spdk_nvmf_request *req)
 		break;
 	default:
 		SPDK_ERRLOG("Unexpected request state %d (cntlid:%d, qid:%d)\n",
-			    tcp_req->state, req->qpair->ctrlr->cntlid, req->qpair->qid);
+			    tcp_req->state, req->qpair->ctrlr ? req->qpair->ctrlr->cntlid : 0,
+			    req->qpair->qid);
 		assert(0 && "Unexpected request state");
 		break;
 	}

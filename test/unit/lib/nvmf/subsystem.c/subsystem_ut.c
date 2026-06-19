@@ -56,6 +56,9 @@ DEFINE_STUB(spdk_nvme_transport_id_trtype_str,
 DEFINE_STUB(spdk_bdev_is_zoned, bool,
 	    (const struct spdk_bdev *bdev), false);
 
+DEFINE_STUB(spdk_bdev_is_slm, bool,
+	    (const struct spdk_bdev *bdev), false);
+
 DEFINE_STUB(spdk_bdev_get_max_zone_append_size, uint32_t,
 	    (const struct spdk_bdev *bdev), 0);
 
@@ -77,6 +80,7 @@ DEFINE_STUB(nvmf_tgt_update_mdns_prr, int, (struct spdk_nvmf_tgt *tgt), 0);
 DEFINE_STUB(spdk_bdev_get_module_name, const char *, (const struct spdk_bdev *bdev), "nvme");
 DEFINE_STUB(spdk_bdev_get_module_ctx, void *, (struct spdk_bdev_desc *desc), NULL);
 DEFINE_STUB(spdk_bdev_get_nvme_nsid, uint32_t, (struct spdk_bdev *bdev), 0);
+DEFINE_STUB_V(spdk_nvmf_cpcs_ns_fini, (struct spdk_nvmf_cpcs_ns *ns));
 
 static struct spdk_nvmf_transport g_transport = {};
 

@@ -17,17 +17,6 @@
 
 SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
-struct spdk_bdev {
-	int ut_mock;
-	uint64_t blockcnt;
-	uint32_t blocklen;
-	bool zoned;
-	uint32_t zone_size;
-	uint32_t max_open_zones;
-	uint32_t max_active_zones;
-	enum spdk_dif_type dif_type;
-};
-
 #define MAX_OPEN_ZONES 12
 #define MAX_ACTIVE_ZONES 34
 #define ZONE_SIZE 56
@@ -39,6 +28,14 @@ static struct spdk_bdev_io *zcopy_start_bdev_io_read = (struct spdk_bdev_io *) 0
 static struct spdk_bdev_io *zcopy_start_bdev_io_write = (struct spdk_bdev_io *)
 		0x8877665544332211UL;
 static struct spdk_bdev_io *zcopy_start_bdev_io_fail = (struct spdk_bdev_io *) 0xFFFFFFFFFFFFFFFFUL;
+static int g_bdev_slm_copy_rc;
+static uint32_t g_bdev_slm_copy_calls;
+static uint32_t g_bdev_slm_write_calls;
+static struct spdk_bdev *g_last_copy_dst_bdev;
+static struct spdk_bdev *g_last_copy_src_bdev;
+static uint64_t g_last_copy_dst_offset;
+static uint64_t g_last_copy_src_offset;
+static uint64_t g_last_copy_len;
 
 DEFINE_STUB(spdk_nvmf_tgt_find_subsystem,
 	    struct spdk_nvmf_subsystem *,
@@ -65,6 +62,34 @@ DEFINE_STUB(spdk_nvmf_subsystem_host_allowed,
 	    (struct spdk_nvmf_subsystem *subsystem, const char *hostnqn),
 	    true);
 
+DEFINE_STUB(spdk_nvmf_cpcs_ns_get_by_nsid,
+	    struct spdk_nvmf_cpcs_ns *,
+	    (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid),
+	    NULL);
+
+DEFINE_STUB(spdk_nvmf_cpcs_ns_identify,
+	    int,
+	    (struct spdk_nvmf_cpcs_ns *ns, struct spdk_nvme_cpcs_ns_data *ns_data),
+	    -ENOTSUP);
+
+DEFINE_STUB(cpcs_handle_admin_cmd,
+	    int,
+	    (struct spdk_nvmf_request *req),
+	    -ENOTSUP);
+
+DEFINE_STUB(cpcs_handle_io_cmd,
+	    int,
+	    (struct spdk_nvmf_request *req),
+	    -ENOTSUP);
+
+DEFINE_STUB(nvmf_slm_parse_copy_lba_cmd,
+	    int,
+	    (struct spdk_nvmf_request *req, struct spdk_nvmf_ns *dest_ns,
+	     enum spdk_nvme_slm_copy_desc_fmt *desc_fmt_out, uint64_t *sdaddr,
+	     uint64_t *total_nbytes_out,
+	     struct nvmf_slm_copy_lba_range **ranges_out, uint32_t *range_count_out),
+	    -EINVAL);
+
 DEFINE_STUB(nvmf_subsystem_add_ctrlr,
 	    int,
 	    (struct spdk_nvmf_subsystem *subsystem, struct spdk_nvmf_ctrlr *ctrlr),
@@ -76,6 +101,92 @@ DEFINE_STUB(nvmf_subsystem_get_ctrlr,
 	    NULL);
 DEFINE_STUB(nvmf_subsystem_zone_append_supported, bool,
 	    (struct spdk_nvmf_subsystem *subsystem), false);
+
+DEFINE_STUB(spdk_bdev_get_block_size, uint32_t, (const struct spdk_bdev *bdev), 512);
+DEFINE_STUB(spdk_bdev_get_num_blocks, uint64_t, (const struct spdk_bdev *bdev), 0);
+DEFINE_STUB(spdk_bdev_readv_blocks, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+	     struct iovec *iov, int iovcnt, uint64_t offset_blocks,
+	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg),
+	    0);
+DEFINE_STUB(bdev_slm_get_buffer_ptr_by_bdev, int,
+	    (struct spdk_bdev *bdev, uint64_t offset, uint64_t length, void **ptr), 0);
+DEFINE_STUB(bdev_slm_read_by_bdev, int,
+	    (struct spdk_bdev *bdev, uint64_t offset, uint64_t length, void *buf), 0);
+
+int
+bdev_slm_write_by_bdev(struct spdk_bdev *bdev, uint64_t offset, uint64_t length, const void *buf)
+{
+	(void)bdev;
+	(void)offset;
+	(void)length;
+	(void)buf;
+	g_bdev_slm_write_calls++;
+	return 0;
+}
+
+int
+bdev_slm_write_by_bdev_async(struct spdk_bdev *bdev, uint64_t offset, uint64_t length,
+			     const void *buf, spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg)
+{
+	int rc;
+
+	rc = bdev_slm_write_by_bdev(bdev, offset, length, buf);
+	if (cb_fn != NULL) {
+		cb_fn(cb_arg, rc);
+	}
+	return 0;
+}
+
+int
+bdev_slm_copy_by_bdev(struct spdk_bdev *dst_bdev, uint64_t dst_offset,
+		      struct spdk_bdev *src_bdev, uint64_t src_offset, uint64_t length)
+{
+	g_bdev_slm_copy_calls++;
+	g_last_copy_dst_bdev = dst_bdev;
+	g_last_copy_src_bdev = src_bdev;
+	g_last_copy_dst_offset = dst_offset;
+	g_last_copy_src_offset = src_offset;
+	g_last_copy_len = length;
+	return g_bdev_slm_copy_rc;
+}
+
+int
+bdev_slm_copy_by_bdev_async(struct spdk_bdev *dst_bdev, uint64_t dst_offset,
+			    struct spdk_bdev *src_bdev, uint64_t src_offset, uint64_t length,
+			    spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg)
+{
+	int rc;
+
+	rc = bdev_slm_copy_by_bdev(dst_bdev, dst_offset, src_bdev, src_offset, length);
+	if (cb_fn != NULL) {
+		cb_fn(cb_arg, rc);
+	}
+	return 0;
+}
+
+static void
+reset_slm_copy_stubs(void)
+{
+	g_bdev_slm_copy_rc = 0;
+	g_bdev_slm_copy_calls = 0;
+	g_bdev_slm_write_calls = 0;
+	g_last_copy_dst_bdev = NULL;
+	g_last_copy_src_bdev = NULL;
+	g_last_copy_dst_offset = 0;
+	g_last_copy_src_offset = 0;
+	g_last_copy_len = 0;
+}
+
+DEFINE_STUB(bdev_slm_exec_read_by_bdev, int,
+	    (struct spdk_bdev *bdev, uint64_t offset, uint64_t length, void *buf), 0);
+DEFINE_STUB(bdev_slm_exec_write_by_bdev, int,
+	    (struct spdk_bdev *bdev, uint64_t offset, uint64_t length, const void *buf), 0);
+DEFINE_STUB(bdev_slm_lease_acquire_by_bdev, int,
+	    (uint64_t lease_id, struct spdk_bdev *bdev, uint64_t offset, uint64_t length), 0);
+DEFINE_STUB(bdev_slm_exec_publish_lease, int, (uint64_t lease_id), 0);
+DEFINE_STUB(bdev_slm_exec_discard_lease, int, (uint64_t lease_id), 0);
+DEFINE_STUB(bdev_slm_lease_release, int, (uint64_t lease_id), 0);
 DEFINE_STUB(nvmf_ctrlr_dsm_supported,
 	    bool,
 	    (struct spdk_nvmf_ctrlr *ctrlr),
@@ -209,6 +320,16 @@ DEFINE_STUB(spdk_bdev_reset, int, (struct spdk_bdev_desc *desc, struct spdk_io_c
 DEFINE_STUB(spdk_bdev_nvme_nssr, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 				       spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *bdev_io));
+DEFINE_STUB(spdk_bdev_nvme_iov_passthru_md, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+	     const struct spdk_nvme_cmd *cmd, struct iovec *iov, int iovcnt,
+	     size_t nbytes, void *md_buf, size_t md_len,
+	     spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_queue_io_wait, int,
+	    (struct spdk_bdev *bdev, struct spdk_io_channel *ch,
+	     struct spdk_bdev_io_wait_entry *entry), 0);
+DEFINE_STUB_V(spdk_bdev_io_get_nvme_status,
+	      (const struct spdk_bdev_io *bdev_io, uint32_t *cdw0, int *sct, int *sc));
 
 DEFINE_STUB(spdk_bdev_get_max_active_zones, uint32_t, (const struct spdk_bdev *bdev),
 	    MAX_ACTIVE_ZONES);
@@ -3686,6 +3807,85 @@ test_nvmf_qpair_cid_is_reservation(void)
 	SPDK_CU_ASSERT_FATAL(nvmf_qpair_cid_is_reservation(&qpair, i * 2) == false);
 }
 
+static void
+test_slm_copy_lba_4h_routes_to_copy_by_bdev(void)
+{
+	struct nvmf_ctrlr_slm_copy_lba_ctx ctx = {};
+	struct nvmf_slm_copy_lba_range ranges[2] = {};
+	struct spdk_nvmf_ns dest_ns = {};
+	struct spdk_bdev dst_bdev = {};
+	struct spdk_bdev src0_bdev = {};
+	struct spdk_bdev src1_bdev = {};
+	int rc;
+
+	reset_slm_copy_stubs();
+
+	dest_ns.bdev = &dst_bdev;
+	ranges[0].src_bdev = &src0_bdev;
+	ranges[0].dest_offset = 0x1000;
+	ranges[0].saddr = 0x2000;
+	ranges[0].nbytes = 0x1000;
+	ranges[1].src_bdev = &src1_bdev;
+	ranges[1].dest_offset = 0x3000;
+	ranges[1].saddr = 0x5000;
+	ranges[1].nbytes = 0x1000;
+
+	ctx.dest_ns = &dest_ns;
+	ctx.ranges = ranges;
+	ctx.range_count = SPDK_COUNTOF(ranges);
+	ctx.sdaddr = 0x8000;
+	ctx.desc_fmt = SPDK_NVME_SLM_COPY_DESC_FMT_4H;
+	ctx.inflight_reads = 1;
+
+	rc = nvmf_ctrlr_slm_copy_lba_submit_reads(&ctx);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
+	CU_ASSERT(ctx.read_submit_done == true);
+	CU_ASSERT(ctx.failed == false);
+	CU_ASSERT(g_bdev_slm_copy_calls == SPDK_COUNTOF(ranges));
+	CU_ASSERT(g_bdev_slm_write_calls == 0);
+	CU_ASSERT(g_last_copy_dst_bdev == &dst_bdev);
+	CU_ASSERT(g_last_copy_src_bdev == &src1_bdev);
+	CU_ASSERT(g_last_copy_dst_offset == (ctx.sdaddr + ranges[1].dest_offset));
+	CU_ASSERT(g_last_copy_src_offset == ranges[1].saddr);
+	CU_ASSERT(g_last_copy_len == ranges[1].nbytes);
+}
+
+static void
+test_slm_copy_lba_4h_maps_copy_errors(void)
+{
+	struct nvmf_ctrlr_slm_copy_lba_ctx ctx = {};
+	struct nvmf_slm_copy_lba_range range = {};
+	struct spdk_nvmf_ns dest_ns = {};
+	struct spdk_bdev dst_bdev = {};
+	struct spdk_bdev src_bdev = {};
+	int rc;
+
+	reset_slm_copy_stubs();
+	g_bdev_slm_copy_rc = -EAGAIN;
+
+	dest_ns.bdev = &dst_bdev;
+	range.src_bdev = &src_bdev;
+	range.dest_offset = 0;
+	range.saddr = 0;
+	range.nbytes = 0x1000;
+
+	ctx.dest_ns = &dest_ns;
+	ctx.ranges = &range;
+	ctx.range_count = 1;
+	ctx.sdaddr = 0x2000;
+	ctx.desc_fmt = SPDK_NVME_SLM_COPY_DESC_FMT_4H;
+	ctx.inflight_reads = 1;
+
+	rc = nvmf_ctrlr_slm_copy_lba_submit_reads(&ctx);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
+	CU_ASSERT(ctx.read_submit_done == true);
+	CU_ASSERT(ctx.failed == true);
+	CU_ASSERT(ctx.failed_sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(ctx.failed_sc == SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+	CU_ASSERT(g_bdev_slm_copy_calls == 1);
+	CU_ASSERT(g_bdev_slm_write_calls == 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3729,6 +3929,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_ctrlr_ns_attachment);
 	CU_ADD_TEST(suite, test_nvmf_check_qpair_active);
 	CU_ADD_TEST(suite, test_nvmf_qpair_cid_is_reservation);
+	CU_ADD_TEST(suite, test_slm_copy_lba_4h_routes_to_copy_by_bdev);
+	CU_ADD_TEST(suite, test_slm_copy_lba_4h_maps_copy_errors);
 
 	allocate_threads(1);
 	set_thread(0);

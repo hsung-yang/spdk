@@ -11,6 +11,7 @@
 #include "transport.h"
 
 #include "spdk/bdev.h"
+#include "spdk/bdev_slm.h"
 #include "spdk/bdev_zone.h"
 #include "spdk/bit_array.h"
 #include "spdk/endian.h"
@@ -22,6 +23,10 @@
 #include "spdk/version.h"
 #include "spdk/log.h"
 #include "spdk_internal/usdt.h"
+
+#include "cpcs/cpcs_cmd.h"
+#include "cpcs/nvmf_cpcs.h"
+#include "slm/slm_cmd.h"
 
 #define NVMF_CC_RESET_SHN_TIMEOUT_IN_MS	10000
 
@@ -237,7 +242,6 @@ nvmf_ctrlr_send_connect_rsp(void *ctx)
 	struct spdk_nvmf_ctrlr *ctrlr = qpair->ctrlr;
 	struct spdk_nvmf_fabric_connect_rsp *rsp = &req->rsp->connect_rsp;
 	int rc;
-
 	/* The qpair might have been disconnected in the meantime */
 	assert(qpair->state == SPDK_NVMF_QPAIR_CONNECTING ||
 	       qpair->state == SPDK_NVMF_QPAIR_DEACTIVATING);
@@ -414,6 +418,21 @@ nvmf_subsystem_has_zns_iocs(struct spdk_nvmf_subsystem *subsystem)
 	return false;
 }
 
+static bool
+nvmf_subsystem_has_multi_iocs(struct spdk_nvmf_subsystem *subsystem)
+{
+	struct spdk_nvmf_ns *ns;
+	uint32_t i;
+
+	for (i = 0; i < subsystem->max_nsid; i++) {
+		ns = subsystem->ns[i];
+		if (ns && ns->csi != SPDK_NVME_CSI_NVM) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 nvmf_ctrlr_init_visible_ns(struct spdk_nvmf_ctrlr *ctrlr)
 {
@@ -548,7 +567,7 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	/* ready timeout - 500 msec units */
 	ctrlr->vcprop.cap.bits.to = NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS / 500;
 	ctrlr->vcprop.cap.bits.dstrd = 0; /* fixed to 0 for NVMe-oF */
-	subsys_has_multi_iocs = nvmf_subsystem_has_zns_iocs(subsystem);
+	subsys_has_multi_iocs = nvmf_subsystem_has_multi_iocs(subsystem);
 	if (subsys_has_multi_iocs) {
 		ctrlr->vcprop.cap.bits.css =
 			SPDK_NVME_CAP_CSS_IOCS; /* One or more I/O command sets supported */
@@ -3252,10 +3271,32 @@ spdk_nvmf_ns_identify_iocs_specific(struct spdk_nvmf_ctrlr *ctrlr,
 				    size_t nsdata_size)
 {
 	uint8_t csi = cmd->cdw11_bits.identify.csi;
-	struct spdk_nvmf_ns *ns = _nvmf_ctrlr_get_ns_safe(ctrlr, cmd->nsid, rsp);
+	struct spdk_nvmf_ns *ns;
+	int rc;
 
 	memset(nsdata, 0, nsdata_size);
 
+	if (csi == SPDK_NVME_CSI_CPCS) {
+		ns = nvmf_ctrlr_get_ns(ctrlr, cmd->nsid);
+		if (ns == NULL || ns->csi != SPDK_NVME_CSI_CPCS || ns->cpcs_ns == NULL) {
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+
+		rc = spdk_nvmf_cpcs_ns_identify(ns->cpcs_ns, nsdata);
+		if (rc != 0) {
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+
+		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+		rsp->status.sc = SPDK_NVME_SC_SUCCESS;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	ns = _nvmf_ctrlr_get_ns_safe(ctrlr, cmd->nsid, rsp);
 	if (ns == NULL) {
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 		rsp->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
@@ -3436,7 +3477,7 @@ nvmf_ctrlr_identify_ns_id_descriptor_list(
 	}
 
 	ns = nvmf_ctrlr_get_ns(ctrlr, nsid);
-	if (ns == NULL || ns->bdev == NULL) {
+	if (ns == NULL) {
 		SPDK_ERRLOG("Identify Namespace Identification Descriptor list with inactive NSID %u\n", nsid);
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 		rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
@@ -4090,6 +4131,40 @@ is_cmd_ctrlr_specific(struct spdk_nvme_cmd *cmd)
 	}
 }
 
+static int
+nvmf_ctrlr_process_cpcs_admin_cmd(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
+	struct spdk_nvmf_ns *ns;
+	int rc;
+
+	if (req == NULL || req->qpair == NULL || req->qpair->ctrlr == NULL) {
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+		response->status.dnr = 1;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	ns = nvmf_ctrlr_get_ns(req->qpair->ctrlr, req->cmd->nvme_cmd.nsid);
+	if (ns == NULL || ns->csi != SPDK_NVME_CSI_CPCS) {
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+		response->status.dnr = 1;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	rc = cpcs_handle_admin_cmd(req);
+	if (rc == -ENOTSUP) {
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_INVALID_OPCODE;
+		response->status.dnr = 1;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	/* CPCS handler owns completion and may complete synchronously or asynchronously. */
+	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+}
+
 int
 nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 {
@@ -4179,6 +4254,10 @@ nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 		return nvmf_ctrlr_async_event_request(req);
 	case SPDK_NVME_OPC_KEEP_ALIVE:
 		return nvmf_ctrlr_keep_alive(req);
+	case SPDK_NVME_OPC_CPCS_LOAD_PROGRAM:
+	case SPDK_NVME_OPC_CPCS_MRS_MANAGEMENT:
+	case SPDK_NVME_OPC_CPCS_PROGRAM_ACTIVATION:
+		return nvmf_ctrlr_process_cpcs_admin_cmd(req);
 
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
 	case SPDK_NVME_OPC_CREATE_IO_CQ:
@@ -4753,6 +4832,336 @@ spdk_nvmf_request_zcopy_end(struct spdk_nvmf_request *req, bool commit)
 	nvmf_bdev_ctrlr_zcopy_end(req, commit);
 }
 
+struct nvmf_ctrlr_slm_copy_lba_ctx;
+
+struct nvmf_ctrlr_slm_copy_lba_read_ctx {
+	struct nvmf_ctrlr_slm_copy_lba_ctx		*ctx;
+	struct iovec					iov;
+};
+
+struct nvmf_ctrlr_slm_copy_lba_ctx {
+	struct spdk_nvmf_request			*req;
+	struct spdk_nvmf_ns				*dest_ns;
+	struct nvmf_slm_copy_lba_range			*ranges;
+	struct nvmf_ctrlr_slm_copy_lba_read_ctx	*read_ctxs;
+	void						*coalesced_buf;
+	uint64_t					coalesced_len;
+	uint64_t					sdaddr;
+	enum spdk_nvme_slm_copy_desc_fmt		desc_fmt;
+	uint32_t					range_count;
+	uint32_t					inflight_reads;
+	uint8_t						failed_sct;
+	uint8_t						failed_sc;
+	bool						read_submit_done;
+	bool						coalesced_write_submitted;
+	bool						completed;
+	bool						failed;
+};
+
+static void
+nvmf_ctrlr_slm_copy_lba_free_ctx(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
+{
+	if (ctx == NULL) {
+		return;
+	}
+
+	spdk_dma_free(ctx->coalesced_buf);
+	free(ctx->read_ctxs);
+	free(ctx->ranges);
+	free(ctx);
+}
+
+static void
+nvmf_ctrlr_slm_copy_lba_fail(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx, uint8_t sct, uint8_t sc)
+{
+	if (ctx->failed) {
+		return;
+	}
+
+	ctx->failed = true;
+	ctx->failed_sct = sct;
+	ctx->failed_sc = sc;
+}
+
+static void
+nvmf_ctrlr_slm_copy_lba_fail_errno(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx, int rc)
+{
+	if (rc == -EINVAL || rc == -ENOENT || rc == -ENOTSUP) {
+		nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INVALID_FIELD);
+	} else {
+		nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+					     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+	}
+}
+
+static int
+nvmf_ctrlr_slm_copy_lba_finish(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
+{
+	struct spdk_nvmf_request *req = ctx->req;
+	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+
+	if (ctx->failed) {
+		rsp->status.sct = ctx->failed_sct;
+		rsp->status.sc = ctx->failed_sc;
+	} else {
+		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+		rsp->status.sc = SPDK_NVME_SC_SUCCESS;
+	}
+
+	spdk_nvmf_request_complete(req);
+	nvmf_ctrlr_slm_copy_lba_free_ctx(ctx);
+	/*
+	 * Completion is already submitted via spdk_nvmf_request_complete(), so callers
+	 * must not attempt to complete this request again in the synchronous path.
+	 */
+	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+}
+
+static void nvmf_ctrlr_slm_copy_lba_slm_io_complete(void *cb_arg, int status);
+
+static int
+nvmf_ctrlr_slm_copy_lba_maybe_finish(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
+{
+	int rc;
+
+	if (ctx->completed || !ctx->read_submit_done || ctx->inflight_reads != 0) {
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+	}
+
+	if (!ctx->failed && ctx->desc_fmt != SPDK_NVME_SLM_COPY_DESC_FMT_4H &&
+	    ctx->coalesced_buf != NULL && ctx->coalesced_len != 0) {
+		if (!ctx->coalesced_write_submitted) {
+			ctx->coalesced_write_submitted = true;
+			ctx->inflight_reads++;
+			rc = bdev_slm_write_by_bdev_async(ctx->dest_ns->bdev, ctx->sdaddr,
+							  ctx->coalesced_len, ctx->coalesced_buf,
+							  nvmf_ctrlr_slm_copy_lba_slm_io_complete,
+							  ctx);
+			if (rc != 0) {
+				ctx->inflight_reads--;
+				nvmf_ctrlr_slm_copy_lba_fail_errno(ctx, rc);
+			} else {
+				/*
+				 * Completion may run inline and free ctx; do not touch ctx
+				 * after successful submission in this stack frame.
+				 */
+				return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+			}
+		}
+
+		if (ctx->inflight_reads != 0) {
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+		}
+	}
+
+	ctx->completed = true;
+	return nvmf_ctrlr_slm_copy_lba_finish(ctx);
+}
+
+static void
+nvmf_ctrlr_slm_copy_lba_maybe_finish_msg(void *ctx_arg)
+{
+	struct nvmf_ctrlr_slm_copy_lba_ctx *ctx = ctx_arg;
+
+	nvmf_ctrlr_slm_copy_lba_maybe_finish(ctx);
+}
+
+static void
+nvmf_ctrlr_slm_copy_lba_slm_io_complete(void *cb_arg, int status)
+{
+	struct nvmf_ctrlr_slm_copy_lba_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		nvmf_ctrlr_slm_copy_lba_fail_errno(ctx, status);
+	}
+
+	assert(ctx->inflight_reads > 0);
+	ctx->inflight_reads--;
+	nvmf_ctrlr_slm_copy_lba_maybe_finish(ctx);
+}
+
+static void
+nvmf_ctrlr_slm_copy_lba_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct nvmf_ctrlr_slm_copy_lba_read_ctx *read_ctx = cb_arg;
+	struct nvmf_ctrlr_slm_copy_lba_ctx *ctx = read_ctx->ctx;
+	struct spdk_thread *thread;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+					     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+	}
+
+	assert(ctx->inflight_reads > 0);
+	ctx->inflight_reads--;
+
+	if (ctx->inflight_reads == 0 && ctx->read_submit_done) {
+		thread = spdk_get_thread();
+		assert(thread != NULL);
+		spdk_thread_send_msg(thread, nvmf_ctrlr_slm_copy_lba_maybe_finish_msg, ctx);
+		return;
+	}
+
+	nvmf_ctrlr_slm_copy_lba_maybe_finish(ctx);
+}
+
+static int
+nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
+{
+	struct nvmf_slm_copy_lba_range *range;
+	uint8_t *dst;
+	uint64_t dest_start;
+	uint64_t src_start;
+	uint64_t src_block_size;
+	uint32_t i;
+	bool mapping_done = false;
+	int rc;
+
+	for (i = 0; i < ctx->range_count && !ctx->failed; i++) {
+		range = &ctx->ranges[i];
+
+		if (range->dest_offset > UINT64_MAX - ctx->sdaddr) {
+			nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+						     SPDK_NVME_SC_INVALID_FIELD);
+			break;
+		}
+		dest_start = ctx->sdaddr + range->dest_offset;
+
+		switch (ctx->desc_fmt) {
+		case SPDK_NVME_SLM_COPY_DESC_FMT_2H:
+		case SPDK_NVME_SLM_COPY_DESC_FMT_3H:
+			if (ctx->coalesced_buf == NULL) {
+				src_block_size = spdk_bdev_get_block_size(range->src_bdev);
+				if (src_block_size == 0 || range->slba > UINT64_MAX / src_block_size) {
+					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+								     SPDK_NVME_SC_INVALID_FIELD);
+					break;
+				}
+
+				src_start = range->slba * src_block_size;
+				ctx->inflight_reads++;
+				rc = bdev_slm_copy_by_bdev_async(ctx->dest_ns->bdev, dest_start,
+								 range->src_bdev, src_start, range->nbytes,
+								 nvmf_ctrlr_slm_copy_lba_slm_io_complete, ctx);
+				if (rc == 0) {
+					mapping_done = true;
+					break;
+				}
+				ctx->inflight_reads--;
+				if (rc != -ENOTSUP) {
+					nvmf_ctrlr_slm_copy_lba_fail_errno(ctx, rc);
+					break;
+				}
+
+				if (mapping_done) {
+					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+								     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+					break;
+				}
+
+				ctx->coalesced_buf = spdk_dma_malloc(ctx->coalesced_len, 0x1000, NULL);
+				if (ctx->coalesced_buf == NULL) {
+					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+								     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+					break;
+				}
+
+				ctx->read_ctxs = calloc(ctx->range_count, sizeof(*ctx->read_ctxs));
+				if (ctx->read_ctxs == NULL) {
+					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+								     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+					break;
+				}
+			}
+
+			assert(range->nbytes > 0);
+			assert(range->dest_offset <= ctx->coalesced_len);
+			assert(range->nbytes <= ctx->coalesced_len - range->dest_offset);
+			dst = (uint8_t *)ctx->coalesced_buf + range->dest_offset;
+
+			ctx->read_ctxs[i].ctx = ctx;
+			ctx->read_ctxs[i].iov.iov_base = dst;
+			ctx->read_ctxs[i].iov.iov_len = range->nbytes;
+
+			ctx->inflight_reads++;
+			rc = spdk_bdev_readv_blocks(range->desc, range->ch, &ctx->read_ctxs[i].iov, 1,
+						    range->slba, range->nlb + 1,
+						    nvmf_ctrlr_slm_copy_lba_read_complete,
+						    &ctx->read_ctxs[i]);
+			if (rc != 0) {
+				ctx->inflight_reads--;
+				nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+							     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+			}
+			break;
+		case SPDK_NVME_SLM_COPY_DESC_FMT_4H:
+			ctx->inflight_reads++;
+			rc = bdev_slm_copy_by_bdev_async(ctx->dest_ns->bdev, dest_start,
+							 range->src_bdev, range->saddr, range->nbytes,
+							 nvmf_ctrlr_slm_copy_lba_slm_io_complete, ctx);
+			if (rc != 0) {
+				ctx->inflight_reads--;
+				nvmf_ctrlr_slm_copy_lba_fail_errno(ctx, rc);
+			}
+			break;
+		default:
+			nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+						     SPDK_NVME_SC_INVALID_FIELD);
+			break;
+		}
+	}
+
+	ctx->read_submit_done = true;
+	return nvmf_ctrlr_slm_copy_lba_maybe_finish(ctx);
+}
+
+static int
+nvmf_ctrlr_process_slm_copy_lba_cmd(struct spdk_nvmf_request *req, struct spdk_nvmf_ns *dest_ns)
+{
+	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+	struct nvmf_ctrlr_slm_copy_lba_ctx *ctx = NULL;
+	struct nvmf_slm_copy_lba_range *ranges = NULL;
+	uint32_t range_count = 0;
+	enum spdk_nvme_slm_copy_desc_fmt desc_fmt = SPDK_NVME_SLM_COPY_DESC_FMT_NONE;
+	uint64_t sdaddr = 0;
+	uint64_t total_nbytes = 0;
+	int rc;
+
+	rc = nvmf_slm_parse_copy_lba_cmd(req, dest_ns, &desc_fmt, &sdaddr, &total_nbytes, &ranges,
+					 &range_count);
+	if (rc != 0) {
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+		rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		free(ranges);
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	ctx->req = req;
+	ctx->dest_ns = dest_ns;
+	ctx->ranges = ranges;
+	ctx->range_count = range_count;
+	ctx->sdaddr = sdaddr;
+	ctx->desc_fmt = desc_fmt;
+	ctx->coalesced_len = total_nbytes;
+
+	switch (desc_fmt) {
+	case SPDK_NVME_SLM_COPY_DESC_FMT_2H:
+	case SPDK_NVME_SLM_COPY_DESC_FMT_3H:
+	case SPDK_NVME_SLM_COPY_DESC_FMT_4H:
+		return nvmf_ctrlr_slm_copy_lba_submit_reads(ctx);
+	default:
+		nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INVALID_FIELD);
+		return nvmf_ctrlr_slm_copy_lba_finish(ctx);
+	}
+}
+
 int
 nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 {
@@ -4768,6 +5177,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 	struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
 	enum spdk_nvme_ana_state ana_state;
+	int rc;
 
 	/* pre-set response details for this command */
 	response->status.sc = SPDK_NVME_SC_SUCCESS;
@@ -4782,7 +5192,8 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	}
 
 	ns = nvmf_ctrlr_get_ns(ctrlr, nsid);
-	if (spdk_unlikely(ns == NULL || ns->bdev == NULL)) {
+	if (spdk_unlikely(ns == NULL ||
+			  (ns->bdev == NULL && ns->csi != SPDK_NVME_CSI_CPCS))) {
 		SPDK_DEBUGLOG(nvmf, "Unsuccessful query for nsid %u\n", cmd->nsid);
 		response->status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
 		response->status.dnr = 1;
@@ -4814,6 +5225,15 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
 
+	if (ns->csi == SPDK_NVME_CSI_CPCS) {
+		rc = cpcs_handle_io_cmd(req);
+		if (rc != -ENOTSUP) {
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+		}
+
+		goto invalid_opcode;
+	}
+
 	bdev = ns->bdev;
 	desc = ns->desc;
 	ch = ns_info->channel;
@@ -4838,6 +5258,19 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 		assert(ns->passthru_nsid > 0);
 		req->orig_nsid = req->cmd->nvme_cmd.nsid;
 		req->cmd->nvme_cmd.nsid = ns->passthru_nsid;
+
+		return nvmf_bdev_ctrlr_nvme_passthru_io(bdev, desc, ch, req);
+	}
+
+	if (ns->csi == SPDK_NVME_CSI_SLM) {
+		if (cmd->opc == SPDK_NVME_OPC_FLUSH) {
+			/* Flush has no effect on SLM namespaces. */
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+
+		if (cmd->opc == SPDK_NVME_SLM_OPC_MEMORY_COPY) {
+			return nvmf_ctrlr_process_slm_copy_lba_cmd(req, ns);
+		}
 
 		return nvmf_bdev_ctrlr_nvme_passthru_io(bdev, desc, ch, req);
 	}
@@ -5075,6 +5508,7 @@ nvmf_check_subsystem_active(struct spdk_nvmf_request *req)
 	struct spdk_nvmf_qpair *qpair = req->qpair;
 	struct spdk_nvmf_subsystem_poll_group *sgroup = NULL;
 	struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
+	struct spdk_nvmf_ns *ns;
 	uint32_t nsid;
 
 	if (spdk_likely(qpair->ctrlr)) {
@@ -5111,6 +5545,18 @@ nvmf_check_subsystem_active(struct spdk_nvmf_request *req)
 		}
 
 		ns_info = &sgroup->ns_info[nsid - 1];
+		ns = nvmf_ctrlr_get_ns(qpair->ctrlr, nsid);
+		if (ns != NULL && ns->csi == SPDK_NVME_CSI_CPCS) {
+			if (spdk_unlikely(ns_info->state != SPDK_NVMF_SUBSYSTEM_ACTIVE)) {
+				/* The namespace is not currently active. Queue this request. */
+				TAILQ_INSERT_TAIL(&sgroup->queued, req, link);
+				return false;
+			}
+
+			ns_info->io_outstanding++;
+			return true;
+		}
+
 		if (spdk_unlikely(ns_info->channel == NULL)) {
 			/* This can can happen if host sends I/O to a namespace that is
 			 * in the process of being added, but before the full addition

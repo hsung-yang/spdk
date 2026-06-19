@@ -226,14 +226,23 @@ dump_nvmf_subsystem(struct spdk_json_write_ctx *w, struct spdk_nvmf_subsystem *s
 		spdk_json_write_named_array_begin(w, "namespaces");
 		for (ns = spdk_nvmf_subsystem_get_first_ns(subsystem); ns != NULL;
 		     ns = spdk_nvmf_subsystem_get_next_ns(subsystem, ns)) {
+			struct spdk_bdev *bdev;
+			const char *bdev_name;
+
 			spdk_nvmf_ns_get_opts(ns, &ns_opts, sizeof(ns_opts));
+			bdev = spdk_nvmf_ns_get_bdev(ns);
+			bdev_name = bdev ? spdk_bdev_get_name(bdev) : NULL;
 			spdk_json_write_object_begin(w);
 			spdk_json_write_named_int32(w, "nsid", spdk_nvmf_ns_get_id(ns));
-			spdk_json_write_named_string(w, "bdev_name",
-						     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
-			/* NOTE: "name" is kept for compatibility only - new code should use bdev_name. */
-			spdk_json_write_named_string(w, "name",
-						     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
+			if (bdev_name != NULL) {
+				spdk_json_write_named_string(w, "bdev_name", bdev_name);
+				/* NOTE: "name" is kept for compatibility only - new code should use bdev_name. */
+				spdk_json_write_named_string(w, "name", bdev_name);
+			} else {
+				spdk_json_write_named_null(w, "bdev_name");
+				/* NOTE: "name" is kept for compatibility only - new code should use bdev_name. */
+				spdk_json_write_named_null(w, "name");
+			}
 
 			if (!spdk_mem_all_zero(ns_opts.nguid, sizeof(ns_opts.nguid))) {
 				spdk_json_write_name(w, "nguid");
