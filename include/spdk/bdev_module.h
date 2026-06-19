@@ -588,6 +588,11 @@ struct spdk_bdev {
 	bool zoned;
 
 	/**
+	 * Specify whether bdev supports SLM (Subsystem Local Memory) semantics.
+	 */
+	bool slm;
+
+	/**
 	 * Default size of each zone (in blocks).
 	 */
 	uint64_t zone_size;

@@ -44,6 +44,7 @@
 	spdk_bdev_is_md_interleaved;
 	spdk_bdev_is_md_separate;
 	spdk_bdev_is_zoned;
+	spdk_bdev_is_slm;
 	spdk_bdev_get_data_block_size;
 	spdk_bdev_get_physical_block_size;
 	spdk_bdev_get_preferred_write_alignment;
@@ -134,6 +135,27 @@
 	spdk_bdev_get_nvme_nsid;
 	spdk_bdev_get_io_type_name;
 	spdk_bdev_get_io_type;
+	bdev_slm_create;
+	bdev_slm_delete;
+	bdev_slm_get_buffer_ptr;
+	bdev_slm_get_buffer_ptr_by_bdev;
+	bdev_slm_lease_acquire_by_bdev;
+	bdev_slm_lease_release;
+	bdev_slm_exec_publish_lease;
+	bdev_slm_exec_discard_lease;
+	bdev_slm_read_by_bdev;
+	bdev_slm_exec_read_by_bdev;
+	bdev_slm_write_by_bdev;
+	bdev_slm_copy_by_bdev;
+	bdev_slm_exec_write_by_bdev;
+	bdev_vslm_create;
+	bdev_vslm_delete;
+	bdev_vslm_set_nsid;
+	bdev_vslm_get_buffer_ptr_by_nsid;
+	bdev_vslm_lease_acquire;
+	bdev_vslm_lease_release;
+	bdev_vslm_set_fdp_mode;
+	bdev_vslm_get_stats;
 
 	# Public functions in bdev_module.h
 	spdk_bdev_register;

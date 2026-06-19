@@ -930,6 +930,14 @@ bool spdk_bdev_is_md_separate(const struct spdk_bdev *bdev);
 bool spdk_bdev_is_zoned(const struct spdk_bdev *bdev);
 
 /**
+ * Checks if bdev supports stream local memory semantics.
+ *
+ * \param bdev Block device to query.
+ * \return true if device supports stream local memory semantics.
+ */
+bool spdk_bdev_is_slm(const struct spdk_bdev *bdev);
+
+/**
  * Get block device data block size.
  *
  * Data block size is equal to block size if there is no metadata or
