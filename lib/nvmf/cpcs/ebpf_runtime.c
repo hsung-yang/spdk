@@ -36,6 +36,36 @@ struct cpcs_ebpf_wait_ctx {
 	int status;
 };
 
+/*
+ * Sanitized guest-ABI view of the execution context.
+ *
+ * Only scalar parameters the program legitimately needs are exposed in
+ * guest-readable VM memory.  Host pointers and lease identifiers from
+ * struct cpcs_exec_context are deliberately NOT placed here, to avoid
+ * leaking host addresses (ASLR defeat) into the sandbox.
+ */
+struct cpcs_ebpf_guest_ctx {
+	uint64_t cparam1;
+	uint64_t cparam2;
+	uint32_t data_len;
+	uint32_t resolved_range_count;
+};
+
+/*
+ * Per-execution scope made reachable from the registered helpers.
+ *
+ * uBPF helpers do not receive the host execution context directly, so the
+ * runtime stashes the real context plus the VM memory base/length here for
+ * the duration of a single (synchronous) program invocation.  Guest-supplied
+ * register values (buf_ptr / msg_ptr) are treated as OFFSETS into
+ * [mem_base, mem_base + mem_len) and validated before any host access.
+ */
+struct cpcs_ebpf_exec_scope {
+	struct cpcs_exec_context *exec_ctx;
+	uint8_t                  *mem_base;
+	size_t                    mem_len;
+};
+
 struct cpcs_ebpf_execute_async_ctx {
 	struct cpcs_program *prog;
 	struct cpcs_exec_context *exec_ctx;
@@ -70,6 +100,40 @@ ebpf_slm_wait(struct cpcs_ebpf_wait_ctx *wait)
 	}
 
 	return wait->status;
+}
+
+/*
+ * Active execution scope for the currently running program.
+ *
+ * The uBPF interpreter/JIT invokes registered helpers synchronously and
+ * nested within ubpf_exec()/the JIT function on the same thread, so a
+ * thread-local pointer set immediately before execution and cleared
+ * immediately after is sufficient and race-free.
+ */
+static __thread struct cpcs_ebpf_exec_scope *g_ebpf_active_scope;
+
+/**
+ * Translate a guest-supplied offset into a validated host pointer inside the
+ * sandbox VM memory region.
+ *
+ * buf_off is an OFFSET into [0, mem_len); the access [buf_off, buf_off + len)
+ * must lie fully within the VM memory.  Returns NULL on any out-of-bounds or
+ * overflowing request so callers reject the operation.
+ */
+static void *
+ebpf_guest_buf(struct cpcs_ebpf_exec_scope *scope, uint64_t buf_off, uint64_t len)
+{
+	if (scope == NULL || scope->mem_base == NULL) {
+		return NULL;
+	}
+	if (buf_off > scope->mem_len) {
+		return NULL;
+	}
+	/* Overflow-safe bounds check: buf_off <= mem_len already guaranteed. */
+	if (len > scope->mem_len - buf_off) {
+		return NULL;
+	}
+	return scope->mem_base + buf_off;
 }
 
 /*
@@ -125,20 +189,38 @@ static uint64_t
 helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 		uint64_t len, uint64_t buf_ptr)
 {
-	struct cpcs_exec_context *exec_ctx = ctx;
+	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
+	struct cpcs_exec_context *exec_ctx;
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
 	struct cpcs_ebpf_wait_ctx wait = {};
+	void *dst;
+	uint32_t data_len;
 	int rc;
 
+	(void)ctx; /* Guest-supplied; never trusted as a host pointer. */
+
+	if (scope == NULL || scope->exec_ctx == NULL) {
+		return (uint64_t) -1;
+	}
+	exec_ctx = scope->exec_ctx;
+
+	/* buf_ptr is an offset into the sandbox VM memory, never a host pointer. */
+	dst = ebpf_guest_buf(scope, buf_ptr, len);
+	if (dst == NULL) {
+		SPDK_ERRLOG("SLM read dst out of sandbox: buf_off=%lu len=%lu\n", buf_ptr, len);
+		return (uint64_t) -1;
+	}
+
 	if (mr_id == 0) {
-		/* Read from input data buffer */
-		if (offset + len > exec_ctx->data_len) {
+		/* Read from input data buffer (overflow-safe bounds check) */
+		data_len = exec_ctx->data_len;
+		if (exec_ctx->data_buffer == NULL || len > data_len || offset > data_len - len) {
 			SPDK_ERRLOG("SLM read out of bounds: offset=%lu len=%lu data_len=%u\n",
-				    offset, len, exec_ctx->data_len);
+				    offset, len, data_len);
 			return (uint64_t) -1;
 		}
-		memcpy((void *)buf_ptr, (uint8_t *)exec_ctx->data_buffer + offset, len);
+		memcpy(dst, (uint8_t *)exec_ctx->data_buffer + offset, len);
 		return 0;
 	}
 
@@ -149,7 +231,7 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 		return (uint64_t) -1;
 	}
 
-	rc = bdev_slm_exec_read_by_bdev_async(bdev, absolute_offset, len, (void *)buf_ptr,
+	rc = bdev_slm_exec_read_by_bdev_async(bdev, absolute_offset, len, dst,
 					      ebpf_slm_wait_done, &wait);
 	if (rc == 0) {
 		rc = ebpf_slm_wait(&wait);
@@ -172,15 +254,31 @@ static uint64_t
 helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 		 uint64_t len, uint64_t buf_ptr)
 {
-	struct cpcs_exec_context *exec_ctx = ctx;
+	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
+	struct cpcs_exec_context *exec_ctx;
 	struct spdk_bdev *bdev;
 	uint64_t absolute_offset;
 	struct cpcs_ebpf_wait_ctx wait = {};
+	void *src;
 	int rc;
+
+	(void)ctx; /* Guest-supplied; never trusted as a host pointer. */
+
+	if (scope == NULL || scope->exec_ctx == NULL) {
+		return (uint64_t) -1;
+	}
+	exec_ctx = scope->exec_ctx;
 
 	if (mr_id == 0) {
 		/* Cannot write to input data buffer */
 		SPDK_ERRLOG("Cannot write to input data buffer (mr_id=0)\n");
+		return (uint64_t) -1;
+	}
+
+	/* buf_ptr is an offset into the sandbox VM memory, never a host pointer. */
+	src = ebpf_guest_buf(scope, buf_ptr, len);
+	if (src == NULL) {
+		SPDK_ERRLOG("SLM write src out of sandbox: buf_off=%lu len=%lu\n", buf_ptr, len);
 		return (uint64_t) -1;
 	}
 
@@ -191,7 +289,7 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 		return (uint64_t) -1;
 	}
 
-	rc = bdev_slm_exec_write_by_bdev_async(bdev, absolute_offset, len, (void *)buf_ptr,
+	rc = bdev_slm_exec_write_by_bdev_async(bdev, absolute_offset, len, src,
 					       ebpf_slm_wait_done, &wait);
 	if (rc == 0) {
 		rc = ebpf_slm_wait(&wait);
@@ -214,7 +312,15 @@ static uint64_t
 helper_get_param(void *ctx, uint64_t param_id, uint64_t unused1,
 		 uint64_t unused2, uint64_t unused3)
 {
-	struct cpcs_exec_context *exec_ctx = ctx;
+	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
+	struct cpcs_exec_context *exec_ctx;
+
+	(void)ctx; /* Guest-supplied; never trusted as a host pointer. */
+
+	if (scope == NULL || scope->exec_ctx == NULL) {
+		return 0;
+	}
+	exec_ctx = scope->exec_ctx;
 
 	switch (param_id) {
 	case 1:
@@ -236,10 +342,22 @@ static uint64_t
 helper_log(void *ctx, uint64_t level, uint64_t msg_ptr,
 	   uint64_t msg_len, uint64_t unused)
 {
+	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
 	char msg[256];
 	size_t copy_len = msg_len < sizeof(msg) - 1 ? msg_len : sizeof(msg) - 1;
+	void *src;
 
-	memcpy(msg, (void *)msg_ptr, copy_len);
+	(void)ctx;    /* Guest-supplied; never trusted as a host pointer. */
+	(void)unused;
+
+	/* msg_ptr is an offset into the sandbox VM memory, never a host pointer. */
+	src = ebpf_guest_buf(scope, msg_ptr, copy_len);
+	if (src == NULL) {
+		SPDK_ERRLOG("eBPF log msg out of sandbox: msg_off=%lu len=%lu\n", msg_ptr, msg_len);
+		return (uint64_t) -1;
+	}
+
+	memcpy(msg, src, copy_len);
 	msg[copy_len] = '\0';
 
 	switch (level) {
@@ -395,19 +513,40 @@ ebpf_execute_sync(struct cpcs_program *prog,
 	}
 
 #if UBPF_AVAILABLE
-	/* Allocate VM memory */
-	void *mem = malloc(ctx->mem_size);
+	struct cpcs_ebpf_guest_ctx guest_ctx;
+	struct cpcs_ebpf_exec_scope scope;
+
+	/* Allocate zeroed VM memory so no host heap contents leak to the guest. */
+	void *mem = calloc(1, ctx->mem_size);
 	if (!mem) {
 		SPDK_ERRLOG("Failed to allocate VM memory\n");
 		return -ENOMEM;
 	}
 
-	/* Copy execution context to VM memory (first part) */
-	size_t ctx_size = sizeof(*exec_ctx);
+	/*
+	 * Expose only a sanitized, scalar view of the execution context to the
+	 * sandbox.  Host pointers and lease ids from struct cpcs_exec_context are
+	 * never placed in guest-readable memory.
+	 */
+	guest_ctx.cparam1 = exec_ctx->cparam1;
+	guest_ctx.cparam2 = exec_ctx->cparam2;
+	guest_ctx.data_len = exec_ctx->data_len;
+	guest_ctx.resolved_range_count = exec_ctx->resolved_range_count;
+
+	size_t ctx_size = sizeof(guest_ctx);
 	if (ctx_size > ctx->mem_size) {
 		ctx_size = ctx->mem_size;
 	}
-	memcpy(mem, exec_ctx, ctx_size);
+	memcpy(mem, &guest_ctx, ctx_size);
+
+	/*
+	 * Publish the execution scope for the helpers (real context kept on the
+	 * host side only; guest sees offsets translated against [mem, mem_size)).
+	 */
+	scope.exec_ctx = exec_ctx;
+	scope.mem_base = mem;
+	scope.mem_len = ctx->mem_size;
+	g_ebpf_active_scope = &scope;
 
 	/* Execute program */
 	if (ctx->jit_enabled && ctx->jit_func) {
@@ -421,6 +560,7 @@ ebpf_execute_sync(struct cpcs_program *prog,
 		int exec_rc = ubpf_exec(ctx->vm, mem, ctx->mem_size, &ret);
 		if (exec_rc != 0) {
 			SPDK_ERRLOG("eBPF program %u interpreter execution failed\n", prog->pind);
+			g_ebpf_active_scope = NULL;
 			free(mem);
 			return -EIO;
 		}
@@ -428,6 +568,7 @@ ebpf_execute_sync(struct cpcs_program *prog,
 			      prog->pind, ret);
 	}
 
+	g_ebpf_active_scope = NULL;
 	free(mem);
 #else
 	/* Simulation mode - just return success */
@@ -466,15 +607,17 @@ ebpf_execute_async(struct cpcs_program *prog,
 		return -EINVAL;
 	}
 
+	/*
+	 * Never invoke done_cb synchronously from this "async" entry point: the
+	 * caller (cpcs_execute_run) sets runtime_pending before calling and may
+	 * own/free the exec context in the completion callback, so a synchronous
+	 * completion would risk use-after-free of that context.  Without an SPDK
+	 * thread there is no message loop to defer onto, so fail and let the
+	 * caller own completion (mirrors the builtin runtime's no-thread path).
+	 */
 	thread = spdk_get_thread();
 	if (thread == NULL) {
-		uint64_t return_value = 0;
-
-		rc = ebpf_execute_sync(prog, exec_ctx, &return_value);
-		if (rc == 0) {
-			done_cb(cb_arg, 0, return_value);
-		}
-		return rc;
+		return -SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 
 	ctx = calloc(1, sizeof(*ctx));
