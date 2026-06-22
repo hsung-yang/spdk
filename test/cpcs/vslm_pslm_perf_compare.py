@@ -819,7 +819,9 @@ def _apply_vslm_debug(rpc: RpcClient, bdev_name: str) -> None:
 
     Env knobs (unset = leave unchanged): VSLM_DEBUG_NUM_SHARDS (int),
     VSLM_DEBUG_ASYNC, VSLM_DEBUG_FAULT_BATCH, VSLM_DEBUG_PREFETCH_BATCH,
-    VSLM_DEBUG_BACKGROUND_CLEANER, VSLM_DEBUG_STREAMING (enable=1 / disable=0).
+    VSLM_DEBUG_BACKGROUND_CLEANER, VSLM_DEBUG_STREAMING,
+    VSLM_DEBUG_FORCE_DMA_FALLBACK, VSLM_DEBUG_DISABLE_COW_BYPASS
+    (enable=1 / disable=0).
     """
     import os
 
@@ -833,6 +835,8 @@ def _apply_vslm_debug(rpc: RpcClient, bdev_name: str) -> None:
         ("VSLM_DEBUG_PREFETCH_BATCH", "prefetch-batch"),
         ("VSLM_DEBUG_BACKGROUND_CLEANER", "background-cleaner"),
         ("VSLM_DEBUG_STREAMING", "streaming-mode"),
+        ("VSLM_DEBUG_FORCE_DMA_FALLBACK", "force-dma-fallback"),
+        ("VSLM_DEBUG_DISABLE_COW_BYPASS", "disable-cow-bypass"),
     ):
         val = os.environ.get(env_key)
         if not val:
