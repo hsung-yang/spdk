@@ -48,10 +48,13 @@ vbdev_slm_sync_is_disallowed(const char *op_name)
 		return false;
 	}
 
-	if (!g_sync_block_warned) {
+	/*
+	 * Set-and-test atomically so the warning is logged at most once and the
+	 * flag has no benign data race across threads.
+	 */
+	if (!__atomic_exchange_n(&g_sync_block_warned, true, __ATOMIC_RELAXED)) {
 		SPDK_WARNLOG("SLM sync API '%s' is disallowed on SPDK thread; use async API\n",
 			     op_name);
-		g_sync_block_warned = true;
 	}
 
 	return true;

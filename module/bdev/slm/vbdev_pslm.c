@@ -30,6 +30,13 @@ SPDK_BDEV_MODULE_REGISTER(slm, &slm_if)
 
 static TAILQ_HEAD(, spdk_bdev_slm) g_slm_bdevs =
 	TAILQ_HEAD_INITIALIZER(g_slm_bdevs);
+/*
+ * g_slm_bdevs_lock guards every insert/remove/traverse of g_slm_bdevs.
+ * It is the outermost lock: the per-bdev slm->lease_lock is always taken
+ * INSIDE this lock (never the reverse) to keep a single ABBA-free ordering
+ * across poll-group and RPC threads.
+ */
+static pthread_mutex_t g_slm_bdevs_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_slm_io_device_registered;
 
 /* I/O channel for SLM bdev */
@@ -61,16 +68,22 @@ pslm_async_complete_msg(void *arg)
 	free(ctx);
 }
 
+/*
+ * Reserve the deferred-completion context BEFORE the caller mutates SLM state,
+ * so a ctx-alloc failure can be reported without leaving a half-applied write.
+ * On a non-SPDK thread there is no deferral; *ctx_out is left NULL and the
+ * caller must complete inline via pslm_send_async_ctx().
+ * Returns 0 on success (resource reserved or inline), negative errno on failure.
+ */
 static int
-pslm_complete_async(spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg, int status)
+pslm_alloc_async_ctx(spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg,
+		     struct pslm_async_complete_ctx **ctx_out)
 {
 	struct pslm_async_complete_ctx *ctx;
-	struct spdk_thread *thread;
-	int rc;
 
-	thread = spdk_get_thread();
-	if (thread == NULL) {
-		cb_fn(cb_arg, status);
+	*ctx_out = NULL;
+
+	if (spdk_get_thread() == NULL) {
 		return 0;
 	}
 
@@ -81,6 +94,27 @@ pslm_complete_async(spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg, int stat
 
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+	*ctx_out = ctx;
+	return 0;
+}
+
+/*
+ * Complete using a context reserved by pslm_alloc_async_ctx(). When ctx is NULL
+ * (non-SPDK thread) the completion is invoked inline.
+ */
+static int
+pslm_send_async_ctx(struct pslm_async_complete_ctx *ctx,
+		    spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg, int status)
+{
+	struct spdk_thread *thread;
+	int rc;
+
+	if (ctx == NULL) {
+		cb_fn(cb_arg, status);
+		return 0;
+	}
+
+	thread = spdk_get_thread();
 	ctx->status = status;
 	rc = spdk_thread_send_msg(thread, pslm_async_complete_msg, ctx);
 	if (rc != 0) {
@@ -89,6 +123,20 @@ pslm_complete_async(spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg, int stat
 	}
 
 	return 0;
+}
+
+static int
+pslm_complete_async(spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg, int status)
+{
+	struct pslm_async_complete_ctx *ctx;
+	int rc;
+
+	rc = pslm_alloc_async_ctx(cb_fn, cb_arg, &ctx);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return pslm_send_async_ctx(ctx, cb_fn, cb_arg, status);
 }
 
 static int
@@ -132,7 +180,9 @@ vbdev_pslm_destruct(void *ctx)
 	struct spdk_bdev_slm *slm = ctx;
 	struct pslm_lease *lease, *tmp;
 
+	pthread_mutex_lock(&g_slm_bdevs_lock);
 	TAILQ_REMOVE(&g_slm_bdevs, slm, link);
+	pthread_mutex_unlock(&g_slm_bdevs_lock);
 
 	pthread_mutex_lock(&slm->lease_lock);
 	TAILQ_FOREACH_SAFE(lease, &slm->leases, link, tmp) {
@@ -214,6 +264,15 @@ vbdev_pslm_nvme_memory_write(struct spdk_bdev_slm *slm, uint64_t starting_byte, 
 }
 
 
+/*
+ * The host-facing NVMe MEMORY_READ/WRITE/FILL data path below touches
+ * slm->buffer directly and intentionally takes NO lease/concurrency guard.
+ * pSLM provides NO host/exec isolation: it does not check whether the
+ * referenced range is currently leased by an executing program. CPCS is
+ * responsible for not issuing host NVMe memory ops against ranges that are
+ * leased to an in-flight execution; pSLM trusts the caller to serialize
+ * host and execute access to overlapping ranges.
+ */
 static void
 vbdev_pslm_submit_nvme_passthru(struct spdk_bdev_slm *slm, struct spdk_bdev_io *bdev_io)
 {
@@ -376,7 +435,7 @@ bdev_slm_create(const char *name, uint32_t nsid,
 		uint64_t size_mb, uint32_t granularity)
 {
 	struct spdk_bdev_slm *slm;
-	uint64_t size_bytes = size_mb * 1024 * 1024;
+	uint64_t size_bytes;
 	int rc;
 
 	if (!name || size_mb == 0 || granularity == 0) {
@@ -386,6 +445,21 @@ bdev_slm_create(const char *name, uint32_t nsid,
 
 	if (granularity % 4 != 0) {
 		SPDK_ERRLOG("Granularity must be dword-aligned per SLM spec\n");
+		return -EINVAL;
+	}
+
+	/* Reject size_mb that would overflow the MiB->bytes conversion. */
+	if (size_mb > UINT64_MAX / (1024 * 1024)) {
+		SPDK_ERRLOG("size_mb %" PRIu64 " too large\n", size_mb);
+		return -EINVAL;
+	}
+
+	size_bytes = size_mb * 1024 * 1024;
+
+	/* Reject sizes too small to hold even one block at this granularity. */
+	if (size_bytes / granularity == 0) {
+		SPDK_ERRLOG("size_mb %" PRIu64 " is below one block of granularity %u\n",
+			    size_mb, granularity);
 		return -EINVAL;
 	}
 
@@ -437,7 +511,9 @@ bdev_slm_create(const char *name, uint32_t nsid,
 		return rc;
 	}
 
+	pthread_mutex_lock(&g_slm_bdevs_lock);
 	TAILQ_INSERT_TAIL(&g_slm_bdevs, slm, link);
+	pthread_mutex_unlock(&g_slm_bdevs_lock);
 
 	SPDK_NOTICELOG("Created SLM bdev '%s': %lu MiB, NSID=%u\n",
 		       name, size_mb, nsid);
@@ -450,12 +526,32 @@ bdev_slm_delete(const char *name,
 		spdk_bdev_unregister_cb cb_fn, void *cb_arg)
 {
 	struct spdk_bdev_slm *slm;
+	struct spdk_bdev *found = NULL;
 
+	if (name == NULL) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -EINVAL);
+		}
+		return;
+	}
+
+	pthread_mutex_lock(&g_slm_bdevs_lock);
 	TAILQ_FOREACH(slm, &g_slm_bdevs, link) {
 		if (strcmp(slm->bdev.name, name) == 0) {
-			spdk_bdev_unregister(&slm->bdev, cb_fn, cb_arg);
-			return;
+			found = &slm->bdev;
+			break;
 		}
+	}
+	pthread_mutex_unlock(&g_slm_bdevs_lock);
+
+	/*
+	 * Drop the global lock before unregistering. spdk_bdev_unregister()
+	 * completes the destruct (which takes g_slm_bdevs_lock) asynchronously
+	 * and re-validates the bdev status, so it is safe to release here.
+	 */
+	if (found != NULL) {
+		spdk_bdev_unregister(found, cb_fn, cb_arg);
+		return;
 	}
 
 	if (cb_fn) {
@@ -473,15 +569,19 @@ bdev_slm_get_buffer_ptr(const char *name, uint64_t offset,
 		return -EINVAL;
 	}
 
+	pthread_mutex_lock(&g_slm_bdevs_lock);
 	TAILQ_FOREACH(slm, &g_slm_bdevs, link) {
 		if (strcmp(slm->bdev.name, name) == 0) {
-			if (offset + length > slm->buffer_size) {
+			if (offset > slm->buffer_size || length > slm->buffer_size - offset) {
+				pthread_mutex_unlock(&g_slm_bdevs_lock);
 				return -EINVAL;
 			}
 			*ptr = (uint8_t *)slm->buffer + offset;
+			pthread_mutex_unlock(&g_slm_bdevs_lock);
 			return 0;
 		}
 	}
+	pthread_mutex_unlock(&g_slm_bdevs_lock);
 
 	return -ENOENT;
 }
@@ -574,6 +674,7 @@ vbdev_pslm_mem_read_by_bdev_async(struct spdk_bdev *bdev, uint64_t offset, uint6
 				  void *buf, spdk_bdev_slm_io_completion_cb cb_fn, void *cb_arg)
 {
 	struct spdk_bdev_slm *slm;
+	struct pslm_async_complete_ctx *ctx;
 	int rc;
 
 	if (cb_fn == NULL || (length != 0 && buf == NULL)) {
@@ -589,10 +690,20 @@ vbdev_pslm_mem_read_by_bdev_async(struct spdk_bdev *bdev, uint64_t offset, uint6
 		return pslm_complete_async(cb_fn, cb_arg, 0);
 	}
 
+	/*
+	 * Reserve the completion context before copying into the caller buffer so
+	 * that a ctx-alloc failure cannot leave a partially-filled buffer while
+	 * the caller is told the operation failed.
+	 */
+	rc = pslm_alloc_async_ctx(cb_fn, cb_arg, &ctx);
+	if (rc != 0) {
+		return rc;
+	}
+
 	memcpy(buf, (uint8_t *)slm->buffer + offset, length);
 	SPDK_DEBUGLOG(pslm, "pSLM mem_read nsid=%u off=%" PRIu64 " len=%" PRIu64 "\n",
 		      bdev->nsid, offset, length);
-	return pslm_complete_async(cb_fn, cb_arg, 0);
+	return pslm_send_async_ctx(ctx, cb_fn, cb_arg, 0);
 }
 
 static int
@@ -622,6 +733,7 @@ vbdev_pslm_mem_write_by_bdev_async(struct spdk_bdev *bdev, uint64_t offset, uint
 				   void *cb_arg)
 {
 	struct spdk_bdev_slm *slm;
+	struct pslm_async_complete_ctx *ctx;
 	int rc;
 
 	if (cb_fn == NULL || (length != 0 && buf == NULL)) {
@@ -637,10 +749,20 @@ vbdev_pslm_mem_write_by_bdev_async(struct spdk_bdev *bdev, uint64_t offset, uint
 		return pslm_complete_async(cb_fn, cb_arg, 0);
 	}
 
+	/*
+	 * Reserve the completion context before mutating slm->buffer so that a
+	 * ctx-alloc failure cannot leave the buffer in a partially-written state
+	 * while the caller is told the operation failed.
+	 */
+	rc = pslm_alloc_async_ctx(cb_fn, cb_arg, &ctx);
+	if (rc != 0) {
+		return rc;
+	}
+
 	memcpy((uint8_t *)slm->buffer + offset, buf, length);
 	SPDK_DEBUGLOG(pslm, "pSLM mem_write nsid=%u off=%" PRIu64 " len=%" PRIu64 "\n",
 		      bdev->nsid, offset, length);
-	return pslm_complete_async(cb_fn, cb_arg, 0);
+	return pslm_send_async_ctx(ctx, cb_fn, cb_arg, 0);
 }
 
 static int
@@ -750,6 +872,7 @@ vbdev_pslm_mem_lease_release(uint64_t lease_id)
 	}
 	SPDK_DEBUGLOG(pslm, "pSLM lease release req lease=%" PRIu64 "\n", lease_id);
 
+	pthread_mutex_lock(&g_slm_bdevs_lock);
 	TAILQ_FOREACH(slm, &g_slm_bdevs, link) {
 		pthread_mutex_lock(&slm->lease_lock);
 		TAILQ_FOREACH_SAFE(lease, &slm->leases, link, tmp) {
@@ -761,6 +884,7 @@ vbdev_pslm_mem_lease_release(uint64_t lease_id)
 		}
 		pthread_mutex_unlock(&slm->lease_lock);
 	}
+	pthread_mutex_unlock(&g_slm_bdevs_lock);
 	SPDK_DEBUGLOG(pslm, "pSLM lease release lease=%" PRIu64 " found=%d\n", lease_id, found);
 
 	return found ? 0 : -ENOENT;
@@ -777,11 +901,13 @@ vbdev_pslm_mem_exec_lease_op(uint64_t lease_id)
 	}
 	SPDK_DEBUGLOG(pslm, "pSLM exec lease lookup lease=%" PRIu64 "\n", lease_id);
 
+	pthread_mutex_lock(&g_slm_bdevs_lock);
 	TAILQ_FOREACH(slm, &g_slm_bdevs, link) {
 		pthread_mutex_lock(&slm->lease_lock);
 		TAILQ_FOREACH(lease, &slm->leases, link) {
 			if (lease->lease_id == lease_id) {
 				pthread_mutex_unlock(&slm->lease_lock);
+				pthread_mutex_unlock(&g_slm_bdevs_lock);
 				SPDK_DEBUGLOG(pslm, "pSLM exec lease lookup hit lease=%" PRIu64
 					      " nsid=%u\n", lease_id, slm->bdev.nsid);
 				return 0;
@@ -789,6 +915,7 @@ vbdev_pslm_mem_exec_lease_op(uint64_t lease_id)
 		}
 		pthread_mutex_unlock(&slm->lease_lock);
 	}
+	pthread_mutex_unlock(&g_slm_bdevs_lock);
 	SPDK_DEBUGLOG(pslm, "pSLM exec lease lookup miss lease=%" PRIu64 "\n", lease_id);
 
 	return -ENOENT;
