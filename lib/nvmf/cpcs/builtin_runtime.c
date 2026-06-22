@@ -1169,7 +1169,7 @@ _cpcs_builtin_kv_parse_request(const struct cpcs_exec_context *ctx, uint16_t pin
 	uint32_t version;
 	uint32_t op;
 	uint64_t shape_bytes;
-	uint64_t required;
+	uint64_t remaining;
 	uint32_t expected_op;
 	const uint8_t *cursor;
 	uint32_t rank;
@@ -1202,13 +1202,29 @@ _cpcs_builtin_kv_parse_request(const struct cpcs_exec_context *ctx, uint16_t pin
 	shape_bytes = (uint64_t)rank * sizeof(uint64_t);
 	dtype_len = from_le32(&hdr.dtype_len);
 	extra_len = from_le32(&hdr.extra_len);
-	required = sizeof(hdr) + shape_bytes + (uint64_t)dtype_len +
-		   (uint64_t)extra_len + payload_len;
-	if (required > ctx->data_len) {
+
+	/*
+	 * payload_len is fully host-controlled and shape_bytes can be as large
+	 * as UINT32_MAX * 8, so a single additive "required" expression can wrap
+	 * uint64 and slip past the bounds check. Validate each variable-length
+	 * section by subtracting it from the bytes remaining after the header;
+	 * ctx->data_len is uint32_t so remaining never overflows.
+	 */
+	remaining = (uint64_t)ctx->data_len - sizeof(hdr);
+	if (shape_bytes > remaining) {
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
 	}
-	if (required < sizeof(hdr) || required < shape_bytes) {
-		return -SPDK_NVME_SC_INVALID_FIELD;
+	remaining -= shape_bytes;
+	if ((uint64_t)dtype_len > remaining) {
+		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
+	}
+	remaining -= dtype_len;
+	if ((uint64_t)extra_len > remaining) {
+		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
+	}
+	remaining -= extra_len;
+	if (payload_len > remaining) {
+		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
 	}
 
 	cursor = (const uint8_t *)ctx->data_buffer + sizeof(hdr);
@@ -2083,16 +2099,20 @@ _cpcs_builtin_kv_prepare_result(const struct cpcs_exec_context *ctx, uint16_t pi
 	}
 
 	if (kv_ctx->target.mr_id != 0 && result_buf != NULL) {
-		uint64_t write_len = result_len;
-
-		if (kv_ctx->target.len != 0) {
-			write_len = spdk_min(write_len, (uint64_t)kv_ctx->target.len);
-		}
-		if (write_len > UINT32_MAX) {
+		/*
+		 * When the caller bounds the output via target.len, the full
+		 * result must fit. Silently writing a prefix and reporting OK
+		 * (with a CRC computed over the truncated buffer) would
+		 * misreport the result, so reject instead of truncating.
+		 */
+		if (kv_ctx->target.len != 0 && result_len > (uint64_t)kv_ctx->target.len) {
 			free(owned_buf);
 			return -SPDK_NVME_SC_INVALID_FIELD;
 		}
-		result_len = write_len;
+		if (result_len > UINT32_MAX) {
+			free(owned_buf);
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
 	}
 
 	if (result_value == 0 && view.op != CPCS_BUILTIN_KV_OP_PREFIX_LOOKUP &&
@@ -3142,22 +3162,17 @@ builtin_async_step(struct cpcs_builtin_async_exec_ctx *ctx)
 				if (unpin_src_rc != 0) {
 					return cpcs_builtin_map_slm_status(unpin_src_rc);
 				}
-				if (dst_pin_rc != -ENOTSUP && dst_pin_rc != -EAGAIN) {
+				if (dst_pin_rc != -ENOTSUP && dst_pin_rc != -EAGAIN &&
+				    dst_pin_rc != -ENOSPC) {
 					return cpcs_builtin_map_slm_status(dst_pin_rc);
 				}
 				fallback_to_async_rw = true;
 			}
-		} else if (src_pin_rc != -ENOTSUP && src_pin_rc != -EAGAIN) {
+		} else if (src_pin_rc != -ENOTSUP && src_pin_rc != -EAGAIN &&
+			   src_pin_rc != -ENOSPC) {
 			return cpcs_builtin_map_slm_status(src_pin_rc);
 		} else {
 			fallback_to_async_rw = true;
-		}
-
-		if (fallback_to_async_rw) {
-			return _cpcs_exec_read_range_async(ctx->exec_ctx, ctx->src_mr_id,
-							   ctx->src_off + ctx->processed,
-							   ctx->chunk_len, ctx->buf,
-							   builtin_memcpy_read_done, ctx);
 		}
 
 		return _cpcs_exec_read_range_async(ctx->exec_ctx, ctx->src_mr_id,
@@ -3199,7 +3214,7 @@ builtin_async_step(struct cpcs_builtin_async_exec_ctx *ctx)
 			}
 			return cpcs_builtin_map_slm_status(unpin_rc);
 		}
-		if (pin_rc != -ENOTSUP && pin_rc != -EAGAIN) {
+		if (pin_rc != -ENOTSUP && pin_rc != -EAGAIN && pin_rc != -ENOSPC) {
 			return cpcs_builtin_map_slm_status(pin_rc);
 		}
 
@@ -3248,7 +3263,7 @@ builtin_async_step(struct cpcs_builtin_async_exec_ctx *ctx)
 			}
 			return cpcs_builtin_map_slm_status(unpin_rc);
 		}
-		if (pin_rc != -ENOTSUP && pin_rc != -EAGAIN) {
+		if (pin_rc != -ENOTSUP && pin_rc != -EAGAIN && pin_rc != -ENOSPC) {
 			return cpcs_builtin_map_slm_status(pin_rc);
 		}
 
