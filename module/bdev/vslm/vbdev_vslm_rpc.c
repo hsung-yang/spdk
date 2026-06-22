@@ -634,7 +634,8 @@ rpc_bdev_vslm_get_stats(struct spdk_jsonrpc_request *request,
 				     stats.vslm_host_write_conflict_total);
 	spdk_json_write_named_uint64(w, "vslm_host_write_blocked_total",
 				     stats.vslm_host_write_blocked_total);
-	spdk_json_write_named_uint64(w, "vslm_host_write_blocked_ns_total", stats.lease_blocked_ns);
+	spdk_json_write_named_uint64(w, "vslm_host_write_blocked_ns_total",
+				     stats.vslm_host_write_blocked_ns_total);
 	spdk_json_write_named_uint64(w, "vslm_host_write_nonconflict_total",
 				     stats.vslm_host_write_nonconflict_total);
 	spdk_json_write_named_uint64(w, "vslm_publish_total", stats.vslm_publish_total);

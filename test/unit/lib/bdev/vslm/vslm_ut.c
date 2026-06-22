@@ -62,10 +62,8 @@ DEFINE_STUB(vbdev_slm_register_ops, int, (const struct spdk_vbdev_slm_ops *ops),
 DEFINE_STUB_V(vbdev_slm_unregister_ops, (const struct spdk_vbdev_slm_ops *ops));
 DEFINE_STUB_V(spdk_bdev_io_complete_nvme_status, (struct spdk_bdev_io *bdev_io,
 		uint32_t cdw0, int sct, int sc));
-DEFINE_STUB_V(spdk_copy_buf_to_iovs, (struct iovec *iovs, int iovcnt,
-				      void *buf, size_t buf_len));
-DEFINE_STUB_V(spdk_copy_iovs_to_buf, (void *buf, size_t buf_len,
-				      struct iovec *iovs, int iovcnt));
+/* spdk_copy_iovs_to_buf / spdk_copy_buf_to_iovs are now provided by the real
+ * libspdk_util iov.o (pulled in for spdk_iov_xfer_*); no stub needed. */
 DEFINE_STUB_V(spdk_io_device_register, (void *io_device, spdk_io_channel_create_cb create_cb,
 					spdk_io_channel_destroy_cb destroy_cb, uint32_t ctx_size, const char *name));
 DEFINE_STUB_V(spdk_io_device_unregister, (void *io_device,

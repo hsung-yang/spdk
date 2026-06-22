@@ -252,6 +252,7 @@ struct spdk_bdev_vslm_stats {
 	uint64_t dirty_writeback_bytes;
 	uint64_t lease_conflicts;
 	uint64_t lease_blocked_ns;
+	uint64_t vslm_host_write_blocked_ns_total;
 	uint64_t admission_rejects;
 	uint64_t vslm_lease_create_total;
 	uint64_t vslm_lease_release_total;

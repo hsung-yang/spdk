@@ -37,6 +37,15 @@ static bool vbdev_vslm_io_type_supported(void *ctx, enum spdk_bdev_io_type io_ty
 
 static TAILQ_HEAD(, vbdev_vslm) g_vslm_bdevs = TAILQ_HEAD_INITIALIZER(g_vslm_bdevs);
 
+/*
+ * Guards every insert/remove/traverse of g_vslm_bdevs. The list is mutated by
+ * create/delete on the management thread and walked by NSID/name lookups,
+ * including CPCS lease ops invoked from I/O threads. The lock is only ever held
+ * for the duration of a list walk (releasing before any per-bdev shard/lease
+ * lock is taken), so it never participates in lock-ordering with those locks.
+ */
+static pthread_mutex_t g_vslm_bdevs_lock = PTHREAD_MUTEX_INITIALIZER;
+
 enum vslm_page_location {
 	VSLM_PAGE_LOC_NONE = 0,
 	VSLM_PAGE_LOC_FREE,
@@ -487,6 +496,30 @@ vslm_ticks_delta_to_ns(uint64_t start_ticks, uint64_t end_ticks)
 	return ((end_ticks - start_ticks) * SPDK_SEC_TO_NSEC) / hz;
 }
 
+/*
+ * memcpy on the page-copy hot path, recording the memcpy latency only when
+ * trace/telemetry is enabled. Each timed copy otherwise costs two extra
+ * spdk_get_ticks()/spdk_get_ticks_hz() reads and a 64-bit divide per chunk.
+ */
+static inline void
+vslm_timed_memcpy(struct vbdev_vslm *vslm, void *dst, const void *src, size_t len)
+{
+	uint64_t memcpy_start_ticks;
+	uint64_t memcpy_ns;
+
+	if (vslm->trace_events_enabled) {
+		memcpy_start_ticks = spdk_get_ticks();
+		memcpy(dst, src, len);
+		memcpy_ns = vslm_ticks_delta_to_ns(memcpy_start_ticks, spdk_get_ticks());
+		VSLM_PERF_ADD(vslm, memcpy_ns_total, memcpy_ns);
+		vslm_perf_max_u64(&vslm->perf_stats.memcpy_ns_max, memcpy_ns);
+	} else {
+		memcpy(dst, src, len);
+	}
+	VSLM_PERF_INC(vslm, memcpy_total);
+	VSLM_PERF_ADD(vslm, memcpy_bytes_total, len);
+}
+
 static bool
 vslm_try_get_io_ref(struct vbdev_vslm *vslm)
 {
@@ -527,14 +560,82 @@ static struct vbdev_vslm *
 vbdev_vslm_get_by_nsid(uint32_t nsid)
 {
 	struct vbdev_vslm *vslm;
+	struct vbdev_vslm *found = NULL;
 
+	pthread_mutex_lock(&g_vslm_bdevs_lock);
 	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
 		if (vslm->vbdev.nsid == nsid) {
-			return vslm;
+			found = vslm;
+			break;
 		}
 	}
+	pthread_mutex_unlock(&g_vslm_bdevs_lock);
 
-	return NULL;
+	return found;
+}
+
+/* Look up a vSLM bdev by name under g_vslm_bdevs_lock (released before return). */
+static struct vbdev_vslm *
+vbdev_vslm_get_by_name(const char *name)
+{
+	struct vbdev_vslm *vslm;
+	struct vbdev_vslm *found = NULL;
+
+	if (name == NULL) {
+		return NULL;
+	}
+
+	pthread_mutex_lock(&g_vslm_bdevs_lock);
+	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
+		if (strcmp(vslm->vbdev.name, name) == 0) {
+			found = vslm;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_vslm_bdevs_lock);
+
+	return found;
+}
+
+/*
+ * Snapshot the current set of vSLM bdev pointers into a freshly allocated array
+ * under g_vslm_bdevs_lock. Callers that must iterate every bdev while taking
+ * per-bdev locks (which cannot be nested under the global list lock) walk the
+ * snapshot instead of the live list, so a concurrent create/delete cannot
+ * corrupt the traversal. Returns the count via *count_out; the caller frees the
+ * returned array. Returns NULL with *count_out == 0 when the list is empty or on
+ * allocation failure (treated as "no bdevs" by the callers).
+ */
+static struct vbdev_vslm **
+vbdev_vslm_snapshot_bdevs(size_t *count_out)
+{
+	struct vbdev_vslm *vslm;
+	struct vbdev_vslm **arr = NULL;
+	size_t count = 0;
+	size_t i = 0;
+
+	*count_out = 0;
+
+	pthread_mutex_lock(&g_vslm_bdevs_lock);
+	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
+		count++;
+	}
+	if (count == 0) {
+		pthread_mutex_unlock(&g_vslm_bdevs_lock);
+		return NULL;
+	}
+	arr = calloc(count, sizeof(*arr));
+	if (arr == NULL) {
+		pthread_mutex_unlock(&g_vslm_bdevs_lock);
+		return NULL;
+	}
+	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
+		arr[i++] = vslm;
+	}
+	pthread_mutex_unlock(&g_vslm_bdevs_lock);
+
+	*count_out = count;
+	return arr;
 }
 
 static struct vbdev_vslm *
@@ -1011,6 +1112,18 @@ vslm_page_mark_dirty(struct vbdev_vslm *vslm, struct vslm_page *page)
 		return;
 	}
 
+	/*
+	 * Fast path for a re-dirty of an already-private page that is already
+	 * publishing: the state, private_authoritative flag, and pending_publish are
+	 * all already maximal and mark_dirty never downgrades them, so re-running the
+	 * full path (lease_lock scan + source invalidate + trace) would be a no-op.
+	 */
+	if (lpage->state == SPDK_BDEV_VSLM_LPAGE_PRIVATE_DIRTY_RESIDENT &&
+	    lpage->private_authoritative && lpage->pending_publish) {
+		page->dirty = true;
+		return;
+	}
+
 	has_active_lease = vslm_vpn_has_active_lease(vslm, page->vpn);
 	old_state = lpage->state;
 	if (old_state == SPDK_BDEV_VSLM_LPAGE_CLEAN_ALIAS ||
@@ -1373,6 +1486,12 @@ vslm_process_blocked_cmds(struct vbdev_vslm *vslm)
 			blocked_ns = ((now_ticks - blocked->queued_ticks) * SPDK_SEC_TO_NSEC) / hz;
 			__atomic_add_fetch(&vslm->stats.lease_blocked_ns,
 					   blocked_ns, __ATOMIC_RELAXED);
+			/*
+			 * Blocked commands are queued only by the host write/fill path
+			 * (vslm_queue_blocked_cmd), so this is the host-write-blocked time.
+			 */
+			__atomic_add_fetch(&vslm->stats.vslm_host_write_blocked_ns_total,
+					   blocked_ns, __ATOMIC_RELAXED);
 		}
 		io_ch = spdk_bdev_io_get_io_channel(blocked->bdev_io);
 		if (io_ch == NULL) {
@@ -1523,9 +1642,16 @@ vslm_mmu_unlock_measured(struct vbdev_vslm *vslm, struct vslm_mmu_shard *shard,
 {
 	uint64_t lock_hold_ns;
 
-	lock_hold_ns = vslm_ticks_delta_to_ns(lock_start_ticks, spdk_get_ticks());
-	VSLM_PERF_ADD(vslm, mmu_lock_hold_ns_total, lock_hold_ns);
-	vslm_perf_max_u64(&vslm->perf_stats.mmu_lock_hold_ns_max, lock_hold_ns);
+	/*
+	 * The two spdk_get_ticks()/spdk_get_ticks_hz() reads plus the 64-bit divide
+	 * needed to measure the hold time run on every shard-lock release. Only pay
+	 * for them when trace/telemetry is enabled.
+	 */
+	if (vslm->trace_events_enabled) {
+		lock_hold_ns = vslm_ticks_delta_to_ns(lock_start_ticks, spdk_get_ticks());
+		VSLM_PERF_ADD(vslm, mmu_lock_hold_ns_total, lock_hold_ns);
+		vslm_perf_max_u64(&vslm->perf_stats.mmu_lock_hold_ns_max, lock_hold_ns);
+	}
 	pthread_mutex_unlock(&shard->lock);
 }
 
@@ -2192,26 +2318,6 @@ struct vslm_sync_io_ctx {
 	int status;
 };
 
-struct vslm_sync_wait_ctx {
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	bool done;
-	int status;
-};
-
-struct vslm_async_io_submit_ctx {
-	struct vslm_sync_wait_ctx *wait;
-	struct vbdev_vslm *vslm;
-	struct spdk_bdev_desc *desc;
-	struct spdk_io_channel *ch;
-	void *buf;
-	uint64_t offset_blocks;
-	uint64_t num_blocks;
-	uint64_t bytes;
-	bool is_write;
-	bool tagged;
-};
-
 static void
 vslm_sync_io_completion_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -2222,164 +2328,14 @@ vslm_sync_io_completion_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_
 	ctx->done = true;
 }
 
-static void
-vslm_sync_wait_complete(struct vslm_sync_wait_ctx *wait, int status)
-{
-	pthread_mutex_lock(&wait->mutex);
-	wait->status = status;
-	wait->done = true;
-	pthread_cond_signal(&wait->cond);
-	pthread_mutex_unlock(&wait->mutex);
-}
-
-static void
-vslm_async_io_completion_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
-{
-	struct vslm_async_io_submit_ctx *ctx = cb_arg;
-
-	spdk_bdev_free_io(bdev_io);
-	spdk_put_io_channel(ctx->ch);
-
-	if (success && ctx->is_write && ctx->vslm != NULL) {
-		__atomic_add_fetch(&ctx->vslm->stats.backing_write_ops, 1, __ATOMIC_RELAXED);
-		__atomic_add_fetch(&ctx->vslm->stats.backing_write_bytes, ctx->bytes, __ATOMIC_RELAXED);
-		if (ctx->tagged) {
-			__atomic_add_fetch(&ctx->vslm->stats.backing_write_tagged_bytes, ctx->bytes, __ATOMIC_RELAXED);
-		} else {
-			__atomic_add_fetch(&ctx->vslm->stats.backing_write_untagged_bytes, ctx->bytes, __ATOMIC_RELAXED);
-		}
-	}
-
-	vslm_sync_wait_complete(ctx->wait, success ? 0 : -EIO);
-	free(ctx);
-}
-
-static void
-vslm_async_base_io_submit(void *arg)
-{
-	struct vslm_async_io_submit_ctx *ctx = arg;
-	struct spdk_bdev_ext_io_opts io_opts = {};
-	struct iovec iov = {};
-	bool submitted = false;
-	int rc = 0;
-
-	ctx->ch = spdk_bdev_get_io_channel(ctx->desc);
-	if (ctx->ch == NULL) {
-		vslm_sync_wait_complete(ctx->wait, -ENOMEM);
-		free(ctx);
-		return;
-	}
-
-	if (ctx->is_write && ctx->vslm->fdp_mode_enabled) {
-		iov.iov_base = ctx->buf;
-		iov.iov_len = ctx->bytes;
-		io_opts.size = sizeof(io_opts);
-		io_opts.nvme_cdw12.write.dtype = SPDK_NVME_DIRECTIVE_TYPE_DATA_PLACEMENT;
-		io_opts.nvme_cdw13.write.dspec = ctx->vslm->fdp_dspec;
-
-		rc = spdk_bdev_writev_blocks_ext(ctx->desc, ctx->ch, &iov, 1,
-						 ctx->offset_blocks, ctx->num_blocks,
-						 vslm_async_io_completion_cb, ctx, &io_opts);
-		if (rc == 0) {
-			ctx->tagged = true;
-			submitted = true;
-		} else if (rc == -ENOTSUP) {
-			rc = 0;
-		}
-	}
-
-	if (!submitted) {
-		if (ctx->is_write) {
-			rc = spdk_bdev_write_blocks(ctx->desc, ctx->ch, ctx->buf,
-						    ctx->offset_blocks, ctx->num_blocks,
-						    vslm_async_io_completion_cb, ctx);
-		} else {
-			rc = spdk_bdev_read_blocks(ctx->desc, ctx->ch, ctx->buf,
-						   ctx->offset_blocks, ctx->num_blocks,
-						   vslm_async_io_completion_cb, ctx);
-		}
-	}
-
-	if (rc != 0) {
-		spdk_put_io_channel(ctx->ch);
-		vslm_sync_wait_complete(ctx->wait, rc);
-		free(ctx);
-	}
-}
-
-static void
-vslm_async_desc_read_submit(void *arg)
-{
-	struct vslm_async_io_submit_ctx *ctx = arg;
-	int rc;
-
-	ctx->ch = spdk_bdev_get_io_channel(ctx->desc);
-	if (ctx->ch == NULL) {
-		vslm_sync_wait_complete(ctx->wait, -ENOMEM);
-		free(ctx);
-		return;
-	}
-
-	rc = spdk_bdev_read_blocks(ctx->desc, ctx->ch, ctx->buf, ctx->offset_blocks,
-				   ctx->num_blocks, vslm_async_io_completion_cb, ctx);
-	if (rc != 0) {
-		spdk_put_io_channel(ctx->ch);
-		vslm_sync_wait_complete(ctx->wait, rc);
-		free(ctx);
-	}
-}
-
-static int
-vslm_wait_async_submit(struct spdk_thread *helper_thread,
-		       void (*submit_fn)(void *), struct vslm_async_io_submit_ctx *ctx)
-{
-	struct vslm_sync_wait_ctx wait = {};
-	int rc;
-
-	pthread_mutex_init(&wait.mutex, NULL);
-	pthread_cond_init(&wait.cond, NULL);
-	wait.done = false;
-	wait.status = 0;
-	ctx->wait = &wait;
-
-	rc = spdk_thread_send_msg(helper_thread, submit_fn, ctx);
-	if (rc != 0) {
-		free(ctx);
-		pthread_cond_destroy(&wait.cond);
-		pthread_mutex_destroy(&wait.mutex);
-		return rc;
-	}
-
-	pthread_mutex_lock(&wait.mutex);
-	while (!wait.done) {
-		pthread_cond_wait(&wait.cond, &wait.mutex);
-	}
-	rc = wait.status;
-	pthread_mutex_unlock(&wait.mutex);
-
-	pthread_cond_destroy(&wait.cond);
-	pthread_mutex_destroy(&wait.mutex);
-	return rc;
-}
-
-static struct spdk_thread *
-vslm_get_sync_io_helper_thread(void)
-{
-	/* Remove after solved problem: app thread is not guaranteed to be polled
-	 * in all deployments, so helper-thread handoff can deadlock here.
-	 */
-	return NULL;
-}
-
 static int
 vslm_submit_sync_base_io(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
+			 struct vslm_mmu_shard *held_shard,
 			 void *buf, uint64_t offset_blocks, uint64_t num_blocks, bool is_write)
 {
-	struct spdk_thread *helper_thread;
 	uint64_t start_ticks;
 	uint64_t elapsed_ns;
 	struct vslm_sync_io_ctx ctx = {};
-	struct vslm_async_io_submit_ctx *async_ctx;
 	struct spdk_bdev_ext_io_opts io_opts = {};
 	struct iovec iov = {};
 	struct spdk_thread *thread;
@@ -2393,25 +2349,6 @@ vslm_submit_sync_base_io(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 	VSLM_PERF_INC(vslm, sync_base_io_total);
 
 	if (num_blocks == 0) {
-		goto out;
-	}
-
-	helper_thread = vslm_get_sync_io_helper_thread();
-	if (helper_thread != NULL) {
-		async_ctx = calloc(1, sizeof(*async_ctx));
-		if (async_ctx == NULL) {
-			rc = -ENOMEM;
-			goto out;
-		}
-
-		async_ctx->vslm = vslm;
-		async_ctx->desc = vslm->base_desc;
-		async_ctx->buf = buf;
-		async_ctx->offset_blocks = offset_blocks;
-		async_ctx->num_blocks = num_blocks;
-		async_ctx->is_write = is_write;
-		async_ctx->bytes = num_blocks * spdk_bdev_get_block_size(vslm->base_bdev);
-		rc = vslm_wait_async_submit(helper_thread, vslm_async_base_io_submit, async_ctx);
 		goto out;
 	}
 
@@ -2457,8 +2394,23 @@ vslm_submit_sync_base_io(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 		goto out;
 	}
 
+	/*
+	 * Never busy-poll the reactor while holding a shard lock: spdk_thread_poll()
+	 * runs other vSLM I/O on this same thread which would re-enter the same
+	 * (non-recursive) shard lock and self-deadlock. Drop the held shard lock
+	 * around the poll loop and re-acquire it afterward, exactly like
+	 * vslm_wait_for_loading_page(). The page being faulted/evicted/written back
+	 * is already protected (LOADING/EVICTING/is_busy) so it cannot be stolen
+	 * during the unlocked window.
+	 */
+	if (held_shard != NULL) {
+		pthread_mutex_unlock(&held_shard->lock);
+	}
 	while (!ctx.done) {
 		spdk_thread_poll(thread, 0, 0);
+	}
+	if (held_shard != NULL) {
+		pthread_mutex_lock(&held_shard->lock);
 	}
 
 	if (is_write && submitted && ctx.status == 0) {
@@ -2482,6 +2434,7 @@ out:
 
 static int
 vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
+			    struct vslm_mmu_shard *held_shard,
 			    struct iovec *iov, int iovcnt,
 			    uint64_t offset_blocks, uint64_t num_blocks)
 {
@@ -2505,8 +2458,9 @@ vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *bas
 	/*
 	 * Ablation override: pretend the backing cannot do a native block-vector
 	 * readv so the caller takes the static DMA ring-buffer fallback (paper 4.5).
+	 * Read atomically: the knob is published lock-free from vslm_apply_debug.
 	 */
-	if (vslm->force_dma_fallback) {
+	if (__atomic_load_n(&vslm->force_dma_fallback, __ATOMIC_RELAXED)) {
 		return -ENOTSUP;
 	}
 
@@ -2518,8 +2472,15 @@ vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *bas
 		return rc;
 	}
 
+	/* See vslm_submit_sync_base_io(): drop any held shard lock across the poll. */
+	if (held_shard != NULL) {
+		pthread_mutex_unlock(&held_shard->lock);
+	}
 	while (!ctx.done) {
 		spdk_thread_poll(thread, 0, 0);
+	}
+	if (held_shard != NULL) {
+		pthread_mutex_lock(&held_shard->lock);
 	}
 
 	return ctx.status;
@@ -2528,24 +2489,24 @@ vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *bas
 static int
 vslm_submit_sync_base_read_bounce(struct vbdev_vslm *vslm,
 				  struct spdk_io_channel *base_ch,
+				  struct vslm_mmu_shard *held_shard,
 				  void *bounce_buf,
 				  uint64_t offset_blocks,
 				  uint64_t num_blocks)
 {
-	return vslm_submit_sync_base_io(vslm, base_ch, bounce_buf,
+	return vslm_submit_sync_base_io(vslm, base_ch, held_shard, bounce_buf,
 					offset_blocks, num_blocks, false);
 }
 
 static int
 vslm_submit_sync_read_desc_io(struct vbdev_vslm *vslm,
 			      struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			      struct vslm_mmu_shard *held_shard,
 			      void *buf, uint64_t offset_blocks, uint64_t num_blocks)
 {
-	struct spdk_thread *helper_thread;
 	uint64_t start_ticks;
 	uint64_t elapsed_ns;
 	struct vslm_sync_io_ctx ctx = {};
-	struct vslm_async_io_submit_ctx *async_ctx;
 	struct spdk_thread *thread;
 	int rc = 0;
 
@@ -2553,22 +2514,6 @@ vslm_submit_sync_read_desc_io(struct vbdev_vslm *vslm,
 	VSLM_PERF_INC(vslm, sync_read_desc_io_total);
 
 	if (num_blocks == 0) {
-		goto out;
-	}
-
-	helper_thread = vslm_get_sync_io_helper_thread();
-	if (helper_thread != NULL) {
-		async_ctx = calloc(1, sizeof(*async_ctx));
-		if (async_ctx == NULL) {
-			rc = -ENOMEM;
-			goto out;
-		}
-
-		async_ctx->desc = desc;
-		async_ctx->buf = buf;
-		async_ctx->offset_blocks = offset_blocks;
-		async_ctx->num_blocks = num_blocks;
-		rc = vslm_wait_async_submit(helper_thread, vslm_async_desc_read_submit, async_ctx);
 		goto out;
 	}
 
@@ -2584,8 +2529,15 @@ vslm_submit_sync_read_desc_io(struct vbdev_vslm *vslm,
 		goto out;
 	}
 
+	/* See vslm_submit_sync_base_io(): drop any held shard lock across the poll. */
+	if (held_shard != NULL) {
+		pthread_mutex_unlock(&held_shard->lock);
+	}
 	while (!ctx.done) {
 		spdk_thread_poll(thread, 0, 0);
+	}
+	if (held_shard != NULL) {
+		pthread_mutex_lock(&held_shard->lock);
 	}
 
 	rc = ctx.status;
@@ -2653,7 +2605,8 @@ vslm_read_page_from_source(struct vbdev_vslm *vslm, struct spdk_io_channel *base
 		}
 	}
 
-	rc = vslm_submit_sync_read_desc_io(vslm, source_desc, source_ch, page_buf,
+	/* Callers (vslm_read_committed_range) drop the shard lock before this. */
+	rc = vslm_submit_sync_read_desc_io(vslm, source_desc, source_ch, NULL, page_buf,
 					   source_offset_blocks, source_page_blocks);
 
 	if (opened_source_desc) {
@@ -2850,7 +2803,13 @@ vslm_writeback_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 	}
 	ptr = vslm->sram_buffer + (page->ppn * VSLM_PAGE_SIZE);
 
-	rc = vslm_submit_sync_base_io(vslm, base_ch, ptr, offset_blocks, page_blocks, true);
+	/*
+	 * The owning shard lock is held by every caller (evict/cleaner/publish).
+	 * Hand it to the sync I/O so the poll loop runs with the lock dropped; the
+	 * victim page is protected during that window (EVICTING / is_busy).
+	 */
+	rc = vslm_submit_sync_base_io(vslm, base_ch, vslm_shard_for_page(vslm, page),
+				      ptr, offset_blocks, page_blocks, true);
 	if (rc == 0) {
 		lpage->pending_publish = false;
 		vslm_lpage_clear_superseded_source(lpage);
@@ -2887,8 +2846,16 @@ vslm_writeback_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 	return rc;
 }
 
+/*
+ * held_shard is the shard lock the caller is holding (the page's owning shard)
+ * or NULL when the caller has already dropped it (the split reserve/fault path).
+ * It is threaded into the sync backing reads so they drop it across their poll
+ * loop. The faulting page is LOADING/busy throughout, so it cannot be stolen
+ * during the unlocked window.
+ */
 static int
 vslm_fault_in_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
+		   struct vslm_mmu_shard *held_shard,
 		   struct vslm_page *page, struct vslm_lpage *lpage, uint64_t vpn)
 {
 	struct spdk_bdev *source_bdev = NULL;
@@ -2928,7 +2895,8 @@ vslm_fault_in_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 		SPDK_DEBUGLOG(vslm, "vSLM fault-in default backing-read bdev=%s vpn=%" PRIu64
 			      " offset_blocks=%" PRIu64 " blocks=%" PRIu64 "\n",
 			      vslm->vbdev.name, vpn, offset_blocks, page_blocks);
-		rc = vslm_submit_sync_base_io(vslm, base_ch, ptr, offset_blocks, page_blocks, false);
+		rc = vslm_submit_sync_base_io(vslm, base_ch, held_shard, ptr, offset_blocks,
+					      page_blocks, false);
 		goto out;
 	}
 
@@ -2969,7 +2937,8 @@ vslm_fault_in_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 				}
 
 				if (rc == 0) {
-					rc = vslm_submit_sync_read_desc_io(vslm, source_desc, source_ch, ptr,
+					rc = vslm_submit_sync_read_desc_io(vslm, source_desc, source_ch,
+									   held_shard, ptr,
 									   source_offset_blocks, source_page_blocks);
 				}
 
@@ -3003,7 +2972,8 @@ vslm_fault_in_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 	SPDK_DEBUGLOG(vslm, "vSLM fault-in fallback backing-read bdev=%s vpn=%" PRIu64
 		      " offset_blocks=%" PRIu64 " blocks=%" PRIu64 "\n",
 		      vslm->vbdev.name, vpn, offset_blocks, page_blocks);
-	rc = vslm_submit_sync_base_io(vslm, base_ch, ptr, offset_blocks, page_blocks, false);
+	rc = vslm_submit_sync_base_io(vslm, base_ch, held_shard, ptr, offset_blocks,
+				      page_blocks, false);
 
 out:
 	fault_ns = vslm_ticks_delta_to_ns(fault_start_ticks, spdk_get_ticks());
@@ -3155,9 +3125,10 @@ vslm_resolve_page_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 
 	/*
 	 * CoW full-overwrite media-bypass ablation override: never skip the backing
-	 * read on a full-page overwrite when disable_cow_bypass is set.
+	 * read on a full-page overwrite when disable_cow_bypass is set. Read
+	 * atomically: the knob is published lock-free from vslm_apply_debug.
 	 */
-	if (vslm->disable_cow_bypass) {
+	if (__atomic_load_n(&vslm->disable_cow_bypass, __ATOMIC_RELAXED)) {
 		skip_fault_in = false;
 	}
 
@@ -3237,7 +3208,13 @@ vslm_resolve_page_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 	pre_fault_state = lpage != NULL ? lpage->state : SPDK_BDEV_VSLM_LPAGE_CLEAN_RESIDENT;
 
 	if (!skip_fault_in) {
-		rc = vslm_fault_in_page(vslm, base_ch, page, lpage, vpn);
+		/*
+		 * shard->lock is held here; hand it to the fault-in so its sync
+		 * backing read does not busy-poll the reactor under the lock. The
+		 * page is LOADING and on the hash/LRU, so it is not an eviction
+		 * candidate during the unlocked window.
+		 */
+		rc = vslm_fault_in_page(vslm, base_ch, shard, page, lpage, vpn);
 		if (rc != 0) {
 			goto rollback_page;
 		}
@@ -3352,10 +3329,11 @@ vslm_reserve_page_for_fault_locked(struct vbdev_vslm *vslm,
 	/*
 	 * CoW full-overwrite media-bypass: a full-page overwrite skips the backing
 	 * read and prepares a blank frame. The disable_cow_bypass ablation override
-	 * forces the read so the page is always faulted in first.
+	 * forces the read so the page is always faulted in first. Read atomically:
+	 * the knob is published lock-free from vslm_apply_debug.
 	 */
 	fault_ctx->skip_fault_in = for_write && full_page_overwrite &&
-				   !vslm->disable_cow_bypass;
+				   !__atomic_load_n(&vslm->disable_cow_bypass, __ATOMIC_RELAXED);
 	fault_ctx->needs_fault_in = !fault_ctx->skip_fault_in;
 	return 0;
 }
@@ -3369,7 +3347,8 @@ vslm_fault_in_reserved_page_unlocked(struct vbdev_vslm *vslm,
 		return 0;
 	}
 
-	return vslm_fault_in_page(vslm, base_ch, fault_ctx->page,
+	/* The caller (split path) has already dropped the shard lock: pass NULL. */
+	return vslm_fault_in_page(vslm, base_ch, NULL, fault_ctx->page,
 				  fault_ctx->lpage, fault_ctx->vpn);
 }
 
@@ -3730,6 +3709,15 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 {
 	struct vslm_fault_batch_ctx batch = {};
 	struct vslm_mmu_shard *shard = vslm_shard_for_vpn(vslm, start_vpn);
+	/*
+	 * requested_pages is clamped below to VSLM_MMU_SHARD_STRIDE_PAGES (a single
+	 * shard's stride run) and to the configured fault-batch page budget, both of
+	 * which are <= VSLM_MMU_SHARD_STRIDE_PAGES (64). Back the per-batch page and
+	 * iov scratch with fixed on-stack arrays sized to that bound instead of a
+	 * per-call calloc/free pair on the hot fault-in path.
+	 */
+	struct vslm_fault_batch_page stack_pages[VSLM_MMU_SHARD_STRIDE_PAGES];
+	struct iovec stack_iov[VSLM_MMU_SHARD_STRIDE_PAGES];
 	uint64_t block_size;
 	uint64_t page_blocks;
 	uint64_t offset_blocks;
@@ -3764,13 +3752,21 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 	}
 	requested_pages = spdk_min(requested_pages, max_by_bytes);
 	requested_pages = vslm_clamp_batch_pages_to_range(vslm, start_vpn, requested_pages);
-	/* Keep the whole batch within one MMU shard so a single shard lock covers it. */
-	if (vslm->num_shards > 1) {
+	/*
+	 * Keep the whole batch within one MMU shard so a single shard lock covers
+	 * it. A batch never spans more than the bytes remaining in the current
+	 * stride run, which also bounds it to VSLM_MMU_SHARD_STRIDE_PAGES and lets
+	 * the fixed stack scratch arrays above suffice.
+	 */
+	{
 		uint64_t shard_room = VSLM_MMU_SHARD_STRIDE_PAGES -
 				      (start_vpn % VSLM_MMU_SHARD_STRIDE_PAGES);
 		if (requested_pages > shard_room) {
 			requested_pages = (uint32_t)shard_room;
 		}
+	}
+	if (requested_pages > VSLM_MMU_SHARD_STRIDE_PAGES) {
+		requested_pages = VSLM_MMU_SHARD_STRIDE_PAGES;
 	}
 	if (requested_pages == 0) {
 		return -ENOSPC;
@@ -3779,12 +3775,10 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 	batch.vslm = vslm;
 	batch.base_ch = base_ch;
 	batch.start_vpn = start_vpn;
-	batch.pages = calloc(requested_pages, sizeof(*batch.pages));
-	batch.iov = calloc(requested_pages, sizeof(*batch.iov));
-	if (batch.pages == NULL || batch.iov == NULL) {
-		rc = -ENOMEM;
-		goto out_free;
-	}
+	batch.pages = stack_pages;
+	batch.iov = stack_iov;
+	memset(stack_pages, 0, requested_pages * sizeof(stack_pages[0]));
+	memset(stack_iov, 0, requested_pages * sizeof(stack_iov[0]));
 
 	VSLM_PERF_INC(vslm, fault_batch_attempt_total);
 	VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
@@ -3803,7 +3797,8 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 	num_blocks = batch.nr_pages * page_blocks;
 	io_start_ticks = spdk_get_ticks();
 	VSLM_PERF_INC(vslm, fault_in_batched_readv_total);
-	rc = vslm_submit_sync_base_readv(vslm, base_ch, batch.iov,
+	/* The shard lock is already dropped here (released above), so pass NULL. */
+	rc = vslm_submit_sync_base_readv(vslm, base_ch, NULL, batch.iov,
 					 (int)batch.nr_pages, offset_blocks, num_blocks);
 	if (rc == -ENOTSUP) {
 		bool contiguous = true;
@@ -3830,7 +3825,7 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 		}
 
 		if (contiguous) {
-			rc = vslm_submit_sync_base_read_bounce(vslm, base_ch,
+			rc = vslm_submit_sync_base_read_bounce(vslm, base_ch, NULL,
 							       batch.iov[0].iov_base,
 							       offset_blocks, num_blocks);
 		} else {
@@ -3844,7 +3839,7 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 				rc = -ENOMEM;
 			} else {
 				batch.used_bounce = true;
-				rc = vslm_submit_sync_base_read_bounce(vslm, base_ch, bounce,
+				rc = vslm_submit_sync_base_read_bounce(vslm, base_ch, NULL, bounce,
 								       offset_blocks, num_blocks);
 				if (rc == 0) {
 					bounce_memcpy_start_ticks = spdk_get_ticks();
@@ -3869,12 +3864,13 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 	lock_start_ticks = spdk_get_ticks();
 	if (rc == 0) {
 		vslm_batch_commit_pages(vslm, &batch, count_fault_stats);
-		vslm->last_batch_start_vpn = start_vpn;
-		vslm->last_batch_pages = batch.nr_pages;
+		/* last_batch_* are read lock-free by the prefetch path; publish atomically. */
+		__atomic_store_n(&vslm->last_batch_start_vpn, start_vpn, __ATOMIC_RELAXED);
+		__atomic_store_n(&vslm->last_batch_pages, batch.nr_pages, __ATOMIC_RELAXED);
 		*pages_loaded = batch.nr_pages;
 	} else {
-		vslm->last_batch_start_vpn = UINT64_MAX;
-		vslm->last_batch_pages = 0;
+		__atomic_store_n(&vslm->last_batch_start_vpn, UINT64_MAX, __ATOMIC_RELAXED);
+		__atomic_store_n(&vslm->last_batch_pages, 0, __ATOMIC_RELAXED);
 		vslm_batch_rollback_reserved_pages(vslm, &batch);
 	}
 	vslm_debug_validate_page_lists(vslm);
@@ -3896,8 +3892,7 @@ out_free:
 	if (batch.bounce_buf != NULL) {
 		spdk_dma_free(batch.bounce_buf);
 	}
-	free(batch.iov);
-	free(batch.pages);
+	/* batch.pages/batch.iov point at on-stack scratch; nothing to free. */
 	return rc;
 }
 
@@ -3905,14 +3900,17 @@ static bool
 vslm_range_covered_by_last_batch(struct vbdev_vslm *vslm, uint64_t vpn)
 {
 	uint64_t start;
+	uint32_t pages;
 	uint64_t end;
 
-	start = vslm->last_batch_start_vpn;
-	if (start == UINT64_MAX || vslm->last_batch_pages == 0) {
+	/* last_batch_* are written lock-free under various shard locks; load atomically. */
+	start = __atomic_load_n(&vslm->last_batch_start_vpn, __ATOMIC_RELAXED);
+	pages = __atomic_load_n(&vslm->last_batch_pages, __ATOMIC_RELAXED);
+	if (start == UINT64_MAX || pages == 0) {
 		return false;
 	}
 
-	end = start + vslm->last_batch_pages;
+	end = start + pages;
 	if (end < start) {
 		return false;
 	}
@@ -4091,8 +4089,9 @@ vslm_prefetch_batch_complete(struct spdk_bdev_io *bdev_io, bool success, void *c
 
 	pthread_mutex_lock(&shard->lock);
 	if (success) {
-		vslm->last_batch_start_vpn = ctx->start_vpn;
-		vslm->last_batch_pages = ctx->nr_pages;
+		/* last_batch_* are read lock-free by the prefetch path; publish atomically. */
+		__atomic_store_n(&vslm->last_batch_start_vpn, ctx->start_vpn, __ATOMIC_RELAXED);
+		__atomic_store_n(&vslm->last_batch_pages, ctx->nr_pages, __ATOMIC_RELAXED);
 	}
 	for (i = 0; i < ctx->nr_pages; i++) {
 		page = ctx->pages[i];
@@ -4335,7 +4334,9 @@ vslm_prefetch_next_pages(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 
 		start_vpn = demand_vpn + 1;
 		if (vslm_range_covered_by_last_batch(vslm, start_vpn)) {
-			start_vpn = vslm->last_batch_start_vpn + vslm->last_batch_pages;
+			/* last_batch_* are written lock-free under shard locks; load atomically. */
+			start_vpn = __atomic_load_n(&vslm->last_batch_start_vpn, __ATOMIC_RELAXED) +
+				    __atomic_load_n(&vslm->last_batch_pages, __ATOMIC_RELAXED);
 		}
 
 		requested_pages = spdk_min(readahead_pages, vslm->prefetch_batch_pages);
@@ -4356,6 +4357,11 @@ vslm_prefetch_next_pages(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 
 	max_vpn = vslm->virtual_size_bytes / VSLM_PAGE_SIZE;
 	for (i = 1; i <= readahead_pages; i++) {
+		struct vslm_mmu_shard *shard;
+		bool no_free = false;
+		bool skip = false;
+		bool stop = false;
+
 		target = (int64_t)demand_vpn + (int64_t)i * stride;
 		if (target < 0 || (uint64_t)target >= max_vpn) {
 			break;
@@ -4363,36 +4369,52 @@ vslm_prefetch_next_pages(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 		vpn = (uint64_t)target;
 		VSLM_PERF_INC(vslm, prefetch_page_attempt_total);
 
+		/*
+		 * The lookup/free-list test and the page reservation done by
+		 * vslm_resolve_page_ex() all mutate the owning shard's hash/LRU/free
+		 * lists and must run under that shard's lock. (resolve_page_ex drops
+		 * the lock itself across the actual backing read via held_shard.)
+		 */
+		shard = vslm_shard_for_vpn(vslm, vpn);
+		pthread_mutex_lock(&shard->lock);
+
 		if (vslm_lookup_page(vslm, vpn) != NULL) {
 			VSLM_PERF_INC(vslm, prefetch_page_skipped_resident_total);
-			continue;
+			skip = true;
+		} else {
+			lpage = vslm_lookup_lpage(vslm, vpn);
+			if (lpage != NULL && lpage->pending_publish) {
+				VSLM_PERF_INC(vslm, prefetch_page_skipped_pending_publish_total);
+				skip = true;
+			} else if (TAILQ_FIRST(&shard->free_list) == NULL) {
+				VSLM_PERF_INC(vslm, prefetch_page_skipped_no_free_page_total);
+				no_free = true;
+			}
 		}
 
-		lpage = vslm_lookup_lpage(vslm, vpn);
-		if (lpage != NULL && lpage->pending_publish) {
-			VSLM_PERF_INC(vslm, prefetch_page_skipped_pending_publish_total);
+		if (skip) {
+			pthread_mutex_unlock(&shard->lock);
 			continue;
 		}
-
-		if (TAILQ_FIRST(&vslm_shard_for_vpn(vslm, vpn)->free_list) == NULL) {
-			VSLM_PERF_INC(vslm, prefetch_page_skipped_no_free_page_total);
+		if (no_free) {
+			pthread_mutex_unlock(&shard->lock);
 			break;
 		}
 
 		rc = vslm_resolve_page_ex(vslm, base_ch, vpn, &prefetch_page, false, false);
-		if (rc != 0) {
+		if (rc != 0 || prefetch_page == NULL) {
+			stop = true;
+		} else {
+			if (vslm_lookup_lpage(vslm, vpn) == NULL) {
+				VSLM_PERF_INC(vslm, prefetch_clean_default_total);
+			}
+			VSLM_PERF_INC(vslm, prefetch_page_loaded_total);
+		}
+		pthread_mutex_unlock(&shard->lock);
+
+		if (stop) {
 			break;
 		}
-
-		if (prefetch_page == NULL) {
-			break;
-		}
-
-		if (vslm_lookup_lpage(vslm, vpn) == NULL) {
-			VSLM_PERF_INC(vslm, prefetch_clean_default_total);
-		}
-
-		VSLM_PERF_INC(vslm, prefetch_page_loaded_total);
 	}
 
 out:
@@ -4418,8 +4440,6 @@ vslm_copy_range_exec_read_batched(struct vbdev_vslm *vslm,
 	uint64_t page_offset;
 	uint64_t chunk;
 	uint64_t lock_start_ticks;
-	uint64_t memcpy_start_ticks;
-	uint64_t memcpy_ns;
 	uint8_t *ptr;
 	uint32_t run_len;
 	uint32_t pages_loaded;
@@ -4511,13 +4531,7 @@ vslm_copy_range_exec_read_batched(struct vbdev_vslm *vslm,
 		}
 
 		ptr = vslm->sram_buffer + (page->ppn * VSLM_PAGE_SIZE) + page_offset;
-		memcpy_start_ticks = spdk_get_ticks();
-		memcpy(buf + offset, ptr, chunk);
-		memcpy_ns = vslm_ticks_delta_to_ns(memcpy_start_ticks, spdk_get_ticks());
-		VSLM_PERF_INC(vslm, memcpy_total);
-		VSLM_PERF_ADD(vslm, memcpy_bytes_total, chunk);
-		VSLM_PERF_ADD(vslm, memcpy_ns_total, memcpy_ns);
-		vslm_perf_max_u64(&vslm->perf_stats.memcpy_ns_max, memcpy_ns);
+		vslm_timed_memcpy(vslm, buf + offset, ptr, chunk);
 		if (page_pinned) {
 			vslm_page_unpin_locked(vslm, page, false, false);
 		}
@@ -4592,8 +4606,6 @@ vslm_copy_range_exec_read_streaming(struct vbdev_vslm *vslm,
 	struct vslm_page *page;
 	struct vslm_mmu_shard *shard;
 	uint64_t lock_start_ticks = 0;
-	uint64_t memcpy_start_ticks;
-	uint64_t memcpy_ns;
 	uint64_t offset = 0;
 	uint64_t tile_start_byte;
 	uint64_t start_vpn;
@@ -4653,13 +4665,7 @@ vslm_copy_range_exec_read_streaming(struct vbdev_vslm *vslm,
 			vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
 
 			ptr_offset = ((uint64_t)i) * VSLM_PAGE_SIZE;
-			memcpy_start_ticks = spdk_get_ticks();
-			memcpy(buf + offset + ptr_offset, ptr, VSLM_PAGE_SIZE);
-			memcpy_ns = vslm_ticks_delta_to_ns(memcpy_start_ticks, spdk_get_ticks());
-			VSLM_PERF_INC(vslm, memcpy_total);
-			VSLM_PERF_ADD(vslm, memcpy_bytes_total, VSLM_PAGE_SIZE);
-			VSLM_PERF_ADD(vslm, memcpy_ns_total, memcpy_ns);
-			vslm_perf_max_u64(&vslm->perf_stats.memcpy_ns_max, memcpy_ns);
+			vslm_timed_memcpy(vslm, buf + offset + ptr_offset, ptr, VSLM_PAGE_SIZE);
 
 			VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
 			pthread_mutex_lock(&shard->lock);
@@ -4697,8 +4703,6 @@ vslm_copy_range_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 	uint64_t vpn;
 	uint64_t page_offset;
 	uint64_t chunk;
-	uint64_t memcpy_start_ticks;
-	uint64_t memcpy_ns;
 	uint8_t *ptr;
 	bool demand_miss;
 	bool full_page_overwrite;
@@ -4785,17 +4789,11 @@ vslm_copy_range_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 		ptr = vslm->sram_buffer + (page->ppn * VSLM_PAGE_SIZE) + page_offset;
 		vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
 
-		memcpy_start_ticks = spdk_get_ticks();
 		if (is_write) {
-			memcpy(ptr, buf + offset, chunk);
+			vslm_timed_memcpy(vslm, ptr, buf + offset, chunk);
 		} else {
-			memcpy(buf + offset, ptr, chunk);
+			vslm_timed_memcpy(vslm, buf + offset, ptr, chunk);
 		}
-		memcpy_ns = vslm_ticks_delta_to_ns(memcpy_start_ticks, spdk_get_ticks());
-		VSLM_PERF_INC(vslm, memcpy_total);
-		VSLM_PERF_ADD(vslm, memcpy_bytes_total, chunk);
-		VSLM_PERF_ADD(vslm, memcpy_ns_total, memcpy_ns);
-		vslm_perf_max_u64(&vslm->perf_stats.memcpy_ns_max, memcpy_ns);
 
 		VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
 		pthread_mutex_lock(&shard->lock);
@@ -4952,7 +4950,9 @@ vbdev_vslm_destruct(void *ctx)
 	struct vslm_lease *lease, *lease_tmp;
 	struct vslm_blocked_cmd *blocked, *blocked_tmp;
 
+	pthread_mutex_lock(&g_vslm_bdevs_lock);
 	TAILQ_REMOVE(&g_vslm_bdevs, vslm, link);
+	pthread_mutex_unlock(&g_vslm_bdevs_lock);
 	pthread_mutex_lock(&vslm->inflight_lock);
 	vslm->destructing = true;
 	while (vslm->inflight_io_count != 0) {
@@ -5216,12 +5216,21 @@ vslm_create_common(const char *bdev_name, const char *base_bdev_name,
 		return -EINVAL;
 	}
 
+	pthread_mutex_lock(&g_vslm_bdevs_lock);
 	TAILQ_FOREACH(iter, &g_vslm_bdevs, link) {
 		if (strcmp(iter->vbdev.name, bdev_name) == 0) {
+			pthread_mutex_unlock(&g_vslm_bdevs_lock);
 			SPDK_ERRLOG("vSLM bdev '%s' already exists\n", bdev_name);
 			return -EEXIST;
 		}
+		if (create_opts->nsid != 0 && iter->vbdev.nsid == create_opts->nsid) {
+			pthread_mutex_unlock(&g_vslm_bdevs_lock);
+			SPDK_ERRLOG("vSLM nsid %u already in use by bdev '%s'\n",
+				    create_opts->nsid, iter->vbdev.name);
+			return -EEXIST;
+		}
 	}
+	pthread_mutex_unlock(&g_vslm_bdevs_lock);
 
 	vslm = calloc(1, sizeof(*vslm));
 	if (!vslm) {
@@ -5438,7 +5447,9 @@ vslm_create_common(const char *bdev_name, const char *base_bdev_name,
 		goto err;
 	}
 
+	pthread_mutex_lock(&g_vslm_bdevs_lock);
 	TAILQ_INSERT_TAIL(&g_vslm_bdevs, vslm, link);
+	pthread_mutex_unlock(&g_vslm_bdevs_lock);
 	return 0;
 
 err:
@@ -5500,11 +5511,10 @@ bdev_vslm_delete(const char *name,
 {
 	struct vbdev_vslm *vslm;
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) == 0) {
-			spdk_bdev_unregister(&vslm->vbdev, cb_fn, cb_arg);
-			return;
-		}
+	vslm = vbdev_vslm_get_by_name(name);
+	if (vslm != NULL) {
+		spdk_bdev_unregister(&vslm->vbdev, cb_fn, cb_arg);
+		return;
 	}
 
 	if (cb_fn) {
@@ -5516,23 +5526,35 @@ int
 bdev_vslm_set_nsid(const char *name, uint32_t nsid)
 {
 	struct vbdev_vslm *vslm;
+	struct vbdev_vslm *target = NULL;
+	int rc = -ENOENT;
 
 	if (!name || nsid == 0) {
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) == 0) {
-			if (vslm->vbdev.nsid == nsid) {
-				return 0;
-			}
+	pthread_mutex_lock(&g_vslm_bdevs_lock);
 
-			vslm->vbdev.nsid = nsid;
-			return 0;
+	/* Reject if another bdev already owns this nsid. */
+	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
+		if (vslm->vbdev.nsid == nsid && strcmp(vslm->vbdev.name, name) != 0) {
+			pthread_mutex_unlock(&g_vslm_bdevs_lock);
+			SPDK_ERRLOG("vSLM nsid %u already in use by bdev '%s'\n",
+				    nsid, vslm->vbdev.name);
+			return -EEXIST;
+		}
+		if (strcmp(vslm->vbdev.name, name) == 0) {
+			target = vslm;
 		}
 	}
 
-	return -ENOENT;
+	if (target != NULL) {
+		target->vbdev.nsid = nsid;
+		rc = 0;
+	}
+	pthread_mutex_unlock(&g_vslm_bdevs_lock);
+
+	return rc;
 }
 
 int
@@ -6391,9 +6413,16 @@ vslm_exec_rw_async_fault_complete(struct spdk_bdev_io *bdev_io, bool success,
 {
 	struct vslm_exec_rw_async_ctx *ctx = cb_arg;
 	struct vbdev_vslm *vslm = ctx->vslm;
+	struct vslm_mmu_shard *shard;
 	struct vslm_page_waiter_list waiters;
+	struct vslm_page *page = NULL;
+	uint64_t absolute;
+	uint64_t page_offset;
+	uint64_t chunk;
 	uint64_t fault_ns;
+	uint8_t *ptr = NULL;
 	bool was_default_backing;
+	bool committed = false;
 	int submit_rc;
 	int rc;
 
@@ -6418,8 +6447,14 @@ vslm_exec_rw_async_fault_complete(struct spdk_bdev_io *bdev_io, bool success,
 	VSLM_PERF_ADD(vslm, fault_in_io_ns_total, fault_ns);
 	vslm_perf_max_u64(&vslm->perf_stats.fault_in_io_ns_max, fault_ns);
 
+	absolute = ctx->offset + ctx->processed;
+	page_offset = absolute % VSLM_PAGE_SIZE;
+	chunk = spdk_min((uint64_t)(VSLM_PAGE_SIZE - page_offset),
+			 ctx->length - ctx->processed);
+
+	shard = vslm_shard_for_vpn(vslm, ctx->fault_ctx.vpn);
 	VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
-	pthread_mutex_lock(&vslm_shard_for_vpn(vslm, ctx->fault_ctx.vpn)->lock);
+	pthread_mutex_lock(&shard->lock);
 	if (success) {
 		rc = vslm_commit_reserved_page_locked(vslm, &ctx->fault_ctx, true);
 		if (rc == 0) {
@@ -6427,6 +6462,19 @@ vslm_exec_rw_async_fault_complete(struct spdk_bdev_io *bdev_io, bool success,
 			VSLM_PERF_ADD(vslm, fault_in_4k_bytes, VSLM_PAGE_SIZE);
 			vslm_page_take_waiters_locked(ctx->fault_ctx.page, 0,
 						      ctx->fault_ctx.page, &waiters);
+			/*
+			 * Pin the just-committed page before releasing the shard lock and
+			 * perform this fault's memcpy NOW, holding the pin across it,
+			 * instead of leaving the still-clean page resident-and-unpinned
+			 * and rescheduling a fresh lookup. Otherwise a concurrent fault's
+			 * vslm_pick_victim() can clean-evict (steal) it in the window,
+			 * which livelocks under sustained eviction pressure (mirrors the
+			 * full-page-overwrite protection in vslm_exec_rw_async_page_step).
+			 */
+			page = ctx->fault_ctx.page;
+			vslm_page_pin_locked(vslm, page);
+			ptr = vslm->sram_buffer + (page->ppn * VSLM_PAGE_SIZE) + page_offset;
+			committed = true;
 		}
 	} else if (rc == 0) {
 		rc = -EIO;
@@ -6439,12 +6487,27 @@ vslm_exec_rw_async_fault_complete(struct spdk_bdev_io *bdev_io, bool success,
 		vslm_rollback_reserved_page_locked(vslm, &ctx->fault_ctx);
 	}
 	vslm_debug_validate_page_lists(vslm);
-	pthread_mutex_unlock(&vslm_shard_for_vpn(vslm, ctx->fault_ctx.vpn)->lock);
+	pthread_mutex_unlock(&shard->lock);
 	vslm_page_complete_waiters(&waiters);
 
 	if (rc != 0) {
 		vslm_exec_rw_async_finish(ctx, rc);
 		return;
+	}
+
+	if (committed) {
+		if (ctx->is_write) {
+			memcpy(ptr, ctx->buf + ctx->processed, chunk);
+		} else {
+			memcpy(ctx->buf + ctx->processed, ptr, chunk);
+		}
+
+		VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
+		pthread_mutex_lock(&shard->lock);
+		vslm_page_unpin_locked(vslm, page, ctx->is_write, false);
+		pthread_mutex_unlock(&shard->lock);
+
+		ctx->processed += chunk;
 	}
 
 	vslm_exec_rw_async_schedule_step(ctx);
@@ -6596,8 +6659,6 @@ vslm_exec_rw_async_page_step(struct vslm_exec_rw_async_ctx *ctx)
 	uint64_t vpn;
 	uint64_t page_offset;
 	uint64_t chunk;
-	uint64_t memcpy_start_ticks;
-	uint64_t memcpy_ns;
 	uint8_t *ptr;
 	bool full_page_overwrite;
 	bool submit_evict_writeback;
@@ -6645,17 +6706,11 @@ vslm_exec_rw_async_page_step(struct vslm_exec_rw_async_ctx *ctx)
 		ptr = vslm->sram_buffer + (page->ppn * VSLM_PAGE_SIZE) + page_offset;
 		vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
 
-		memcpy_start_ticks = spdk_get_ticks();
 		if (ctx->is_write) {
-			memcpy(ptr, ctx->buf + ctx->processed, chunk);
+			vslm_timed_memcpy(vslm, ptr, ctx->buf + ctx->processed, chunk);
 		} else {
-			memcpy(ctx->buf + ctx->processed, ptr, chunk);
+			vslm_timed_memcpy(vslm, ctx->buf + ctx->processed, ptr, chunk);
 		}
-		memcpy_ns = vslm_ticks_delta_to_ns(memcpy_start_ticks, spdk_get_ticks());
-		VSLM_PERF_INC(vslm, memcpy_total);
-		VSLM_PERF_ADD(vslm, memcpy_bytes_total, chunk);
-		VSLM_PERF_ADD(vslm, memcpy_ns_total, memcpy_ns);
-		vslm_perf_max_u64(&vslm->perf_stats.memcpy_ns_max, memcpy_ns);
 
 		VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
 		pthread_mutex_lock(&shard->lock);
@@ -7363,7 +7418,15 @@ vslm_publish_lease_ranges(struct vbdev_vslm *vslm, struct spdk_io_channel *base_
 				continue;
 			}
 
+			/*
+			 * vslm_writeback_page drops shard->lock across its sync
+			 * backing write; mark the page busy first so it cannot be
+			 * picked as an eviction victim during that window (the
+			 * cleaner path relies on the same is_busy guard).
+			 */
+			page->is_busy = true;
 			rc = vslm_writeback_page(vslm, base_ch, page, false);
+			page->is_busy = false;
 			pthread_mutex_unlock(&shard->lock);
 			if (rc != 0) {
 				break;
@@ -7443,9 +7506,12 @@ static int
 vbdev_vslm_exec_lease_op(uint64_t lease_id, bool publish)
 {
 	struct vbdev_vslm *vslm;
+	struct vbdev_vslm **snapshot;
 	struct vslm_lease_range *ranges = NULL;
 	struct spdk_io_channel *base_ch;
 	size_t range_count;
+	size_t snap_count;
+	size_t snap_i;
 	bool found = false;
 	int rc, op_rc, first_err = 0;
 
@@ -7453,7 +7519,9 @@ vbdev_vslm_exec_lease_op(uint64_t lease_id, bool publish)
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
+	snapshot = vbdev_vslm_snapshot_bdevs(&snap_count);
+	for (snap_i = 0; snap_i < snap_count; snap_i++) {
+		vslm = snapshot[snap_i];
 		rc = vslm_collect_lease_ranges(vslm, lease_id, &ranges, &range_count);
 		if (rc == -ENOENT) {
 			continue;
@@ -7507,6 +7575,7 @@ vbdev_vslm_exec_lease_op(uint64_t lease_id, bool publish)
 			first_err = op_rc;
 		}
 	}
+	free(snapshot);
 
 	if (first_err != 0) {
 		return first_err;
@@ -7531,7 +7600,10 @@ static int
 vbdev_vslm_mem_lease_release(uint64_t lease_id)
 {
 	struct vbdev_vslm *vslm;
+	struct vbdev_vslm **snapshot;
 	struct vslm_lease *lease, *lease_tmp;
+	size_t snap_count;
+	size_t snap_i;
 	bool found = false;
 	bool released;
 	uint64_t released_ranges;
@@ -7540,7 +7612,9 @@ vbdev_vslm_mem_lease_release(uint64_t lease_id)
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
+	snapshot = vbdev_vslm_snapshot_bdevs(&snap_count);
+	for (snap_i = 0; snap_i < snap_count; snap_i++) {
+		vslm = snapshot[snap_i];
 		released = false;
 		released_ranges = 0;
 
@@ -7565,6 +7639,7 @@ vbdev_vslm_mem_lease_release(uint64_t lease_id)
 			vslm_process_blocked_cmds(vslm);
 		}
 	}
+	free(snapshot);
 
 	if (!found) {
 		return -ENOENT;
@@ -7594,15 +7669,12 @@ bdev_vslm_set_policy(const char *name, const struct spdk_bdev_vslm_policy *polic
 		return rc;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) != 0) {
-			continue;
-		}
-
-		return vslm_apply_policy(vslm, policy);
+	vslm = vbdev_vslm_get_by_name(name);
+	if (vslm == NULL) {
+		return -ENOENT;
 	}
 
-	return -ENOENT;
+	return vslm_apply_policy(vslm, policy);
 }
 
 /*
@@ -7614,6 +7686,8 @@ bdev_vslm_set_policy(const char *name, const struct spdk_bdev_vslm_policy *polic
 static int
 vslm_reshard_idle(struct vbdev_vslm *vslm, uint32_t num_shards)
 {
+	struct vslm_mmu_shard *old_shards;
+	uint32_t old_num_shards;
 	uint64_t i;
 	int rc;
 
@@ -7627,6 +7701,20 @@ vslm_reshard_idle(struct vbdev_vslm *vslm, uint32_t num_shards)
 		return 0;
 	}
 
+	/*
+	 * Refuse to re-shard while any host/compute I/O is in flight: in-flight
+	 * operations hold (or are about to take) the existing per-shard locks,
+	 * which would be destroyed out from under them. Reuse the destruct drain
+	 * counter (incremented by vslm_try_get_io_ref) in addition to the
+	 * lease-empty check enforced by the caller.
+	 */
+	pthread_mutex_lock(&vslm->inflight_lock);
+	if (vslm->inflight_io_count != 0) {
+		pthread_mutex_unlock(&vslm->inflight_lock);
+		return -EBUSY;
+	}
+	pthread_mutex_unlock(&vslm->inflight_lock);
+
 	for (i = 0; i < vslm->num_sram_pages; i++) {
 		struct vslm_page *page = &vslm->page_array[i];
 
@@ -7637,12 +7725,40 @@ vslm_reshard_idle(struct vbdev_vslm *vslm, uint32_t num_shards)
 		}
 	}
 
-	vslm_free_shards(vslm);
+	/*
+	 * Build the new shard array into a temporary and only swap it in on
+	 * success. vslm_build_shards() builds into vslm->shards, so stash the
+	 * live shards aside (NULLing them) before the build, then free them on
+	 * success or restore them on failure -- the live bdev is never left with
+	 * shards == NULL.
+	 */
+	old_shards = vslm->shards;
+	old_num_shards = vslm->num_shards;
+	vslm->shards = NULL;
+	vslm->num_shards = 0;
+
 	rc = vslm_build_shards(vslm, num_shards);
 	if (rc != 0) {
-		SPDK_ERRLOG("vslm: re-shard to %u failed; bdev left without shards\n",
-			    num_shards);
+		/* build failed and tore down its partial state; restore the old shards. */
+		vslm->shards = old_shards;
+		vslm->num_shards = old_num_shards;
+		SPDK_ERRLOG("vslm: re-shard to %u failed; keeping existing %u shards\n",
+			    num_shards, old_num_shards);
 		return -ENOMEM;
+	}
+
+	/* New shards are live; tear down the old array. */
+	if (old_shards != NULL) {
+		uint32_t s;
+
+		for (s = 0; s < old_num_shards; s++) {
+			struct vslm_mmu_shard *shard = &old_shards[s];
+
+			free(shard->hash_table);
+			free(shard->lpage_hash_table);
+			pthread_mutex_destroy(&shard->lock);
+		}
+		free(old_shards);
 	}
 	return 0;
 }
@@ -7686,10 +7802,13 @@ vslm_apply_debug(struct vbdev_vslm *vslm, const struct spdk_bdev_vslm_debug *dbg
 		vslm->streaming_mode_enabled = (dbg->streaming_mode != 0);
 	}
 	if (dbg->force_dma_fallback >= 0) {
-		vslm->force_dma_fallback = (dbg->force_dma_fallback != 0);
+		/* Read lock-free on the I/O path; publish atomically. */
+		__atomic_store_n(&vslm->force_dma_fallback,
+				 (dbg->force_dma_fallback != 0), __ATOMIC_RELAXED);
 	}
 	if (dbg->disable_cow_bypass >= 0) {
-		vslm->disable_cow_bypass = (dbg->disable_cow_bypass != 0);
+		__atomic_store_n(&vslm->disable_cow_bypass,
+				 (dbg->disable_cow_bypass != 0), __ATOMIC_RELAXED);
 	}
 
 	SPDK_NOTICELOG("vslm[%s] debug: num_shards=%u async=%d fault_batch=%d "
@@ -7729,14 +7848,12 @@ bdev_vslm_set_debug(const char *name, const struct spdk_bdev_vslm_debug *dbg)
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) != 0) {
-			continue;
-		}
-		return vslm_apply_debug(vslm, dbg);
+	vslm = vbdev_vslm_get_by_name(name);
+	if (vslm == NULL) {
+		return -ENOENT;
 	}
 
-	return -ENOENT;
+	return vslm_apply_debug(vslm, dbg);
 }
 
 int
@@ -7748,18 +7865,15 @@ bdev_vslm_get_policy(const char *name, struct spdk_bdev_vslm_policy *policy)
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) != 0) {
-			continue;
-		}
-
-		pthread_mutex_lock(&vslm->policy_lock);
-		*policy = vslm->policy;
-		pthread_mutex_unlock(&vslm->policy_lock);
-		return 0;
+	vslm = vbdev_vslm_get_by_name(name);
+	if (vslm == NULL) {
+		return -ENOENT;
 	}
 
-	return -ENOENT;
+	pthread_mutex_lock(&vslm->policy_lock);
+	*policy = vslm->policy;
+	pthread_mutex_unlock(&vslm->policy_lock);
+	return 0;
 }
 
 int
@@ -7771,21 +7885,18 @@ bdev_vslm_set_fdp_mode(const char *name, bool enabled, uint16_t dspec)
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) != 0) {
-			continue;
-		}
-
-		if (enabled && !vslm->base_fdp_supported) {
-			return -ENOTSUP;
-		}
-
-		vslm->fdp_mode_enabled = enabled;
-		vslm->fdp_dspec = dspec;
-		return 0;
+	vslm = vbdev_vslm_get_by_name(name);
+	if (vslm == NULL) {
+		return -ENOENT;
 	}
 
-	return -ENOENT;
+	if (enabled && !vslm->base_fdp_supported) {
+		return -ENOTSUP;
+	}
+
+	vslm->fdp_mode_enabled = enabled;
+	vslm->fdp_dspec = dspec;
+	return 0;
 }
 
 int
@@ -7799,40 +7910,38 @@ bdev_vslm_reset_stats(const char *name)
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) != 0) {
-			continue;
-		}
-
-		/*
-		 * Keep dirty_resident_pages baseline without scanning all SRAM pages.
-		 * Full walks under mmu_lock can stall I/O threads when SRAM is large.
-		 */
-		dirty_pages = __atomic_load_n(&vslm->stats.dirty_resident_pages, __ATOMIC_RELAXED);
-		resident_bytes_current =
-			__atomic_load_n(&vslm->stats.vslm_resident_bytes_current, __ATOMIC_RELAXED);
-		memset(&vslm->stats, 0, sizeof(vslm->stats));
-		memset(&vslm->perf_stats, 0, sizeof(vslm->perf_stats));
-		pthread_mutex_lock(&vslm->policy_lock);
-		vslm->admission_window_start_ticks = 0;
-		vslm->admission_faults_in_window = 0;
-		vslm->last_exec_read_vpn = UINT64_MAX;
-		vslm->sequential_exec_read_count = 0;
-		vslm->last_exec_read_stride = 0;
-		vslm->strided_exec_read_count = 0;
-		vslm->prefetch_until_vpn = 0;
-		pthread_mutex_unlock(&vslm->policy_lock);
-		vslm->last_batch_start_vpn = UINT64_MAX;
-		vslm->last_batch_pages = 0;
-		__atomic_store_n(&vslm->stats.dirty_resident_pages, dirty_pages, __ATOMIC_RELAXED);
-		__atomic_store_n(&vslm->stats.vslm_resident_bytes_current,
-				 resident_bytes_current, __ATOMIC_RELAXED);
-		__atomic_store_n(&vslm->stats.vslm_resident_bytes_peak,
-				 resident_bytes_current, __ATOMIC_RELAXED);
-		return 0;
+	vslm = vbdev_vslm_get_by_name(name);
+	if (vslm == NULL) {
+		return -ENOENT;
 	}
 
-	return -ENOENT;
+	/*
+	 * Keep dirty_resident_pages baseline without scanning all SRAM pages.
+	 * Full walks under mmu_lock can stall I/O threads when SRAM is large.
+	 */
+	dirty_pages = __atomic_load_n(&vslm->stats.dirty_resident_pages, __ATOMIC_RELAXED);
+	resident_bytes_current =
+		__atomic_load_n(&vslm->stats.vslm_resident_bytes_current, __ATOMIC_RELAXED);
+	memset(&vslm->stats, 0, sizeof(vslm->stats));
+	memset(&vslm->perf_stats, 0, sizeof(vslm->perf_stats));
+	pthread_mutex_lock(&vslm->policy_lock);
+	vslm->admission_window_start_ticks = 0;
+	vslm->admission_faults_in_window = 0;
+	vslm->last_exec_read_vpn = UINT64_MAX;
+	vslm->sequential_exec_read_count = 0;
+	vslm->last_exec_read_stride = 0;
+	vslm->strided_exec_read_count = 0;
+	vslm->prefetch_until_vpn = 0;
+	pthread_mutex_unlock(&vslm->policy_lock);
+	/* last_batch_* are read lock-free by the prefetch path; publish atomically. */
+	__atomic_store_n(&vslm->last_batch_start_vpn, UINT64_MAX, __ATOMIC_RELAXED);
+	__atomic_store_n(&vslm->last_batch_pages, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&vslm->stats.dirty_resident_pages, dirty_pages, __ATOMIC_RELAXED);
+	__atomic_store_n(&vslm->stats.vslm_resident_bytes_current,
+			 resident_bytes_current, __ATOMIC_RELAXED);
+	__atomic_store_n(&vslm->stats.vslm_resident_bytes_peak,
+			 resident_bytes_current, __ATOMIC_RELAXED);
+	return 0;
 }
 
 int
@@ -7844,106 +7953,105 @@ bdev_vslm_get_stats(const char *name, struct spdk_bdev_vslm_stats *stats)
 		return -EINVAL;
 	}
 
-	TAILQ_FOREACH(vslm, &g_vslm_bdevs, link) {
-		if (strcmp(vslm->vbdev.name, name) != 0) {
-			continue;
-		}
-
-		stats->backing_write_ops = __atomic_load_n(&vslm->stats.backing_write_ops, __ATOMIC_RELAXED);
-		stats->backing_write_bytes = __atomic_load_n(&vslm->stats.backing_write_bytes, __ATOMIC_RELAXED);
-		stats->backing_write_tagged_bytes = __atomic_load_n(&vslm->stats.backing_write_tagged_bytes,
-						    __ATOMIC_RELAXED);
-		stats->backing_write_untagged_bytes = __atomic_load_n(&vslm->stats.backing_write_untagged_bytes,
-						      __ATOMIC_RELAXED);
-		stats->page_faults = __atomic_load_n(&vslm->stats.page_faults, __ATOMIC_RELAXED);
-		stats->page_fault_bytes = __atomic_load_n(&vslm->stats.page_fault_bytes, __ATOMIC_RELAXED);
-		stats->vslm_fault_clean_total =
-			__atomic_load_n(&vslm->stats.vslm_fault_clean_total, __ATOMIC_RELAXED);
-		stats->vslm_fault_private_total =
-			__atomic_load_n(&vslm->stats.vslm_fault_private_total, __ATOMIC_RELAXED);
-		stats->page_evictions = __atomic_load_n(&vslm->stats.page_evictions, __ATOMIC_RELAXED);
-		stats->page_eviction_bytes = __atomic_load_n(&vslm->stats.page_eviction_bytes, __ATOMIC_RELAXED);
-		stats->vslm_eviction_clean_total =
-			__atomic_load_n(&vslm->stats.vslm_eviction_clean_total, __ATOMIC_RELAXED);
-		stats->vslm_eviction_private_total =
-			__atomic_load_n(&vslm->stats.vslm_eviction_private_total, __ATOMIC_RELAXED);
-		stats->page_writebacks = __atomic_load_n(&vslm->stats.page_writebacks, __ATOMIC_RELAXED);
-		stats->page_writeback_bytes = __atomic_load_n(&vslm->stats.page_writeback_bytes, __ATOMIC_RELAXED);
-		stats->vslm_spill_write_bytes =
-			__atomic_load_n(&vslm->stats.vslm_spill_write_bytes, __ATOMIC_RELAXED);
-		stats->vslm_spill_read_bytes =
-			__atomic_load_n(&vslm->stats.vslm_spill_read_bytes, __ATOMIC_RELAXED);
-		stats->vslm_fast_tier_bytes = vslm->sram_size_bytes;
-		stats->vslm_logical_working_set_bytes = vslm->virtual_size_bytes;
-		stats->dirty_resident_pages = __atomic_load_n(&vslm->stats.dirty_resident_pages, __ATOMIC_RELAXED);
-		stats->vslm_resident_bytes_current =
-			__atomic_load_n(&vslm->stats.vslm_resident_bytes_current,
-					__ATOMIC_RELAXED);
-		stats->vslm_resident_bytes_peak =
-			__atomic_load_n(&vslm->stats.vslm_resident_bytes_peak,
-					__ATOMIC_RELAXED);
-		stats->dirty_writeback_bytes = __atomic_load_n(&vslm->stats.dirty_writeback_bytes,
-					       __ATOMIC_RELAXED);
-		stats->lease_conflicts = __atomic_load_n(&vslm->stats.lease_conflicts, __ATOMIC_RELAXED);
-		stats->lease_blocked_ns = __atomic_load_n(&vslm->stats.lease_blocked_ns, __ATOMIC_RELAXED);
-		stats->admission_rejects = __atomic_load_n(&vslm->stats.admission_rejects, __ATOMIC_RELAXED);
-		stats->vslm_lease_create_total =
-			__atomic_load_n(&vslm->stats.vslm_lease_create_total, __ATOMIC_RELAXED);
-		stats->vslm_lease_release_total =
-			__atomic_load_n(&vslm->stats.vslm_lease_release_total, __ATOMIC_RELAXED);
-		stats->vslm_host_read_during_execution_total =
-			__atomic_load_n(&vslm->stats.vslm_host_read_during_execution_total,
-					__ATOMIC_RELAXED);
-		stats->vslm_host_write_conflict_total =
-			__atomic_load_n(&vslm->stats.vslm_host_write_conflict_total,
-					__ATOMIC_RELAXED);
-		stats->vslm_host_write_blocked_total =
-			__atomic_load_n(&vslm->stats.vslm_host_write_blocked_total,
-					__ATOMIC_RELAXED);
-		stats->vslm_host_write_nonconflict_total =
-			__atomic_load_n(&vslm->stats.vslm_host_write_nonconflict_total,
-					__ATOMIC_RELAXED);
-		stats->vslm_publish_total =
-			__atomic_load_n(&vslm->stats.vslm_publish_total, __ATOMIC_RELAXED);
-		stats->vslm_discard_total =
-			__atomic_load_n(&vslm->stats.vslm_discard_total, __ATOMIC_RELAXED);
-		stats->vslm_visibility_violation_total =
-			__atomic_load_n(&vslm->stats.vslm_visibility_violation_total,
-					__ATOMIC_RELAXED);
-		stats->perf_fault_in_io_ns_total =
-			__atomic_load_n(&vslm->perf_stats.fault_in_io_ns_total, __ATOMIC_RELAXED);
-		stats->perf_fault_in_io_ns_max =
-			__atomic_load_n(&vslm->perf_stats.fault_in_io_ns_max, __ATOMIC_RELAXED);
-		stats->perf_mmu_lock_acquire_total =
-			__atomic_load_n(&vslm->perf_stats.mmu_lock_acquire_total, __ATOMIC_RELAXED);
-		stats->perf_mmu_lock_hold_ns_total =
-			__atomic_load_n(&vslm->perf_stats.mmu_lock_hold_ns_total, __ATOMIC_RELAXED);
-		stats->perf_mmu_lock_hold_ns_max =
-			__atomic_load_n(&vslm->perf_stats.mmu_lock_hold_ns_max, __ATOMIC_RELAXED);
-		stats->perf_sync_base_io_total =
-			__atomic_load_n(&vslm->perf_stats.sync_base_io_total, __ATOMIC_RELAXED);
-		stats->perf_sync_base_io_ns_total =
-			__atomic_load_n(&vslm->perf_stats.sync_base_io_ns_total, __ATOMIC_RELAXED);
-		stats->perf_sync_base_io_ns_max =
-			__atomic_load_n(&vslm->perf_stats.sync_base_io_ns_max, __ATOMIC_RELAXED);
-		stats->perf_sync_read_desc_io_total =
-			__atomic_load_n(&vslm->perf_stats.sync_read_desc_io_total, __ATOMIC_RELAXED);
-		stats->perf_sync_read_desc_io_ns_total =
-			__atomic_load_n(&vslm->perf_stats.sync_read_desc_io_ns_total, __ATOMIC_RELAXED);
-		stats->perf_sync_read_desc_io_ns_max =
-			__atomic_load_n(&vslm->perf_stats.sync_read_desc_io_ns_max, __ATOMIC_RELAXED);
-		stats->perf_fault_batch_attempt_total =
-			__atomic_load_n(&vslm->perf_stats.fault_batch_attempt_total, __ATOMIC_RELAXED);
-		stats->perf_fault_batch_fallback_total =
-			__atomic_load_n(&vslm->perf_stats.fault_batch_fallback_total, __ATOMIC_RELAXED);
-		stats->perf_prefetch_async_wait_total =
-			__atomic_load_n(&vslm->perf_stats.prefetch_async_wait_total, __ATOMIC_RELAXED);
-		stats->perf_prefetch_async_wait_ns_total =
-			__atomic_load_n(&vslm->perf_stats.prefetch_async_wait_ns_total, __ATOMIC_RELAXED);
-		return 0;
+	vslm = vbdev_vslm_get_by_name(name);
+	if (vslm == NULL) {
+		return -ENOENT;
 	}
 
-	return -ENOENT;
+	stats->backing_write_ops = __atomic_load_n(&vslm->stats.backing_write_ops, __ATOMIC_RELAXED);
+	stats->backing_write_bytes = __atomic_load_n(&vslm->stats.backing_write_bytes, __ATOMIC_RELAXED);
+	stats->backing_write_tagged_bytes = __atomic_load_n(&vslm->stats.backing_write_tagged_bytes,
+					    __ATOMIC_RELAXED);
+	stats->backing_write_untagged_bytes = __atomic_load_n(&vslm->stats.backing_write_untagged_bytes,
+					      __ATOMIC_RELAXED);
+	stats->page_faults = __atomic_load_n(&vslm->stats.page_faults, __ATOMIC_RELAXED);
+	stats->page_fault_bytes = __atomic_load_n(&vslm->stats.page_fault_bytes, __ATOMIC_RELAXED);
+	stats->vslm_fault_clean_total =
+		__atomic_load_n(&vslm->stats.vslm_fault_clean_total, __ATOMIC_RELAXED);
+	stats->vslm_fault_private_total =
+		__atomic_load_n(&vslm->stats.vslm_fault_private_total, __ATOMIC_RELAXED);
+	stats->page_evictions = __atomic_load_n(&vslm->stats.page_evictions, __ATOMIC_RELAXED);
+	stats->page_eviction_bytes = __atomic_load_n(&vslm->stats.page_eviction_bytes, __ATOMIC_RELAXED);
+	stats->vslm_eviction_clean_total =
+		__atomic_load_n(&vslm->stats.vslm_eviction_clean_total, __ATOMIC_RELAXED);
+	stats->vslm_eviction_private_total =
+		__atomic_load_n(&vslm->stats.vslm_eviction_private_total, __ATOMIC_RELAXED);
+	stats->page_writebacks = __atomic_load_n(&vslm->stats.page_writebacks, __ATOMIC_RELAXED);
+	stats->page_writeback_bytes = __atomic_load_n(&vslm->stats.page_writeback_bytes, __ATOMIC_RELAXED);
+	stats->vslm_spill_write_bytes =
+		__atomic_load_n(&vslm->stats.vslm_spill_write_bytes, __ATOMIC_RELAXED);
+	stats->vslm_spill_read_bytes =
+		__atomic_load_n(&vslm->stats.vslm_spill_read_bytes, __ATOMIC_RELAXED);
+	stats->vslm_fast_tier_bytes = vslm->sram_size_bytes;
+	stats->vslm_logical_working_set_bytes = vslm->virtual_size_bytes;
+	stats->dirty_resident_pages = __atomic_load_n(&vslm->stats.dirty_resident_pages, __ATOMIC_RELAXED);
+	stats->vslm_resident_bytes_current =
+		__atomic_load_n(&vslm->stats.vslm_resident_bytes_current,
+				__ATOMIC_RELAXED);
+	stats->vslm_resident_bytes_peak =
+		__atomic_load_n(&vslm->stats.vslm_resident_bytes_peak,
+				__ATOMIC_RELAXED);
+	stats->dirty_writeback_bytes = __atomic_load_n(&vslm->stats.dirty_writeback_bytes,
+				       __ATOMIC_RELAXED);
+	stats->lease_conflicts = __atomic_load_n(&vslm->stats.lease_conflicts, __ATOMIC_RELAXED);
+	stats->lease_blocked_ns = __atomic_load_n(&vslm->stats.lease_blocked_ns, __ATOMIC_RELAXED);
+	stats->vslm_host_write_blocked_ns_total =
+		__atomic_load_n(&vslm->stats.vslm_host_write_blocked_ns_total, __ATOMIC_RELAXED);
+	stats->admission_rejects = __atomic_load_n(&vslm->stats.admission_rejects, __ATOMIC_RELAXED);
+	stats->vslm_lease_create_total =
+		__atomic_load_n(&vslm->stats.vslm_lease_create_total, __ATOMIC_RELAXED);
+	stats->vslm_lease_release_total =
+		__atomic_load_n(&vslm->stats.vslm_lease_release_total, __ATOMIC_RELAXED);
+	stats->vslm_host_read_during_execution_total =
+		__atomic_load_n(&vslm->stats.vslm_host_read_during_execution_total,
+				__ATOMIC_RELAXED);
+	stats->vslm_host_write_conflict_total =
+		__atomic_load_n(&vslm->stats.vslm_host_write_conflict_total,
+				__ATOMIC_RELAXED);
+	stats->vslm_host_write_blocked_total =
+		__atomic_load_n(&vslm->stats.vslm_host_write_blocked_total,
+				__ATOMIC_RELAXED);
+	stats->vslm_host_write_nonconflict_total =
+		__atomic_load_n(&vslm->stats.vslm_host_write_nonconflict_total,
+				__ATOMIC_RELAXED);
+	stats->vslm_publish_total =
+		__atomic_load_n(&vslm->stats.vslm_publish_total, __ATOMIC_RELAXED);
+	stats->vslm_discard_total =
+		__atomic_load_n(&vslm->stats.vslm_discard_total, __ATOMIC_RELAXED);
+	stats->vslm_visibility_violation_total =
+		__atomic_load_n(&vslm->stats.vslm_visibility_violation_total,
+				__ATOMIC_RELAXED);
+	stats->perf_fault_in_io_ns_total =
+		__atomic_load_n(&vslm->perf_stats.fault_in_io_ns_total, __ATOMIC_RELAXED);
+	stats->perf_fault_in_io_ns_max =
+		__atomic_load_n(&vslm->perf_stats.fault_in_io_ns_max, __ATOMIC_RELAXED);
+	stats->perf_mmu_lock_acquire_total =
+		__atomic_load_n(&vslm->perf_stats.mmu_lock_acquire_total, __ATOMIC_RELAXED);
+	stats->perf_mmu_lock_hold_ns_total =
+		__atomic_load_n(&vslm->perf_stats.mmu_lock_hold_ns_total, __ATOMIC_RELAXED);
+	stats->perf_mmu_lock_hold_ns_max =
+		__atomic_load_n(&vslm->perf_stats.mmu_lock_hold_ns_max, __ATOMIC_RELAXED);
+	stats->perf_sync_base_io_total =
+		__atomic_load_n(&vslm->perf_stats.sync_base_io_total, __ATOMIC_RELAXED);
+	stats->perf_sync_base_io_ns_total =
+		__atomic_load_n(&vslm->perf_stats.sync_base_io_ns_total, __ATOMIC_RELAXED);
+	stats->perf_sync_base_io_ns_max =
+		__atomic_load_n(&vslm->perf_stats.sync_base_io_ns_max, __ATOMIC_RELAXED);
+	stats->perf_sync_read_desc_io_total =
+		__atomic_load_n(&vslm->perf_stats.sync_read_desc_io_total, __ATOMIC_RELAXED);
+	stats->perf_sync_read_desc_io_ns_total =
+		__atomic_load_n(&vslm->perf_stats.sync_read_desc_io_ns_total, __ATOMIC_RELAXED);
+	stats->perf_sync_read_desc_io_ns_max =
+		__atomic_load_n(&vslm->perf_stats.sync_read_desc_io_ns_max, __ATOMIC_RELAXED);
+	stats->perf_fault_batch_attempt_total =
+		__atomic_load_n(&vslm->perf_stats.fault_batch_attempt_total, __ATOMIC_RELAXED);
+	stats->perf_fault_batch_fallback_total =
+		__atomic_load_n(&vslm->perf_stats.fault_batch_fallback_total, __ATOMIC_RELAXED);
+	stats->perf_prefetch_async_wait_total =
+		__atomic_load_n(&vslm->perf_stats.prefetch_async_wait_total, __ATOMIC_RELAXED);
+	stats->perf_prefetch_async_wait_ns_total =
+		__atomic_load_n(&vslm->perf_stats.prefetch_async_wait_ns_total, __ATOMIC_RELAXED);
+	return 0;
 }
 
 static const struct spdk_bdev_fn_table vbdev_vslm_fn_table = {
@@ -8038,52 +8146,104 @@ vbdev_vslm_nvme_prepare_iovs(struct spdk_bdev_io *bdev_io, uint32_t length,
 	return 0;
 }
 
+/*
+ * Stream the committed-view read into the caller iovs one page-sized chunk at a
+ * time. vslm_read_committed_range() already iterates per page internally, so a
+ * single bounded on-stack bounce avoids a per-I/O malloc of host-controlled size.
+ */
 static int
 vbdev_vslm_nvme_memory_read(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 			    uint64_t starting_byte, uint32_t length,
 			    struct iovec *iovs, int iovcnt)
 {
-	uint8_t *tmp;
+	uint8_t page[VSLM_PAGE_SIZE];
+	struct spdk_iov_xfer ix;
+	uint32_t processed = 0;
 	int rc;
 
-	tmp = malloc(length);
-	if (tmp == NULL) {
-		return -ENOMEM;
+	spdk_iov_xfer_init(&ix, iovs, iovcnt);
+
+	while (processed < length) {
+		uint32_t chunk = spdk_min((uint32_t)VSLM_PAGE_SIZE, length - processed);
+
+		rc = vslm_read_committed_range(vslm, base_ch, starting_byte + processed,
+					       chunk, page);
+		if (rc != 0) {
+			return rc;
+		}
+
+		spdk_iov_xfer_from_buf(&ix, page, chunk);
+		processed += chunk;
 	}
 
-	rc = vslm_read_committed_range(vslm, base_ch, starting_byte, length, tmp);
-	if (rc != 0) {
-		free(tmp);
-		return rc;
-	}
-
-	spdk_copy_buf_to_iovs(iovs, iovcnt, tmp, length);
-	free(tmp);
 	return 0;
 }
 
+/*
+ * Stream the host write out of the caller iovs one page-sized chunk at a time.
+ * vslm_copy_range() iterates per page internally, so a bounded on-stack bounce
+ * avoids a per-I/O malloc of host-controlled size.
+ */
 static int
 vbdev_vslm_nvme_memory_write(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 			     uint64_t starting_byte, uint32_t length,
 			     struct iovec *iovs, int iovcnt)
 {
-	uint8_t *tmp;
+	uint8_t page[VSLM_PAGE_SIZE];
+	struct spdk_iov_xfer ix;
+	uint32_t processed = 0;
 	int rc;
 
-	tmp = malloc(length);
-	if (tmp == NULL) {
-		return -ENOMEM;
+	spdk_iov_xfer_init(&ix, iovs, iovcnt);
+
+	while (processed < length) {
+		uint32_t chunk = spdk_min((uint32_t)VSLM_PAGE_SIZE, length - processed);
+
+		spdk_iov_xfer_to_buf(&ix, page, chunk);
+		rc = vslm_copy_range(vslm, base_ch, starting_byte + processed, chunk, page,
+				     true);
+		if (rc != 0) {
+			return rc;
+		}
+
+		processed += chunk;
 	}
 
-	spdk_copy_iovs_to_buf(tmp, length, iovs, iovcnt);
-	rc = vslm_copy_range(vslm, base_ch, starting_byte, length, tmp, true);
-	if (rc != 0) {
-		free(tmp);
-		return rc;
-	}
-
-	free(tmp);
 	return 0;
+}
+
+/*
+ * Decode and bounds-validate the SLM memory range (start offset / length) shared
+ * by the MEMORY_FILL/READ/WRITE opcodes. Returns the decoded range via the out
+ * params and an NVMe status code: SPDK_NVME_SC_SUCCESS for a valid non-empty
+ * range, SPDK_NVME_SC_INVALID_FIELD for an unaligned/out-of-bounds range. A
+ * zero-length (no-op) range is reported via *is_empty so the caller can complete
+ * it as success without further work.
+ */
+static int
+decode_and_validate_slm_range(const struct spdk_nvme_cmd *cmd, uint64_t buffer_size,
+			      uint64_t *starting_byte, uint32_t *length, bool *is_empty)
+{
+	uint64_t start;
+	uint32_t len;
+	uint64_t end;
+
+	start = ((uint64_t)cmd->cdw11 << 32) | cmd->cdw10;
+	len = cmd->cdw12;
+
+	if ((start & 0x3) != 0 || (len & 0x3) != 0) {
+		return SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	end = start + len;
+	if (end < start || end > buffer_size) {
+		return SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	*starting_byte = start;
+	*length = len;
+	*is_empty = (len == 0);
+	return SPDK_NVME_SC_SUCCESS;
 }
 
 static void
@@ -8091,12 +8251,12 @@ vbdev_vslm_submit_nvme_passthru(struct vbdev_vslm *vslm, struct spdk_io_channel 
 				struct spdk_bdev_io *bdev_io)
 {
 	const struct spdk_nvme_cmd *cmd = &bdev_io->u.nvme_passthru.cmd;
-	uint64_t starting_byte;
-	uint32_t length;
-	uint64_t end;
+	uint64_t starting_byte = 0;
+	uint32_t length = 0;
 	uint64_t buffer_size = vslm->virtual_size_bytes;
 	struct iovec *iovs = NULL;
 	struct iovec local_iov;
+	bool is_empty = false;
 	int iovcnt = 0;
 	int sct = SPDK_NVME_SCT_GENERIC;
 	int sc = SPDK_NVME_SC_SUCCESS;
@@ -8104,21 +8264,9 @@ vbdev_vslm_submit_nvme_passthru(struct vbdev_vslm *vslm, struct spdk_io_channel 
 
 	switch (cmd->opc) {
 	case SPDK_NVME_SLM_OPC_MEMORY_FILL:
-		starting_byte = ((uint64_t)cmd->cdw11 << 32) | cmd->cdw10;
-		length = cmd->cdw12;
-
-		if ((starting_byte & 0x3) != 0 || (length & 0x3) != 0) {
-			sc = SPDK_NVME_SC_INVALID_FIELD;
-			goto out;
-		}
-
-		end = starting_byte + length;
-		if (end < starting_byte || end > buffer_size) {
-			sc = SPDK_NVME_SC_INVALID_FIELD;
-			goto out;
-		}
-
-		if (length == 0) {
+		sc = decode_and_validate_slm_range(cmd, buffer_size, &starting_byte,
+						   &length, &is_empty);
+		if (sc != SPDK_NVME_SC_SUCCESS || is_empty) {
 			goto out;
 		}
 
@@ -8145,21 +8293,9 @@ vbdev_vslm_submit_nvme_passthru(struct vbdev_vslm *vslm, struct spdk_io_channel 
 		}
 		goto out;
 	case SPDK_NVME_SLM_OPC_MEMORY_READ:
-		starting_byte = ((uint64_t)cmd->cdw11 << 32) | cmd->cdw10;
-		length = cmd->cdw12;
-
-		if ((starting_byte & 0x3) != 0 || (length & 0x3) != 0) {
-			sc = SPDK_NVME_SC_INVALID_FIELD;
-			goto out;
-		}
-
-		end = starting_byte + length;
-		if (end < starting_byte || end > buffer_size) {
-			sc = SPDK_NVME_SC_INVALID_FIELD;
-			goto out;
-		}
-
-		if (length == 0) {
+		sc = decode_and_validate_slm_range(cmd, buffer_size, &starting_byte,
+						   &length, &is_empty);
+		if (sc != SPDK_NVME_SC_SUCCESS || is_empty) {
 			goto out;
 		}
 
@@ -8184,21 +8320,9 @@ vbdev_vslm_submit_nvme_passthru(struct vbdev_vslm *vslm, struct spdk_io_channel 
 		}
 		break;
 	case SPDK_NVME_SLM_OPC_MEMORY_WRITE:
-		starting_byte = ((uint64_t)cmd->cdw11 << 32) | cmd->cdw10;
-		length = cmd->cdw12;
-
-		if ((starting_byte & 0x3) != 0 || (length & 0x3) != 0) {
-			sc = SPDK_NVME_SC_INVALID_FIELD;
-			goto out;
-		}
-
-		end = starting_byte + length;
-		if (end < starting_byte || end > buffer_size) {
-			sc = SPDK_NVME_SC_INVALID_FIELD;
-			goto out;
-		}
-
-		if (length == 0) {
+		sc = decode_and_validate_slm_range(cmd, buffer_size, &starting_byte,
+						   &length, &is_empty);
+		if (sc != SPDK_NVME_SC_SUCCESS || is_empty) {
 			goto out;
 		}
 
