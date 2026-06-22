@@ -320,6 +320,15 @@ struct vslm_mmu_shard {
 	TAILQ_HEAD(, vslm_page) free_list;
 	uint64_t base_ppn;
 	uint64_t num_frames;
+	/*
+	 * O(1) running count of frames on free_list, maintained at every free-list
+	 * push/pop (all funneled through vslm_free_list_insert_tail/vslm_get_free_page
+	 * plus the init-time seed below) under shard->lock. Lets the background
+	 * cleaner's clean/free watermark check skip an O(frames) free-list rescan per
+	 * resolve-miss. Guarded by an assert against a debug rescan, see
+	 * vslm_count_clean_or_free_pages_locked().
+	 */
+	uint32_t free_frame_count;
 };
 
 struct vbdev_vslm {
@@ -1633,6 +1642,7 @@ vslm_free_list_insert_tail(struct vbdev_vslm *vslm, struct vslm_page *page)
 
 	TAILQ_INSERT_TAIL(&shard->free_list, page, lru_link);
 	page->location = VSLM_PAGE_LOC_FREE;
+	shard->free_frame_count++;
 	VSLM_PERF_INC(vslm, free_list_push_total);
 }
 
@@ -1976,6 +1986,7 @@ vslm_build_shards(struct vbdev_vslm *vslm, uint32_t num_shards)
 
 		TAILQ_INIT(&shard->lru_list);
 		TAILQ_INIT(&shard->free_list);
+		shard->free_frame_count = 0;
 		for (i = 0; i < shard->num_buckets; i++) {
 			LIST_INIT(&shard->hash_table[i]);
 			LIST_INIT(&shard->lpage_hash_table[i]);
@@ -2004,6 +2015,7 @@ vslm_build_shards(struct vbdev_vslm *vslm, uint32_t num_shards)
 			}
 		}
 		TAILQ_INSERT_TAIL(&vslm->shards[page->shard_id].free_list, page, lru_link);
+		vslm->shards[page->shard_id].free_frame_count++;
 	}
 
 	return 0;
@@ -2143,6 +2155,8 @@ vslm_get_free_page(struct vbdev_vslm *vslm, struct vslm_mmu_shard *shard)
 
 		TAILQ_REMOVE(&shard->free_list, page, lru_link);
 		page->location = VSLM_PAGE_LOC_NONE;
+		assert(shard->free_frame_count > 0);
+		shard->free_frame_count--;
 		VSLM_PERF_INC(vslm, free_list_pop_total);
 	}
 
@@ -2151,7 +2165,7 @@ vslm_get_free_page(struct vbdev_vslm *vslm, struct vslm_mmu_shard *shard)
 
 static struct vslm_page *
 vslm_pick_victim_pass(struct vbdev_vslm *vslm, struct vslm_mmu_shard *shard,
-		      bool clean_only, bool count_skips)
+		      bool clean_only, bool count_skips, bool any_lease)
 {
 	struct vslm_page *page;
 	struct vslm_lpage *lpage;
@@ -2178,15 +2192,24 @@ vslm_pick_victim_pass(struct vbdev_vslm *vslm, struct vslm_mmu_shard *shard,
 			continue;
 		}
 
-		lpage = vslm_lookup_lpage(vslm, page->vpn);
-		if (lpage != NULL &&
-		    lpage->state == SPDK_BDEV_VSLM_LPAGE_PRIVATE_DIRTY_RESIDENT &&
-		    lpage->pending_publish &&
-		    vslm_vpn_has_active_lease(vslm, page->vpn)) {
-			if (count_skips) {
-				VSLM_PERF_INC(vslm, victim_skip_lease_total);
+		/*
+		 * Lease pins are never evicted. any_lease is a snapshot of "the
+		 * instance has at least one active lease" taken once for this scan:
+		 * when it is false the lease list is empty, so no vpn can be leased
+		 * and the per-candidate vslm_vpn_has_active_lease() lock+scan is
+		 * skipped. When it is true keep the exact per-candidate check.
+		 */
+		if (any_lease) {
+			lpage = vslm_lookup_lpage(vslm, page->vpn);
+			if (lpage != NULL &&
+			    lpage->state == SPDK_BDEV_VSLM_LPAGE_PRIVATE_DIRTY_RESIDENT &&
+			    lpage->pending_publish &&
+			    vslm_vpn_has_active_lease(vslm, page->vpn)) {
+				if (count_skips) {
+					VSLM_PERF_INC(vslm, victim_skip_lease_total);
+				}
+				continue;
 			}
-			continue;
 		}
 		if (clean_only && page->dirty) {
 			continue;
@@ -2205,15 +2228,26 @@ static struct vslm_page *
 vslm_pick_victim(struct vbdev_vslm *vslm, struct vslm_mmu_shard *shard)
 {
 	struct vslm_page *page;
+	bool any_lease;
 
 	VSLM_PERF_INC(vslm, victim_pick_total);
 
-	page = vslm_pick_victim_pass(vslm, shard, true, true);
+	/*
+	 * Snapshot once whether any lease exists. The caller already holds
+	 * shard->lock, and vslm_vpn_has_active_lease() also takes lease_lock while
+	 * the shard lock is held, so taking lease_lock here preserves the existing
+	 * shard->lock -> lease_lock ordering (no new lock-order edge).
+	 */
+	pthread_mutex_lock(&vslm->lease_lock);
+	any_lease = !TAILQ_EMPTY(&vslm->leases);
+	pthread_mutex_unlock(&vslm->lease_lock);
+
+	page = vslm_pick_victim_pass(vslm, shard, true, true, any_lease);
 	if (page != NULL) {
 		return page;
 	}
 
-	return vslm_pick_victim_pass(vslm, shard, false, false);
+	return vslm_pick_victim_pass(vslm, shard, false, false, any_lease);
 }
 
 /* Count clean/free frames in a single shard (caller holds shard->lock). */
@@ -2222,13 +2256,28 @@ vslm_count_clean_or_free_pages_locked(struct vbdev_vslm *vslm,
 				      struct vslm_mmu_shard *shard)
 {
 	struct vslm_page *page;
-	uint32_t count = 0;
+	uint32_t count;
 
 	(void)vslm;
 
-	TAILQ_FOREACH(page, &shard->free_list, lru_link) {
-		count++;
+	/*
+	 * Free frames use the O(1) running counter (vslm_mmu_shard.free_frame_count)
+	 * maintained at every free-list push/pop, removing the per-call O(frames)
+	 * free-list rescan. In debug builds, cross-check the counter against a real
+	 * rescan so a missed maintenance site is caught immediately.
+	 */
+	count = shard->free_frame_count;
+
+#ifndef NDEBUG
+	{
+		uint32_t scanned_free = 0;
+
+		TAILQ_FOREACH(page, &shard->free_list, lru_link) {
+			scanned_free++;
+		}
+		assert(scanned_free == shard->free_frame_count);
 	}
+#endif
 
 	TAILQ_FOREACH(page, &shard->lru_list, lru_link) {
 		if (!page->dirty &&
@@ -3843,10 +3892,27 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 								       offset_blocks, num_blocks);
 				if (rc == 0) {
 					bounce_memcpy_start_ticks = spdk_get_ticks();
-					for (uint32_t i = 0; i < batch.nr_pages; i++) {
+					/*
+					 * The bounce buffer is contiguous (page i lives at
+					 * bounce + i*PAGE), so a run of destination frames that
+					 * are physically contiguous in SRAM maps to one
+					 * contiguous source slice. Coalesce the scatter into one
+					 * memcpy per maximal contiguous destination run instead of
+					 * one per page; the data movement is identical.
+					 */
+					for (uint32_t i = 0; i < batch.nr_pages;) {
+						uint32_t j = i + 1;
+
+						while (j < batch.nr_pages &&
+						       (uint8_t *)batch.iov[j].iov_base ==
+						       (uint8_t *)batch.iov[i].iov_base +
+						       (uint64_t)(j - i) * VSLM_PAGE_SIZE) {
+							j++;
+						}
 						memcpy(batch.iov[i].iov_base,
-						       bounce + (i * VSLM_PAGE_SIZE),
-						       VSLM_PAGE_SIZE);
+						       bounce + ((uint64_t)i * VSLM_PAGE_SIZE),
+						       (size_t)(j - i) * VSLM_PAGE_SIZE);
+						i = j;
 					}
 					bounce_memcpy_ns = vslm_ticks_delta_to_ns(bounce_memcpy_start_ticks,
 							   spdk_get_ticks());
