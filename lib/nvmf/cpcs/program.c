@@ -52,8 +52,17 @@ cpcs_program_load(struct spdk_nvmf_cpcs_ns *ns,
 			return -SPDK_NVME_CPCS_SC_PROGRAM_IN_USE;
 		}
 
-		/* Check program size limits */
-		load_gran = 1 << ns->load_program_gran;
+		/*
+		 * Check program size limits. PSIZE is a 32-bit byte count, so a
+		 * granularity shift of 32 or more is nonsensical and would also
+		 * be undefined behaviour for a 32-bit shift; reject it.
+		 */
+		if (ns->load_program_gran >= 32) {
+			pthread_mutex_unlock(&ns->lock);
+			SPDK_ERRLOG("Invalid load program granularity: %u\n", ns->load_program_gran);
+			return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
+		}
+		load_gran = 1U << ns->load_program_gran;
 		if (psize == 0 || (psize % load_gran) != 0) {
 			pthread_mutex_unlock(&ns->lock);
 			return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;

@@ -386,7 +386,8 @@ cpcs_reachability_get_memory_ns(struct cpcs_reachability_manager *mgr,
 				uint32_t *count)
 {
 	struct cpcs_reachability_association *assoc;
-	struct cpcs_reachability_group *group;
+	struct cpcs_reachability_group *own_group;
+	struct cpcs_reachability_group *assoc_group;
 	struct cpcs_reachability_ns_entry *entry;
 	uint32_t idx = 0;
 	bool assoc_has_group;
@@ -404,14 +405,14 @@ cpcs_reachability_get_memory_ns(struct cpcs_reachability_manager *mgr,
 		return 0;
 	}
 
-	group = cpcs_reachability_find_group(mgr, compute_ns->reach_group_id);
-	if (!group) {
+	own_group = cpcs_reachability_find_group(mgr, compute_ns->reach_group_id);
+	if (!own_group) {
 		pthread_mutex_unlock(&mgr->lock);
 		*count = 0;
 		return -ENOENT;
 	}
 
-	TAILQ_FOREACH(entry, &group->namespaces, link) {
+	TAILQ_FOREACH(entry, &own_group->namespaces, link) {
 		if (entry->ns && entry->ns->csi == SPDK_NVME_CSI_CPCS) {
 			continue;
 		}
@@ -429,7 +430,7 @@ cpcs_reachability_get_memory_ns(struct cpcs_reachability_manager *mgr,
 		assoc_has_group = false;
 
 		for (i = 0; i < assoc->group_count; i++) {
-			if (assoc->group_ids[i] == group->group_id) {
+			if (assoc->group_ids[i] == own_group->group_id) {
 				assoc_has_group = true;
 				break;
 			}
@@ -440,12 +441,12 @@ cpcs_reachability_get_memory_ns(struct cpcs_reachability_manager *mgr,
 		}
 
 		for (i = 0; i < assoc->group_count; i++) {
-			group = cpcs_reachability_find_group(mgr, assoc->group_ids[i]);
-			if (!group) {
+			assoc_group = cpcs_reachability_find_group(mgr, assoc->group_ids[i]);
+			if (!assoc_group) {
 				continue;
 			}
 
-			TAILQ_FOREACH(entry, &group->namespaces, link) {
+			TAILQ_FOREACH(entry, &assoc_group->namespaces, link) {
 				if (entry->ns && entry->ns->csi == SPDK_NVME_CSI_CPCS) {
 					continue;
 				}
@@ -472,7 +473,8 @@ cpcs_reachability_is_memory_ns_reachable(struct cpcs_reachability_manager *mgr,
 		uint32_t mnsid)
 {
 	struct cpcs_reachability_association *assoc;
-	struct cpcs_reachability_group *group;
+	struct cpcs_reachability_group *own_group;
+	struct cpcs_reachability_group *assoc_group;
 	bool assoc_has_group;
 	bool reachable = false;
 	uint8_t i;
@@ -487,12 +489,12 @@ cpcs_reachability_is_memory_ns_reachable(struct cpcs_reachability_manager *mgr,
 
 	pthread_mutex_lock(&mgr->lock);
 
-	group = cpcs_reachability_find_group(mgr, compute_ns->reach_group_id);
-	if (!group) {
+	own_group = cpcs_reachability_find_group(mgr, compute_ns->reach_group_id);
+	if (!own_group) {
 		goto out;
 	}
 
-	if (cpcs_reachability_group_has_memory_nsid(group, mnsid)) {
+	if (cpcs_reachability_group_has_memory_nsid(own_group, mnsid)) {
 		reachable = true;
 		goto out;
 	}
@@ -500,7 +502,7 @@ cpcs_reachability_is_memory_ns_reachable(struct cpcs_reachability_manager *mgr,
 	TAILQ_FOREACH(assoc, &mgr->associations, link) {
 		assoc_has_group = false;
 		for (i = 0; i < assoc->group_count; i++) {
-			if (assoc->group_ids[i] == group->group_id) {
+			if (assoc->group_ids[i] == own_group->group_id) {
 				assoc_has_group = true;
 				break;
 			}
@@ -511,12 +513,12 @@ cpcs_reachability_is_memory_ns_reachable(struct cpcs_reachability_manager *mgr,
 		}
 
 		for (i = 0; i < assoc->group_count; i++) {
-			group = cpcs_reachability_find_group(mgr, assoc->group_ids[i]);
-			if (!group) {
+			assoc_group = cpcs_reachability_find_group(mgr, assoc->group_ids[i]);
+			if (!assoc_group) {
 				continue;
 			}
 
-			if (cpcs_reachability_group_has_memory_nsid(group, mnsid)) {
+			if (cpcs_reachability_group_has_memory_nsid(assoc_group, mnsid)) {
 				reachable = true;
 				goto out;
 			}

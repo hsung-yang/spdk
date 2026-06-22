@@ -29,6 +29,47 @@ cpcs_mrs_get_bdev_by_nsid(uint32_t mnsid)
 	return NULL;
 }
 
+static bool
+cpcs_mrs_rsid_in_use_locked(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
+{
+	struct cpcs_memory_range_set *mrs;
+
+	TAILQ_FOREACH(mrs, &ns->mrs_list, link) {
+		if (mrs->rsid == rsid) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Allocate the next free, non-zero RSID. RSID 0 is reserved (it means
+ * "no Memory Range Set" on the Execute Program path), so it is skipped on
+ * wrap. Returns 0 if no RSID is free.
+ */
+static uint16_t
+cpcs_mrs_alloc_rsid_locked(struct spdk_nvmf_cpcs_ns *ns)
+{
+	uint32_t attempts;
+	uint16_t rsid;
+
+	/* Try every possible non-zero RSID value at most once. */
+	for (attempts = 0; attempts < UINT16_MAX; attempts++) {
+		rsid = ns->next_rsid++;
+		if (rsid == 0) {
+			/* Skip the reserved value on wrap. */
+			continue;
+		}
+
+		if (!cpcs_mrs_rsid_in_use_locked(ns, rsid)) {
+			return rsid;
+		}
+	}
+
+	return 0;
+}
+
 int
 cpcs_mrs_create(struct spdk_nvmf_cpcs_ns *ns,
 		const struct spdk_nvme_cpcs_memory_range_descriptor *ranges,
@@ -86,7 +127,13 @@ cpcs_mrs_create(struct spdk_nvmf_cpcs_ns *ns,
 	}
 
 	/* Initialize MRS */
-	mrs->rsid = ns->next_rsid++;
+	mrs->rsid = cpcs_mrs_alloc_rsid_locked(ns);
+	if (mrs->rsid == 0) {
+		free(mrs->ranges);
+		free(mrs);
+		pthread_mutex_unlock(&ns->lock);
+		return -SPDK_NVME_CPCS_SC_MAX_MEMORY_RANGE_SETS_EXCEEDED;
+	}
 	mrs->range_count = num_ranges;
 	mrs->ref_count = 0;
 
@@ -182,6 +229,35 @@ cpcs_mrs_get(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
 	return NULL;
 }
 
+struct cpcs_memory_range_set *
+cpcs_mrs_get_and_acquire(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
+{
+	struct cpcs_memory_range_set *mrs;
+
+	if (!ns) {
+		return NULL;
+	}
+
+	pthread_mutex_lock(&ns->lock);
+
+	TAILQ_FOREACH(mrs, &ns->mrs_list, link) {
+		if (mrs->rsid == rsid) {
+			/*
+			 * Increment the reference count while still holding
+			 * ns->lock so that a concurrent cpcs_mrs_delete() cannot
+			 * observe ref_count==0 and free the MRS between lookup
+			 * and acquire.
+			 */
+			__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
+			pthread_mutex_unlock(&ns->lock);
+			return mrs;
+		}
+	}
+
+	pthread_mutex_unlock(&ns->lock);
+	return NULL;
+}
+
 int
 cpcs_mrs_acquire(struct cpcs_memory_range_set *mrs)
 {
@@ -231,10 +307,26 @@ cpcs_mrs_validate_locked(struct spdk_nvmf_cpcs_ns *ns,
 	uint64_t start1, end1, start2, end2;
 	uint8_t i, j;
 
+	/*
+	 * MRSG is a power-of-two byte granularity over a 64-bit address space.
+	 * A shift of 64 or more is undefined behaviour, so reject it. Use an
+	 * explicit 64-bit width for the shift.
+	 */
+	if (ns->mrs_granularity >= 64) {
+		SPDK_ERRLOG("Invalid MRS granularity: %u\n", ns->mrs_granularity);
+		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET;
+	}
 	granularity = 1ULL << ns->mrs_granularity;
 
 	for (i = 0; i < num_ranges; i++) {
 		start1 = ranges[i].starting_byte;
+
+		/* Reject ranges whose end address overflows uint64. */
+		if (ranges[i].length > UINT64_MAX - start1) {
+			SPDK_ERRLOG("Memory range end address overflow: start=%lu len=%u\n",
+				    start1, ranges[i].length);
+			return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET;
+		}
 		end1 = start1 + ranges[i].length;
 
 		/* Validate granularity alignment */
@@ -253,6 +345,13 @@ cpcs_mrs_validate_locked(struct spdk_nvmf_cpcs_ns *ns,
 			/* Same memory namespace */
 			if (ranges[i].mnsid == ranges[j].mnsid) {
 				start2 = ranges[j].starting_byte;
+
+				/* Reject ranges whose end address overflows uint64. */
+				if (ranges[j].length > UINT64_MAX - start2) {
+					SPDK_ERRLOG("Memory range end address overflow: start=%lu len=%u\n",
+						    start2, ranges[j].length);
+					return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET;
+				}
 				end2 = start2 + ranges[j].length;
 
 				/* Check overlap */
@@ -301,10 +400,21 @@ cpcs_mrs_get_buffer(struct cpcs_memory_range_set *mrs,
 	range_idx = mr_id - 1;
 	mr = &mrs->ranges[range_idx];
 
-	/* Validate offset and length are within range */
-	if (offset + len > mr->length) {
+	/*
+	 * Validate offset and length are within range without overflowing.
+	 * (offset + len) could wrap, so compare each term against the range
+	 * length instead.
+	 */
+	if (len > mr->length || offset > (uint64_t)mr->length - len) {
 		SPDK_ERRLOG("Access out of bounds: offset=%lu len=%lu range_len=%u\n",
 			    offset, len, mr->length);
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	/* Guard against starting_byte + offset wrapping around uint64. */
+	if (offset > UINT64_MAX - mr->starting_byte) {
+		SPDK_ERRLOG("Memory range offset overflow: starting_byte=%lu offset=%lu\n",
+			    mr->starting_byte, offset);
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 

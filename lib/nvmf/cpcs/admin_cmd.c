@@ -69,8 +69,7 @@ cpcs_admin_load_program(struct spdk_nvmf_request *req)
 		rc = cpcs_program_unload(ns, pind);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to unload program %u: %d\n", pind, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_status_from_rc(rc, &req->rsp->nvme_cpl.status);
 			spdk_nvmf_request_complete(req);
 			return rc;
 		}
@@ -80,6 +79,16 @@ cpcs_admin_load_program(struct spdk_nvmf_request *req)
 		return 0;
 
 	case SPDK_NVME_CPCS_LOAD_OP_LOAD:
+		/* A load with no data bytes is meaningless; reject it directly. */
+		if (numb == 0) {
+			SPDK_ERRLOG("Load Program with NUMB=0 is invalid\n");
+			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INVALID_FIELD;
+			req->rsp->nvme_cpl.status.dnr = 1;
+			spdk_nvmf_request_complete(req);
+			return -EINVAL;
+		}
+
 		/* Get data from DPTR if NUMB > 0 */
 		if (numb > 0) {
 			if (req->length < numb) {
@@ -120,8 +129,7 @@ cpcs_admin_load_program(struct spdk_nvmf_request *req)
 		}
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to load program %u: %d\n", pind, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_status_from_rc(rc, &req->rsp->nvme_cpl.status);
 			spdk_nvmf_request_complete(req);
 			return rc;
 		}
@@ -169,8 +177,7 @@ cpcs_admin_program_activation(struct spdk_nvmf_request *req)
 		rc = cpcs_program_activate(ns, pind);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to activate program %u: %d\n", pind, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_status_from_rc(rc, &req->rsp->nvme_cpl.status);
 		} else {
 			SPDK_DEBUGLOG(nvmf_cpcs, "Program %u activated successfully\n", pind);
 		}
@@ -180,8 +187,7 @@ cpcs_admin_program_activation(struct spdk_nvmf_request *req)
 		rc = cpcs_program_deactivate(ns, pind);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to deactivate program %u: %d\n", pind, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_status_from_rc(rc, &req->rsp->nvme_cpl.status);
 		} else {
 			SPDK_DEBUGLOG(nvmf_cpcs, "Program %u deactivated successfully\n", pind);
 		}
@@ -281,8 +287,7 @@ cpcs_admin_mrs_management(struct spdk_nvmf_request *req)
 		}
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to create MRS: %d\n", rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_status_from_rc(rc, &req->rsp->nvme_cpl.status);
 		} else {
 			/* Return RSID in DW0 */
 			req->rsp->nvme_cpl.cdw0 = rsid;
@@ -294,8 +299,7 @@ cpcs_admin_mrs_management(struct spdk_nvmf_request *req)
 		rc = cpcs_mrs_delete(ns, rsid);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to delete MRS %u: %d\n", rsid, rc);
-			req->rsp->nvme_cpl.status.sc = -rc;
-			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			cpcs_status_from_rc(rc, &req->rsp->nvme_cpl.status);
 		} else {
 			SPDK_DEBUGLOG(nvmf_cpcs, "MRS %u deleted successfully\n", rsid);
 		}

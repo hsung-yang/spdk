@@ -19,6 +19,52 @@
 extern "C" {
 #endif
 
+/**
+ * Map an internal return code to an NVMe completion status.
+ *
+ * CPCS handlers return either a negated CPCS command-specific status code
+ * (0x80..0xFF, e.g. -SPDK_NVME_CPCS_SC_*) or a raw negative errno
+ * (-EINVAL/-ENOMEM/...). This helper writes the correct (sct, sc, dnr) so
+ * that raw errnos do not leak out as bogus command-specific NVMe statuses.
+ *
+ * \param rc Return code (0 on success, negative on failure)
+ * \param status NVMe completion status to populate
+ */
+static inline void
+cpcs_status_from_rc(int rc, struct spdk_nvme_status *status)
+{
+	if (rc == 0) {
+		status->sct = SPDK_NVME_SCT_GENERIC;
+		status->sc = SPDK_NVME_SC_SUCCESS;
+		return;
+	}
+
+	if (rc < 0 && -rc >= 0x80) {
+		/* CPCS (or other) command-specific status code. */
+		status->sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		status->sc = (uint16_t)(-rc);
+		status->dnr = 1;
+		return;
+	}
+
+	/* Map raw errnos to generic NVMe status codes. */
+	status->sct = SPDK_NVME_SCT_GENERIC;
+	switch (rc) {
+	case -EINVAL:
+		status->sc = SPDK_NVME_SC_INVALID_FIELD;
+		break;
+	case -ENOENT:
+		status->sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+		break;
+	case -ENOMEM:
+	case -EIO:
+	default:
+		status->sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		break;
+	}
+	status->dnr = 1;
+}
+
 /* Forward declarations */
 struct spdk_nvmf_subsystem;
 struct spdk_nvmf_ns;

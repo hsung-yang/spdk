@@ -164,6 +164,36 @@ cpcs_execute_resolve_ranges(struct cpcs_exec_context *ctx)
 	return 0;
 }
 
+/*
+ * Decrement the program's in-flight execution count under ns->lock, matching
+ * the increment in cpcs_execute_run(). Keeping both sides under the same lock
+ * means cpcs_program_unload()/deactivate() (which read exec_count under
+ * ns->lock) never see a torn or stale value.
+ */
+static void
+cpcs_execute_dec_exec_count(struct cpcs_exec_context *ctx)
+{
+	if (ctx == NULL || ctx->program == NULL) {
+		return;
+	}
+
+	/*
+	 * Mirror the increment in cpcs_execute_run(): use ns->lock when an ns is
+	 * present, otherwise (test-harness path) fall back to an atomic decrement.
+	 */
+	if (ctx->ns != NULL) {
+		pthread_mutex_lock(&ctx->ns->lock);
+		if (ctx->program->exec_count > 0) {
+			ctx->program->exec_count--;
+		}
+		pthread_mutex_unlock(&ctx->ns->lock);
+	} else {
+		if (ctx->program->exec_count > 0) {
+			__atomic_sub_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+		}
+	}
+}
+
 int
 cpcs_execute_program_cmd(struct spdk_nvmf_request *req)
 {
@@ -320,17 +350,15 @@ cpcs_execute_setup_memory(struct cpcs_exec_context *ctx)
 	struct spdk_nvme_cpcs_memory_range_descriptor *descriptors;
 
 	if (ctx->rsid != 0) {
-		/* Use pre-created Memory Range Set */
-		ctx->mrs = cpcs_mrs_get(ctx->ns, ctx->rsid);
+		/*
+		 * Use pre-created Memory Range Set. Look up and acquire the
+		 * reference atomically under ns->lock so a concurrent delete
+		 * cannot free the set between the lookup and the acquire.
+		 */
+		ctx->mrs = cpcs_mrs_get_and_acquire(ctx->ns, ctx->rsid);
 		if (!ctx->mrs) {
 			SPDK_ERRLOG("MRS %u not found\n", ctx->rsid);
 			return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_RANGE_SET_ID;
-		}
-
-		rc = cpcs_mrs_acquire(ctx->mrs);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to acquire MRS %u: %d\n", ctx->rsid, rc);
-			return rc;
 		}
 
 		SPDK_DEBUGLOG(nvmf_cpcs, "Acquired MRS %u for execution\n", ctx->rsid);
@@ -399,15 +427,36 @@ cpcs_execute_run(struct cpcs_exec_context *ctx)
 		return -SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 
-	/* Increment execution count */
-	__atomic_add_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+	/*
+	 * Re-check that the program is still activated and bump exec_count
+	 * atomically under ns->lock. cpcs_program_unload()/deactivate() refuse
+	 * while exec_count > 0 (also under ns->lock), so once this increment is
+	 * visible the program cannot be freed or deactivated underneath us. This
+	 * closes the use-after-free window between the activated-check in
+	 * cpcs_execute_parse_cmd() and the start of execution here.
+	 *
+	 * Some in-process test harnesses call cpcs_execute_run() directly with
+	 * ctx->ns == NULL; in that case fall back to an atomic increment.
+	 */
+	if (ctx->ns != NULL) {
+		pthread_mutex_lock(&ctx->ns->lock);
+		if (!ctx->program->activated) {
+			pthread_mutex_unlock(&ctx->ns->lock);
+			SPDK_ERRLOG("Program %u no longer activated\n", ctx->program->pind);
+			return -SPDK_NVME_CPCS_SC_PROGRAM_NOT_ACTIVATED;
+		}
+		ctx->program->exec_count++;
+		pthread_mutex_unlock(&ctx->ns->lock);
+	} else {
+		__atomic_add_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+	}
 
 	SPDK_DEBUGLOG(nvmf_cpcs, "Executing program %u (type %u)\n",
 		      ctx->program->pind, ctx->program->ptype);
 
 	/* Execute program asynchronously. */
 	if (runtime->execute_async == NULL) {
-		__atomic_sub_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+		cpcs_execute_dec_exec_count(ctx);
 		return -SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 
@@ -423,7 +472,7 @@ cpcs_execute_run(struct cpcs_exec_context *ctx)
 		pthread_mutex_unlock(&ctx->program->lock);
 		if (rc != 0) {
 			ctx->runtime_pending = false;
-			__atomic_sub_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+			cpcs_execute_dec_exec_count(ctx);
 			return rc;
 		}
 
@@ -438,7 +487,7 @@ cpcs_execute_run(struct cpcs_exec_context *ctx)
 
 		ctx->runtime_pending = false;
 		ctx->return_value = wait_ctx.return_value;
-		__atomic_sub_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+		cpcs_execute_dec_exec_count(ctx);
 		return wait_ctx.status;
 	}
 
@@ -449,7 +498,7 @@ cpcs_execute_run(struct cpcs_exec_context *ctx)
 	if (rc != 0) {
 		ctx->runtime_pending = false;
 		SPDK_ERRLOG("Program %u async submission failed: %d\n", ctx->program->pind, rc);
-		__atomic_sub_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+		cpcs_execute_dec_exec_count(ctx);
 		return rc;
 	}
 
@@ -475,11 +524,7 @@ cpcs_execute_complete(struct cpcs_exec_context *ctx, int status)
 		cpl->status.sct = SPDK_NVME_SCT_GENERIC;
 		cpl->status.sc = SPDK_NVME_SC_SUCCESS;
 	} else if (status < 0) {
-		uint16_t sc = (uint16_t)(-status);
-
-		cpl->status.sc = sc;
-		cpl->status.sct = (sc >= 0x80) ? SPDK_NVME_SCT_COMMAND_SPECIFIC : SPDK_NVME_SCT_GENERIC;
-		cpl->status.dnr = 1;
+		cpcs_status_from_rc(status, &cpl->status);
 	} else {
 		cpl->status.sct = SPDK_NVME_SCT_GENERIC;
 		cpl->status.sc = (uint16_t)status;
@@ -527,7 +572,7 @@ cpcs_execute_runtime_done(void *cb_arg, int status, uint64_t return_value)
 	ctx->runtime_pending = false;
 	ctx->return_value = return_value;
 
-	__atomic_sub_fetch(&ctx->program->exec_count, 1, __ATOMIC_SEQ_CST);
+	cpcs_execute_dec_exec_count(ctx);
 
 	if (status == 0) {
 		cpcs_execute_complete(ctx, SPDK_NVME_SC_SUCCESS);
