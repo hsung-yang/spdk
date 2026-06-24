@@ -737,6 +737,171 @@ def enable_spdk_debug_logging(args: argparse.Namespace, rpc: RpcClient) -> None:
             print(f"WARN: log_set_flag {flag} failed: {stderr or stdout or 'unknown error'}")
 
 
+def parse_bdf_csv(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [tok.strip() for tok in str(value).split(",") if tok.strip()]
+
+
+def multissd_backing_requested(args: argparse.Namespace) -> bool:
+    return bool(parse_bdf_csv(getattr(args, "backing_bdfs", None)))
+
+
+def multissd_dataset_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "dataset_bdf", None)) or bool(
+        parse_bdf_csv(getattr(args, "dataset_bdfs", None))
+    )
+
+
+@dataclass
+class MultiSsdState:
+    # Controller aliases attached by the multi-SSD path, in attach order; torn
+    # down in reverse on cleanup. The single-SSD --controller-name is NOT listed
+    # here (it stays owned by setup_common/cleanup_common unchanged).
+    backing_controllers: List[str]
+    dataset_controllers: List[str]
+    backing_raid_bdev: Optional[str]
+    dataset_raid_bdev: Optional[str]
+    # True when the single-SSD --controller-name attach must be skipped because
+    # the multi-SSD path now owns every device the benchmark needs (so the
+    # default --pcie-bdf controller would double-attach a BDF -> -EALREADY).
+    skip_single_ssd_attach: bool
+
+
+def _attach_devices(
+        rpc: RpcClient,
+        bdfs: Sequence[str],
+        prefix: str,
+        nsid: int,
+) -> Tuple[List[str], List[str]]:
+    """Attach one NVMe controller per BDF as <prefix><i> and return
+    (controller_aliases, base_bdev_names) where each base bdev is the
+    <prefix><i>n<nsid> namespace (mirrors how the single-SSD path names
+    Nvme0n<nsid>). Attach order is preserved for reverse-order teardown.
+    """
+    controllers: List[str] = []
+    base_bdevs: List[str] = []
+    for index, bdf in enumerate(bdfs):
+        alias = f"{prefix}{index}"
+        rpc.call(
+            "bdev_nvme_attach_controller",
+            "-b", alias,
+            "-t", "pcie",
+            "-a", bdf,
+        )
+        controllers.append(alias)
+        base_bdevs.append(f"{alias}n{nsid}")
+    return controllers, base_bdevs
+
+
+def _create_raid0(
+        rpc: RpcClient,
+        raid_name: str,
+        base_bdevs: Sequence[str],
+        strip_size_kb: int,
+) -> None:
+    rpc.call(
+        "bdev_raid_create",
+        "-n", raid_name,
+        "-z", str(strip_size_kb),
+        "-r", "raid0",
+        "-b", " ".join(base_bdevs),
+    )
+
+
+def setup_multissd(args: argparse.Namespace, rpc: RpcClient) -> None:
+    """Attach the multi-SSD backing/dataset devices and build RAID0 stripes,
+    then rewrite args.backing_bdev / args.dataset_bdev to point at the resulting
+    bdevs so the rest of the flow (vSLM create, ns add, capacity checks) is
+    unchanged. Purely additive: a no-op unless --backing-bdfs / --dataset-bdf(s)
+    are supplied.
+
+    When --backing-bdfs is set but no dataset flag is, the dataset stays on the
+    FIRST backing device (its --dataset-device-nsid namespace) exactly like the
+    single-SSD case keeps dataset (n1) and backing (n2) on the same drive; the
+    single-SSD --controller-name attach is then skipped so the first backing
+    BDF is not double-attached (-EALREADY). --dataset-bdf/--dataset-bdfs isolate
+    the dataset onto separate device(s).
+    """
+    state = MultiSsdState(
+        backing_controllers=[],
+        dataset_controllers=[],
+        backing_raid_bdev=None,
+        dataset_raid_bdev=None,
+        skip_single_ssd_attach=False,
+    )
+    setattr(args, "_multissd_state", state)
+
+    backing_first_base: Optional[str] = None
+    if multissd_backing_requested(args):
+        backing_bdfs = parse_bdf_csv(args.backing_bdfs)
+        controllers, base_bdevs = _attach_devices(
+            rpc,
+            backing_bdfs,
+            prefix="VslmBack",
+            nsid=args.backing_device_nsid,
+        )
+        state.backing_controllers = controllers
+        if len(base_bdevs) > 1:
+            raid_name = "VSLM_BACKING_RAID0"
+            _create_raid0(rpc, raid_name, base_bdevs, args.raid_strip_size_kb)
+            state.backing_raid_bdev = raid_name
+            args.backing_bdev = raid_name
+        else:
+            # Single device: use the namespace bdev directly (raid-of-1, no raid).
+            args.backing_bdev = base_bdevs[0]
+        # First backing controller alias, used to host the dataset namespace
+        # when the dataset is not isolated onto its own device(s).
+        backing_first_base = f"{controllers[0]}n{args.dataset_device_nsid}"
+        # The multi-SSD path owns the backing (and, by default, the dataset on
+        # the same first device): skip the single-SSD --controller-name attach.
+        state.skip_single_ssd_attach = True
+
+    if multissd_dataset_requested(args):
+        # Dataset isolated onto its own separate device(s).
+        if args.dataset_bdfs:
+            dataset_bdfs = parse_bdf_csv(args.dataset_bdfs)
+        else:
+            dataset_bdfs = [str(args.dataset_bdf).strip()]
+        controllers, base_bdevs = _attach_devices(
+            rpc,
+            dataset_bdfs,
+            prefix="VslmData",
+            nsid=args.dataset_device_nsid,
+        )
+        state.dataset_controllers = controllers
+        if len(base_bdevs) > 1:
+            raid_name = "VSLM_DATASET_RAID0"
+            _create_raid0(rpc, raid_name, base_bdevs, args.raid_strip_size_kb)
+            state.dataset_raid_bdev = raid_name
+            args.dataset_bdev = raid_name
+        else:
+            args.dataset_bdev = base_bdevs[0]
+    elif backing_first_base is not None:
+        # No dataset isolation requested: keep the dataset on the first backing
+        # device (its --dataset-device-nsid namespace), mirroring the single-SSD
+        # layout where dataset (n1) and backing (n2) share one drive.
+        args.dataset_bdev = backing_first_base
+
+
+def cleanup_multissd(args: argparse.Namespace, rpc: RpcClient) -> None:
+    """Tear the multi-SSD stripes and controllers down: delete the dataset and
+    backing RAID0 bdevs first, then detach every controller this path attached
+    (reverse of attach order). No-op when the single-SSD path was used.
+    """
+    state = getattr(args, "_multissd_state", None)
+    if state is None:
+        return
+    if state.dataset_raid_bdev:
+        rpc.quiet("bdev_raid_delete", state.dataset_raid_bdev)
+    if state.backing_raid_bdev:
+        rpc.quiet("bdev_raid_delete", state.backing_raid_bdev)
+    for alias in reversed(state.dataset_controllers):
+        rpc.quiet("bdev_nvme_detach_controller", alias)
+    for alias in reversed(state.backing_controllers):
+        rpc.quiet("bdev_nvme_detach_controller", alias)
+
+
 def setup_common(args: argparse.Namespace, rpc: RpcClient, max_ranges_per_mrs: int) -> Dict[str, Any]:
     def _prepare_aio_file(path: str, size_mb: int) -> Path:
         if size_mb <= 0:
@@ -748,13 +913,24 @@ def setup_common(args: argparse.Namespace, rpc: RpcClient, max_ranges_per_mrs: i
         return file_path
 
     rpc.call("framework_start_init")
-    if not args.skip_nvme_attach:
+    # The single-SSD --controller-name attach is skipped only when --backing-bdfs
+    # is set: the backing then comes from the VslmBack* controllers, and the
+    # dataset rides the first backing device (or its own --dataset-bdf(s)), so
+    # the --pcie-bdf controller is unused and re-attaching its BDF would -EALREADY.
+    # When only dataset flags are set (backing stays single-SSD), --pcie-bdf is
+    # still needed for the backing namespace, so the attach is kept.
+    skip_single_ssd_attach = multissd_backing_requested(args)
+    if not args.skip_nvme_attach and not skip_single_ssd_attach:
         rpc.call(
             "bdev_nvme_attach_controller",
             "-b", args.controller_name,
             "-t", "pcie",
             "-a", args.pcie_bdf,
         )
+
+    # Attach multi-SSD backing/dataset devices and (if >1) build RAID0 stripes,
+    # rewriting args.backing_bdev / args.dataset_bdev before bdev resolution below.
+    setup_multissd(args, rpc)
 
     if args.dataset_malloc_mb > 0:
         rpc.call("bdev_malloc_create", "-b", args.dataset_bdev, str(args.dataset_malloc_mb), "4096")
@@ -809,7 +985,13 @@ def cleanup_common(args: argparse.Namespace, rpc: RpcClient) -> None:
     if args.backing_aio_file:
         rpc.quiet("bdev_aio_delete", args.backing_bdev)
         Path(args.backing_aio_file).expanduser().resolve().unlink(missing_ok=True)
-    if not args.skip_nvme_attach:
+    # Tear down multi-SSD RAID0 stripes + detach the controllers this path owns,
+    # before detaching the single-SSD controller. No-op for the single-SSD path.
+    cleanup_multissd(args, rpc)
+    # Mirror the setup_common attach condition: the single-SSD controller was
+    # only attached when --backing-bdfs was NOT set.
+    skip_single_ssd_attach = multissd_backing_requested(args)
+    if not args.skip_nvme_attach and not skip_single_ssd_attach:
         rpc.quiet("bdev_nvme_detach_controller", args.controller_name)
 
 
@@ -1427,6 +1609,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--backing-bdev", required=True, help="vSLM backing bdev (e.g., Nvme0n2)")
     parser.add_argument("--skip-nvme-attach", action="store_true",
                         help="Skip bdev_nvme_attach_controller and use pre-existing dataset/backing bdevs")
+    parser.add_argument(
+        "--backing-bdfs",
+        default=None,
+        help="CSV of PCIe BDFs whose BACKING namespace is RAID0-striped into one vSLM backing bdev. "
+             "A single BDF behaves exactly like the single-SSD --pcie-bdf path (raid-of-1, no raid). "
+             "When unset, the single-SSD --pcie-bdf/--backing-bdev path is used unchanged.")
+    parser.add_argument(
+        "--backing-device-nsid",
+        type=int,
+        default=2,
+        help="NSID of the BACKING namespace on each --backing-bdfs device (Nvme<i>n<NSID>); default 2")
+    parser.add_argument(
+        "--dataset-bdf",
+        default=None,
+        help="Optional PCIe BDF that places the dataset namespace on a SEPARATE physical device. "
+             "When unset, the dataset stays on the first backing/--pcie-bdf device (today's behavior).")
+    parser.add_argument(
+        "--dataset-bdfs",
+        default=None,
+        help="Optional CSV of PCIe BDFs whose DATASET namespace is RAID0-striped into one dataset bdev. "
+             "When unset, the dataset stays on the first backing/--pcie-bdf device (today's behavior).")
+    parser.add_argument(
+        "--dataset-device-nsid",
+        type=int,
+        default=1,
+        help="NSID of the DATASET namespace on each --dataset-bdf/--dataset-bdfs device "
+             "(Nvme<i>n<NSID>); default 1")
+    parser.add_argument(
+        "--raid-strip-size-kb",
+        type=int,
+        default=64,
+        help="RAID0 strip size in KiB used when striping multiple backing/dataset devices; default 64")
     parser.add_argument("--dataset-malloc-mb", type=int, default=0,
                         help="Create dataset-bdev as malloc with this size in MiB (0 disables)")
     parser.add_argument("--backing-malloc-mb", type=int, default=0,
@@ -1627,6 +1841,12 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
         "pcie_bdf": args.pcie_bdf,
         "dataset_bdev": args.dataset_bdev,
         "backing_bdev": args.backing_bdev,
+        "backing_bdfs": args.backing_bdfs,
+        "backing_device_nsid": args.backing_device_nsid,
+        "dataset_bdf": args.dataset_bdf,
+        "dataset_bdfs": args.dataset_bdfs,
+        "dataset_device_nsid": args.dataset_device_nsid,
+        "raid_strip_size_kb": args.raid_strip_size_kb,
         "dataset_size_gb": derived["dataset_size_gb"],
         "dataset_size_mb": derived["dataset_size_mb"],
         "chunk_size_mb": args.chunk_size_mb,
