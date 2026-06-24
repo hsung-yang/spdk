@@ -42,10 +42,17 @@ MAX_DESC_PER_COPY_CMD = 256
 MAX_BLOCKS_PER_DESC = 0x10000  # nlb is uint16, nlb + 1 blocks per descriptor.
 MAX_MRS_RANGE_LEN = 0xFFFFFFFF  # uint32 max from CPCS memory range descriptor.
 BUILTIN_PROGRAM_PIND = {
+    "memcpy": 0,
+    "memfill": 1,
     "sum64": 2,
     "max64": 3,
     "min64": 4,
+    "filter_agg": 5,
 }
+# Programs whose execution dirties the SLM image (results must be copied OUT for
+# pSLM to make them host-visible; vSLM publishes them for free). Used by the
+# --copy-out-mode fairness control.
+BUILTIN_WRITE_PROGRAMS = {"memcpy", "memfill"}
 BUILTIN_EXEC_DESC_LEN = 24
 NS_UPDATE_QUIESCE_TIMEOUT_SEC = 20.0
 VSLM_MAX_READAHEAD_PAGES = 64
@@ -470,6 +477,31 @@ def build_mrs_ranges(total_bytes: int, align_bytes: int = 4) -> List[Tuple[int, 
     return ranges
 
 
+def load_mrs_spec(path: str) -> List[Tuple[int, int]]:
+    """Load an access-pattern MRS spec (from experiments/vslm_eval/workload/mrs_gen.py).
+    Returns the [(offset, length), ...] range list that defines which bytes the
+    program touches -- i.e. the access pattern (sequential/strided/random/sparse)."""
+    with open(path) as fh:
+        spec = json.load(fh)
+    return [(int(o), int(l)) for o, l in spec["ranges"]]
+
+
+def effective_exec_ranges(args: argparse.Namespace, total_bytes: int,
+                          align_bytes: int) -> List[Tuple[int, int]]:
+    """Execute-range list. When --mrs-spec is given the access pattern comes from
+    the spec (the new vSLM-eval suite); otherwise the legacy contiguous tiling.
+    Single-SSD / existing-suite behavior is preserved (no --mrs-spec => unchanged)."""
+    spec_path = getattr(args, "mrs_spec", None)
+    if spec_path:
+        ranges = load_mrs_spec(spec_path)
+        for off, length in ranges:
+            if off % align_bytes or length % align_bytes:
+                raise ValueError(
+                    f"--mrs-spec range not {align_bytes}-byte aligned: ({off}, {length})")
+        return ranges
+    return build_mrs_ranges(total_bytes, align_bytes=align_bytes)
+
+
 def create_mrs(
         args: argparse.Namespace,
         tmp_dir: Path,
@@ -599,12 +631,16 @@ def run_execute_template(template: str, values: Dict[str, Any]) -> float:
 def reduce_builtin_results(program: str, values: Sequence[int]) -> int:
     if not values:
         raise ValueError("builtin execution produced no values")
-    if program == "sum64":
+    if program in ("sum64", "filter_agg"):
         return int(sum(values))
     if program == "max64":
         return int(max(values))
     if program == "min64":
         return int(min(values))
+    if program in ("memcpy", "memfill"):
+        # write kernels: device returns per-segment bytes-written (or status); the
+        # absolute output is verified by a readback-sum at the driver layer.
+        return int(sum(values))
     raise ValueError(f"unsupported builtin program: {program}")
 
 
@@ -652,6 +688,7 @@ def run_builtin_execute(
     values: List[int] = []
     total_seconds = 0.0
     total_cmds = 0
+    latency_samples_ns: List[float] = []
 
     for mr_id, (_, length) in enumerate(ranges, start=1):
         mr_length = int(length)
@@ -677,8 +714,11 @@ def run_builtin_execute(
 
             start = now()
             cp = run_cmd(cmd, check=True, capture_output=True, log_cmd=False)
-            total_seconds += now() - start
+            seg_seconds = now() - start
+            total_seconds += seg_seconds
             total_cmds += 1
+            if getattr(args, "per_op_latency", "off") != "off":
+                latency_samples_ns.append(seg_seconds * 1e9)
 
             out = (cp.stdout or "") + (cp.stderr or "")
             result_hex = parse_result_hex(out)
@@ -694,6 +734,7 @@ def run_builtin_execute(
         "seconds": total_seconds,
         "result": reduce_builtin_results(program, values),
         "range_results": values,
+        "latency_samples_ns": latency_samples_ns,
     }
 
 
@@ -1079,6 +1120,11 @@ def run_pslm_once(
     total_copy_cmds = 0
     total_execute_cmds = 0
     execute_values: List[int] = []
+    copy_out_seconds = 0.0
+    copy_out_cmds = 0
+    copy_out_bytes = 0
+    copy_out_mode = getattr(args, "copy_out_mode", "none")
+    is_write_program = bool(args.builtin_program) and args.builtin_program in BUILTIN_WRITE_PROGRAMS
 
     try:
         rpc.call(
@@ -1161,6 +1207,23 @@ def run_pslm_once(
                     )
                     total_execute_cmds += 1
 
+            # --copy-out-mode explicit: a write kernel dirties the staged SLM image,
+            # so pSLM must copy those bytes back out for the host to see them -- a
+            # symmetric fabric transfer of the dirtied chunk. vSLM publishes for free
+            # and pays nothing here. Modeled as a same-volume SLM Copy of the chunk
+            # (proxy for the egress cost); counted as copy-out (also inside e2e).
+            if copy_out_mode == "explicit" and is_write_program and chunk_execute_bytes > 0:
+                t_out = now()
+                _, out_cmds = issue_slm_copy(
+                    args=args, tmp_dir=tmp_dir, slm_nsid=args.slm_nsid,
+                    dest_offset=0, source_nsid=args.dataset_nsid, ranges=desc,
+                    run_tag=run_tag, desc_tag=f"chunkout{chunk_index}",
+                    dataset_block_size=dataset_block_size,
+                )
+                copy_out_seconds += now() - t_out
+                copy_out_cmds += out_cmds
+                copy_out_bytes += chunk_execute_bytes
+
             if ((chunk_index + 1) % progress_stride == 0) or (chunk_index + 1 == chunk_count):
                 print(
                     f"[run {run_index}] pSLM progress: "
@@ -1173,6 +1236,9 @@ def run_pslm_once(
             "copy_cmd_count": total_copy_cmds,
             "copy_seconds": copy_seconds,
             "copy_throughput_gib_s": gib_per_sec(dataset_bytes, copy_seconds),
+            "copy_out_cmd_count": copy_out_cmds,
+            "copy_out_seconds": copy_out_seconds,
+            "copy_out_bytes": copy_out_bytes,
             "execute_cmd_count": total_execute_cmds,
             "execute_total_cmd_count": total_execute_cmds,
             "execute_repeats": 1 if execute_enabled else 0,
@@ -1250,7 +1316,7 @@ def run_vslm_once(
     mrs_ranges: List[Tuple[int, int]] = []
     rsid = 0
     if execute_enabled:
-        mrs_ranges = build_mrs_ranges(execute_bytes, align_bytes=mrs_align_bytes)
+        mrs_ranges = effective_exec_ranges(args, execute_bytes, mrs_align_bytes)
         rsid = create_mrs(
             args,
             tmp_dir,
@@ -1263,6 +1329,7 @@ def run_vslm_once(
     execute_values: List[int] = []
     execute_pass_seconds: List[float] = []
     execute_pass_cmds: List[int] = []
+    execute_latency_samples: List[float] = []
 
     if execute_enabled:
         pass_count = max(1, int(args.vslm_execute_repeats))
@@ -1279,6 +1346,7 @@ def run_vslm_once(
                 execute_pass_seconds.append(float(exec_info["seconds"]))
                 execute_pass_cmds.append(int(exec_info["cmd_count"]))
                 execute_values.append(int(exec_info["result"]))
+                execute_latency_samples.extend(exec_info.get("latency_samples_ns", []))
             else:
                 exec_sec = run_execute_template(
                     args.execute_template,
@@ -1338,6 +1406,7 @@ def run_vslm_once(
         "end_to_end_seconds": end_to_end_seconds,
         "rsid": rsid,
         "vslm_stats": stats,
+        "execute_latency_samples_ns": execute_latency_samples,
     }
 
 
@@ -1708,6 +1777,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=f"Number of repeated execute passes on the same vSLM image (default: {DEFAULT_VSLM_EXECUTE_REPEATS})",
     )
     parser.add_argument("--skip-execute", action="store_true", help="Skip execute phase; copy-only benchmark")
+
+    # --- vslm_eval suite extensions (additive; defaults preserve legacy behavior) ---
+    parser.add_argument(
+        "--mrs-spec", default=None,
+        help="Path to an access-pattern MRS spec JSON (experiments/vslm_eval/workload/mrs_gen.py). "
+             "When set, the vSLM execute ranges come from the spec (random/strided/sparse/selective) "
+             "instead of the legacy contiguous tiling. Unset => unchanged behavior.")
+    parser.add_argument(
+        "--copy-out-mode", choices=["none", "inline", "explicit"], default="none",
+        help="pSLM write-result handling. 'explicit' charges pSLM a symmetric copy-OUT of the dirtied "
+             "bytes (write-kernel fairness vs vSLM publish). Default none (unchanged).")
+    parser.add_argument(
+        "--per-op-latency-sample", dest="per_op_latency",
+        choices=["off", "exec", "all"], default="off",
+        help="Collect per-execute-op latency samples for p50/p95/p99 (execute-descriptor level).")
 
     parser.add_argument("--runs", type=int, default=3, help="Number of repetitions per mode")
     parser.add_argument("--output-json", default=None, help="Write structured output JSON")
