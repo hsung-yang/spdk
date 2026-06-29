@@ -19,8 +19,8 @@
 #define VSLM_PAGE_SHIFT 12
 #define VSLM_DEFAULT_READAHEAD_PAGES 4
 #define VSLM_MAX_READAHEAD_PAGES 64
-#define VSLM_DEFAULT_FAULT_BATCH_PAGES 64
-#define VSLM_DEFAULT_FAULT_BATCH_MAX_BYTES (256 * 1024)
+#define VSLM_DEFAULT_FAULT_BATCH_PAGES 512
+#define VSLM_DEFAULT_FAULT_BATCH_MAX_BYTES (2 * 1024 * 1024)
 #define VSLM_DEFAULT_PREFETCH_BATCH_PAGES 64
 #define VSLM_DEFAULT_PREFETCH_QUEUE_DEPTH 4
 #define VSLM_DEFAULT_CLEANER_MAX_PAGES_PER_POLL 16
@@ -142,6 +142,7 @@ struct vslm_lease_range {
 
 struct vslm_fault_batch_page {
 	struct vslm_page *page;
+	struct vslm_lpage *lpage;	/* non-NULL for a clean-alias page (see batch commit) */
 	uint64_t vpn;
 	bool inserted_hash;
 	bool inserted_lru;
@@ -298,7 +299,7 @@ struct vslm_perf_stats {
  * lock-ordering deadlock is possible. Whole-instance operations (teardown, debug
  * validation) walk shards one at a time.
  */
-#define VSLM_MMU_SHARD_STRIDE_PAGES 64u
+#define VSLM_MMU_SHARD_STRIDE_PAGES 512u
 #define VSLM_MMU_MIN_FRAMES_PER_SHARD 1024u
 #define VSLM_MMU_MAX_SHARDS 32u
 
@@ -2482,7 +2483,8 @@ out:
 }
 
 static int
-vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
+vslm_submit_sync_readv_desc(struct vbdev_vslm *vslm, struct spdk_bdev_desc *desc,
+			    struct spdk_io_channel *ch,
 			    struct vslm_mmu_shard *held_shard,
 			    struct iovec *iov, int iovcnt,
 			    uint64_t offset_blocks, uint64_t num_blocks)
@@ -2513,7 +2515,7 @@ vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *bas
 		return -ENOTSUP;
 	}
 
-	rc = spdk_bdev_readv_blocks(vslm->base_desc, base_ch,
+	rc = spdk_bdev_readv_blocks(desc, ch,
 				    iov, iovcnt,
 				    offset_blocks, num_blocks,
 				    vslm_sync_io_completion_cb, &ctx);
@@ -2533,18 +2535,6 @@ vslm_submit_sync_base_readv(struct vbdev_vslm *vslm, struct spdk_io_channel *bas
 	}
 
 	return ctx.status;
-}
-
-static int
-vslm_submit_sync_base_read_bounce(struct vbdev_vslm *vslm,
-				  struct spdk_io_channel *base_ch,
-				  struct vslm_mmu_shard *held_shard,
-				  void *bounce_buf,
-				  uint64_t offset_blocks,
-				  uint64_t num_blocks)
-{
-	return vslm_submit_sync_base_io(vslm, base_ch, held_shard, bounce_buf,
-					offset_blocks, num_blocks, false);
 }
 
 static int
@@ -2902,20 +2892,102 @@ vslm_writeback_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
  * loop. The faulting page is LOADING/busy throughout, so it cannot be stolen
  * during the unlocked window.
  */
+/*
+ * Per-execute source-I/O holder. A clean page's source backing (an ALIAS_BDEV,
+ * e.g. the dataset namespace staged by SLM Copy) is generally a different bdev
+ * than the vSLM backing namespace, so its fault-in must read through that source
+ * bdev's own descriptor + I/O channel. Opening and closing that descriptor and
+ * channel on every single 4 KiB page fault is enormously expensive (it creates
+ * and tears down an NVMe qpair per page). Instead the copy/exec path holds one
+ * source_io across the whole call: the descriptor + per-thread channel are opened
+ * on the first source fault and reused for every later page in that call, then
+ * released once. A NULL holder falls back to the old open-once-per-fault path, so
+ * callers that do not thread one are unchanged.
+ */
+struct vslm_source_io {
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc;
+	struct spdk_io_channel *ch;
+	bool opened;
+};
+
+static int
+vslm_source_io_acquire(struct vbdev_vslm *vslm, struct vslm_source_io *src,
+		       struct spdk_io_channel *base_ch, struct spdk_bdev *source_bdev,
+		       struct spdk_bdev_desc **out_desc, struct spdk_io_channel **out_ch)
+{
+	const char *source_name;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *ch = NULL;
+	int rc;
+
+	if (source_bdev == vslm->base_bdev) {
+		*out_desc = vslm->base_desc;
+		*out_ch = base_ch;
+		return 0;
+	}
+	if (src != NULL && src->opened && src->bdev == source_bdev) {
+		*out_desc = src->desc;
+		*out_ch = src->ch;
+		return 0;
+	}
+
+	source_name = source_bdev->name;
+	if (source_name == NULL) {
+		return -EINVAL;
+	}
+	rc = spdk_bdev_open_ext(source_name, false, vbdev_vslm_bdev_event_cb, vslm, &desc);
+	if (rc != 0) {
+		return rc;
+	}
+	ch = spdk_bdev_get_io_channel(desc);
+	if (ch == NULL) {
+		spdk_bdev_close(desc);
+		return -ENOMEM;
+	}
+
+	if (src != NULL) {
+		/* Cache for reuse; release any previously-held different source first. */
+		if (src->opened) {
+			spdk_put_io_channel(src->ch);
+			spdk_bdev_close(src->desc);
+		}
+		src->bdev = source_bdev;
+		src->desc = desc;
+		src->ch = ch;
+		src->opened = true;
+	}
+	*out_desc = desc;
+	*out_ch = ch;
+	return 0;
+}
+
+static void
+vslm_source_io_release(struct vslm_source_io *src)
+{
+	if (src == NULL || !src->opened) {
+		return;
+	}
+	spdk_put_io_channel(src->ch);
+	spdk_bdev_close(src->desc);
+	src->opened = false;
+	src->bdev = NULL;
+	src->desc = NULL;
+	src->ch = NULL;
+}
+
 static int
 vslm_fault_in_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
-		   struct vslm_mmu_shard *held_shard,
+		   struct vslm_source_io *src, struct vslm_mmu_shard *held_shard,
 		   struct vslm_page *page, struct vslm_lpage *lpage, uint64_t vpn)
 {
 	struct spdk_bdev *source_bdev = NULL;
 	struct spdk_bdev_desc *source_desc = NULL;
 	struct spdk_io_channel *source_ch = NULL;
-	const char *source_name;
 	uint64_t source_block_size;
 	uint64_t source_page_blocks;
 	uint64_t source_offset_blocks;
 	uint64_t source_num_blocks;
-	bool opened_source_desc = false;
 	uint64_t block_size;
 	uint64_t page_blocks;
 	uint64_t offset_blocks;
@@ -2963,39 +3035,21 @@ vslm_fault_in_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 			source_num_blocks = spdk_bdev_get_num_blocks(source_bdev);
 			if (source_offset_blocks <= source_num_blocks &&
 			    source_page_blocks <= (source_num_blocks - source_offset_blocks)) {
-				if (source_bdev == vslm->base_bdev) {
-					source_desc = vslm->base_desc;
-					source_ch = base_ch;
-					rc = 0;
-				} else {
-					source_name = source_bdev->name;
-					if (source_name == NULL) {
-						rc = -EINVAL;
-					} else {
-						rc = spdk_bdev_open_ext(source_name, false,
-									vbdev_vslm_bdev_event_cb, vslm,
-									&source_desc);
-					}
-					if (rc == 0) {
-						opened_source_desc = true;
-						source_ch = spdk_bdev_get_io_channel(source_desc);
-						if (source_ch == NULL) {
-							rc = -ENOMEM;
-						}
-					}
-				}
+				struct vslm_source_io local_src = {0};
+				struct vslm_source_io *use_src = (src != NULL) ? src : &local_src;
 
+				rc = vslm_source_io_acquire(vslm, use_src, base_ch, source_bdev,
+							    &source_desc, &source_ch);
 				if (rc == 0) {
 					rc = vslm_submit_sync_read_desc_io(vslm, source_desc, source_ch,
 									   held_shard, ptr,
 									   source_offset_blocks, source_page_blocks);
 				}
 
-				if (opened_source_desc) {
-					if (source_ch != NULL) {
-						spdk_put_io_channel(source_ch);
-					}
-					spdk_bdev_close(source_desc);
+				/* A throwaway holder (no per-call src threaded) is released now;
+				 * a real src keeps the desc+channel cached for later faults. */
+				if (use_src == &local_src) {
+					vslm_source_io_release(&local_src);
 				}
 
 				if (rc == 0) {
@@ -3155,7 +3209,7 @@ restore_victim:
 
 static int
 vslm_resolve_page_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
-		     uint64_t vpn, struct vslm_page **out_page,
+		     struct vslm_source_io *src, uint64_t vpn, struct vslm_page **out_page,
 		     bool count_fault_stats, bool skip_fault_in)
 {
 	struct vslm_mmu_shard *shard = vslm_shard_for_vpn(vslm, vpn);
@@ -3263,7 +3317,7 @@ vslm_resolve_page_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 		 * page is LOADING and on the hash/LRU, so it is not an eviction
 		 * candidate during the unlocked window.
 		 */
-		rc = vslm_fault_in_page(vslm, base_ch, shard, page, lpage, vpn);
+		rc = vslm_fault_in_page(vslm, base_ch, src, shard, page, lpage, vpn);
 		if (rc != 0) {
 			goto rollback_page;
 		}
@@ -3328,7 +3382,7 @@ static int
 vslm_resolve_page(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 		  uint64_t vpn, struct vslm_page **out_page)
 {
-	return vslm_resolve_page_ex(vslm, base_ch, vpn, out_page, true, false);
+	return vslm_resolve_page_ex(vslm, base_ch, NULL, vpn, out_page, true, false);
 }
 
 static int
@@ -3390,14 +3444,15 @@ vslm_reserve_page_for_fault_locked(struct vbdev_vslm *vslm,
 static int
 vslm_fault_in_reserved_page_unlocked(struct vbdev_vslm *vslm,
 				     struct spdk_io_channel *base_ch,
+				     struct vslm_source_io *src,
 				     struct vslm_single_fault_ctx *fault_ctx)
 {
 	if (!fault_ctx->needs_fault_in) {
 		return 0;
 	}
 
-	/* The caller (split path) has already dropped the shard lock: pass NULL. */
-	return vslm_fault_in_page(vslm, base_ch, NULL, fault_ctx->page,
+	/* The caller (split path) has already dropped the shard lock: pass NULL shard. */
+	return vslm_fault_in_page(vslm, base_ch, src, NULL, fault_ctx->page,
 				  fault_ctx->lpage, fault_ctx->vpn);
 }
 
@@ -3474,6 +3529,7 @@ vslm_rollback_reserved_page_locked(struct vbdev_vslm *vslm,
 static int
 vslm_resolve_and_pin_page_locked(struct vbdev_vslm *vslm,
 				 struct spdk_io_channel *base_ch,
+				 struct vslm_source_io *src,
 				 uint64_t vpn,
 				 bool for_write,
 				 bool full_page_overwrite,
@@ -3494,7 +3550,7 @@ vslm_resolve_and_pin_page_locked(struct vbdev_vslm *vslm,
 		if (rc == 0) {
 			use_split = true;
 		} else if (rc == -ENOSPC || rc == -EEXIST) {
-			rc = vslm_resolve_page_ex(vslm, base_ch, vpn, &page, true,
+			rc = vslm_resolve_page_ex(vslm, base_ch, src, vpn, &page, true,
 						  for_write && full_page_overwrite);
 			if (rc != 0) {
 				return rc;
@@ -3503,7 +3559,7 @@ vslm_resolve_and_pin_page_locked(struct vbdev_vslm *vslm,
 			return rc;
 		}
 	} else {
-		rc = vslm_resolve_page_ex(vslm, base_ch, vpn, &page, true,
+		rc = vslm_resolve_page_ex(vslm, base_ch, src, vpn, &page, true,
 					  for_write && full_page_overwrite);
 		if (rc != 0) {
 			return rc;
@@ -3517,7 +3573,7 @@ vslm_resolve_and_pin_page_locked(struct vbdev_vslm *vslm,
 
 		if (fault_ctx.needs_fault_in) {
 			pthread_mutex_unlock(&shard->lock);
-			rc = vslm_fault_in_reserved_page_unlocked(vslm, base_ch, &fault_ctx);
+			rc = vslm_fault_in_reserved_page_unlocked(vslm, base_ch, src, &fault_ctx);
 			pthread_mutex_lock(&shard->lock);
 		} else {
 			rc = 0;
@@ -3563,49 +3619,87 @@ vslm_resolve_and_pin_page_locked(struct vbdev_vslm *vslm,
 }
 
 static bool
-vslm_vpn_is_batch_clean_backing_candidate(struct vbdev_vslm *vslm, uint64_t vpn)
+vslm_vpn_batch_clean_source(struct vbdev_vslm *vslm, uint64_t vpn,
+			    struct spdk_bdev **src_bdev, uint64_t *src_off,
+			    struct vslm_lpage **out_lpage)
 {
+	struct vslm_lpage *lpage;
 	uint64_t max_vpn;
 
 	max_vpn = vslm->virtual_size_bytes / VSLM_PAGE_SIZE;
 	if (vpn >= max_vpn) {
 		return false;
 	}
-
 	if (vslm_lookup_page(vslm, vpn) != NULL) {
-		return false;
+		return false;	/* already resident */
 	}
 
-	/* Conservative first rule: any metadata means non-default semantics. */
-	if (vslm_lookup_lpage(vslm, vpn) != NULL) {
-		return false;
+	lpage = vslm_lookup_lpage(vslm, vpn);
+	if (lpage == NULL) {
+		/* Default clean backing: the vSLM backing namespace at the linear offset. */
+		*src_bdev = vslm->base_bdev;
+		*src_off = vpn * VSLM_PAGE_SIZE;
+		*out_lpage = NULL;
+		return true;
 	}
-
-	return true;
+	/*
+	 * Clean alias (e.g. an SLM-Copy-staged dataset range): a contiguous run of
+	 * aliases over the same source bdev with contiguous source offsets is bulk-read
+	 * in one readv from that source instead of one read (and, pre-fix, one source
+	 * descriptor open/close) per page.
+	 */
+	if (lpage->state == SPDK_BDEV_VSLM_LPAGE_CLEAN_ALIAS &&
+	    lpage->source_bdev != NULL && !lpage->pending_publish) {
+		*src_bdev = lpage->source_bdev;
+		*src_off = lpage->source_offset_bytes;
+		*out_lpage = lpage;
+		return true;
+	}
+	return false;
 }
 
+/*
+ * Longest run starting at start_vpn that can be filled by ONE source readv: every
+ * page must be a clean batch candidate over the SAME source bdev with source
+ * offsets contiguous (off == run_off + i*PAGE), and its shard must have a free
+ * frame. Returns the run length and the run's source bdev/offset (from the first
+ * page). A run never mixes default-backing and alias pages, nor two sources.
+ */
 static uint32_t
-vslm_find_clean_backing_batch_len(struct vbdev_vslm *vslm,
-				  uint64_t start_vpn,
-				  uint32_t max_pages)
+vslm_find_clean_batch_run(struct vbdev_vslm *vslm, uint64_t start_vpn, uint32_t max_pages,
+			  struct spdk_bdev **run_src_bdev, uint64_t *run_src_off)
 {
 	uint64_t max_vpn;
+	struct spdk_bdev *first_bdev = NULL;
+	uint64_t first_off = 0;
 	uint32_t nr_pages = 0;
 	uint64_t vpn;
 
 	max_vpn = vslm->virtual_size_bytes / VSLM_PAGE_SIZE;
-	for (vpn = start_vpn;
-	     vpn < max_vpn && nr_pages < max_pages;
-	     vpn++, nr_pages++) {
-		if (!vslm_vpn_is_batch_clean_backing_candidate(vslm, vpn)) {
+	for (vpn = start_vpn; vpn < max_vpn && nr_pages < max_pages; vpn++, nr_pages++) {
+		struct spdk_bdev *sbdev = NULL;
+		uint64_t soff = 0;
+		struct vslm_lpage *lp = NULL;
+
+		if (!vslm_vpn_batch_clean_source(vslm, vpn, &sbdev, &soff, &lp)) {
 			break;
 		}
-
+		if (nr_pages == 0) {
+			first_bdev = sbdev;
+			first_off = soff;
+		} else if (sbdev != first_bdev ||
+			   soff != first_off + (uint64_t)nr_pages * VSLM_PAGE_SIZE) {
+			break;	/* source not contiguous with the run */
+		}
 		if (TAILQ_FIRST(&vslm_shard_for_vpn(vslm, vpn)->free_list) == NULL) {
 			break;
 		}
 	}
 
+	if (nr_pages > 0) {
+		*run_src_bdev = first_bdev;
+		*run_src_off = first_off;
+	}
 	return nr_pages;
 }
 
@@ -3641,8 +3735,12 @@ vslm_batch_reserve_free_pages(struct vbdev_vslm *vslm,
 
 	batch->nr_pages = 0;
 	for (i = 0; i < requested_pages; i++) {
+		struct spdk_bdev *sbdev = NULL;
+		uint64_t soff = 0;
+		struct vslm_lpage *lp = NULL;
+
 		vpn = start_vpn + i;
-		if (!vslm_vpn_is_batch_clean_backing_candidate(vslm, vpn)) {
+		if (!vslm_vpn_batch_clean_source(vslm, vpn, &sbdev, &soff, &lp)) {
 			break;
 		}
 		assert(vslm_vpn_to_shard(vslm, vpn) == (uint32_t)(shard - vslm->shards));
@@ -3661,6 +3759,7 @@ vslm_batch_reserve_free_pages(struct vbdev_vslm *vslm,
 		vslm_hash_insert(vslm, page);
 
 		batch->pages[i].page = page;
+		batch->pages[i].lpage = lp;
 		batch->pages[i].vpn = vpn;
 		batch->pages[i].inserted_hash = true;
 		batch->pages[i].inserted_lru = false;
@@ -3711,9 +3810,21 @@ vslm_batch_commit_pages(struct vbdev_vslm *vslm,
 	struct vslm_page *page;
 
 	for (i = 0; i < batch->nr_pages; i++) {
+		struct vslm_lpage *lpage = batch->pages[i].lpage;
+
 		page = batch->pages[i].page;
 		if (page == NULL) {
 			continue;
+		}
+
+		if (lpage != NULL) {
+			/*
+			 * Clean-alias page: link the lpage to this resident frame
+			 * (mirroring vslm_commit_reserved_page_locked) so eviction
+			 * reverts it to its alias source rather than the backing namespace.
+			 */
+			vslm_lpage_set_state(vslm, page, lpage, SPDK_BDEV_VSLM_LPAGE_CLEAN_RESIDENT);
+			(void)vslm_lpage_free_if_default_backing(vslm, lpage);
 		}
 
 		page->dirty = false;
@@ -3751,17 +3862,22 @@ vslm_batch_build_iov(struct vbdev_vslm *vslm, struct vslm_fault_batch_ctx *batch
 static int
 vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 				       struct spdk_io_channel *base_ch,
+				       struct vslm_source_io *src,
+				       struct spdk_bdev *src_bdev,
+				       uint64_t src_off_bytes,
 				       uint64_t start_vpn,
 				       uint32_t requested_pages,
 				       bool count_fault_stats,
 				       uint32_t *pages_loaded)
 {
+	struct spdk_bdev_desc *src_desc = NULL;
+	struct spdk_io_channel *src_ch = NULL;
 	struct vslm_fault_batch_ctx batch = {};
 	struct vslm_mmu_shard *shard = vslm_shard_for_vpn(vslm, start_vpn);
 	/*
 	 * requested_pages is clamped below to VSLM_MMU_SHARD_STRIDE_PAGES (a single
 	 * shard's stride run) and to the configured fault-batch page budget, both of
-	 * which are <= VSLM_MMU_SHARD_STRIDE_PAGES (64). Back the per-batch page and
+	 * which are <= VSLM_MMU_SHARD_STRIDE_PAGES (512). Back the per-batch page and
 	 * iov scratch with fixed on-stack arrays sized to that bound instead of a
 	 * per-call calloc/free pair on the hot fault-in path.
 	 */
@@ -3789,8 +3905,9 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 		return 0;
 	}
 
-	block_size = spdk_bdev_get_block_size(vslm->base_bdev);
-	if (block_size == 0 || (VSLM_PAGE_SIZE % block_size) != 0) {
+	block_size = spdk_bdev_get_block_size(src_bdev);
+	if (block_size == 0 || (VSLM_PAGE_SIZE % block_size) != 0 ||
+	    (src_off_bytes % block_size) != 0) {
 		return -EINVAL;
 	}
 
@@ -3842,13 +3959,22 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 		goto out_free;
 	}
 
-	offset_blocks = start_vpn * page_blocks;
+	offset_blocks = src_off_bytes / block_size;
 	num_blocks = batch.nr_pages * page_blocks;
 	io_start_ticks = spdk_get_ticks();
 	VSLM_PERF_INC(vslm, fault_in_batched_readv_total);
-	/* The shard lock is already dropped here (released above), so pass NULL. */
-	rc = vslm_submit_sync_base_readv(vslm, base_ch, NULL, batch.iov,
-					 (int)batch.nr_pages, offset_blocks, num_blocks);
+
+	/*
+	 * Resolve the source channel once for the whole run (base namespace for a
+	 * default-backing run, or the held alias source for an alias run) and bulk-read
+	 * the entire contiguous run in one readv.
+	 */
+	rc = vslm_source_io_acquire(vslm, src, base_ch, src_bdev, &src_desc, &src_ch);
+	if (rc == 0) {
+		/* The shard lock is already dropped here (released above), so pass NULL. */
+		rc = vslm_submit_sync_readv_desc(vslm, src_desc, src_ch, NULL, batch.iov,
+						 (int)batch.nr_pages, offset_blocks, num_blocks);
+	}
 	if (rc == -ENOTSUP) {
 		bool contiguous = true;
 		uint8_t *bounce = NULL;
@@ -3874,7 +4000,7 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 		}
 
 		if (contiguous) {
-			rc = vslm_submit_sync_base_read_bounce(vslm, base_ch, NULL,
+			rc = vslm_submit_sync_read_desc_io(vslm, src_desc, src_ch, NULL,
 							       batch.iov[0].iov_base,
 							       offset_blocks, num_blocks);
 		} else {
@@ -3888,7 +4014,7 @@ vslm_fault_in_clean_backing_batch_sync(struct vbdev_vslm *vslm,
 				rc = -ENOMEM;
 			} else {
 				batch.used_bounce = true;
-				rc = vslm_submit_sync_base_read_bounce(vslm, base_ch, NULL, bounce,
+				rc = vslm_submit_sync_read_desc_io(vslm, src_desc, src_ch, NULL, bounce,
 								       offset_blocks, num_blocks);
 				if (rc == 0) {
 					bounce_memcpy_start_ticks = spdk_get_ticks();
@@ -4467,7 +4593,7 @@ vslm_prefetch_next_pages(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 			break;
 		}
 
-		rc = vslm_resolve_page_ex(vslm, base_ch, vpn, &prefetch_page, false, false);
+		rc = vslm_resolve_page_ex(vslm, base_ch, NULL, vpn, &prefetch_page, false, false);
 		if (rc != 0 || prefetch_page == NULL) {
 			stop = true;
 		} else {
@@ -4492,6 +4618,7 @@ out:
 static int
 vslm_copy_range_exec_read_batched(struct vbdev_vslm *vslm,
 				  struct spdk_io_channel *base_ch,
+				  struct vslm_source_io *src,
 				  uint64_t starting_byte,
 				  uint32_t length,
 				  uint8_t *buf,
@@ -4500,6 +4627,8 @@ vslm_copy_range_exec_read_batched(struct vbdev_vslm *vslm,
 {
 	struct vslm_page *page;
 	struct vslm_mmu_shard *shard;
+	struct spdk_bdev *run_src_bdev = NULL;
+	uint64_t run_src_off = 0;
 	uint64_t offset = 0;
 	uint64_t absolute;
 	uint64_t vpn;
@@ -4548,13 +4677,14 @@ vslm_copy_range_exec_read_batched(struct vbdev_vslm *vslm,
 		if (demand_miss && page_offset == 0 &&
 		    ((uint64_t)length - offset) >= VSLM_PAGE_SIZE &&
 		    vslm->fault_batch_enabled) {
-			run_len = vslm_find_clean_backing_batch_len(vslm, vpn, vslm->fault_batch_pages);
+			run_len = vslm_find_clean_batch_run(vslm, vpn, vslm->fault_batch_pages,
+							    &run_src_bdev, &run_src_off);
 		}
 		vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
 
 		if (demand_miss && run_len > 1) {
-			rc = vslm_fault_in_clean_backing_batch_sync(vslm, base_ch, vpn, run_len,
-					true, &pages_loaded);
+			rc = vslm_fault_in_clean_backing_batch_sync(vslm, base_ch, src, run_src_bdev,
+					run_src_off, vpn, run_len, true, &pages_loaded);
 			if (rc != 0 && rc != -ENOSPC) {
 				SPDK_DEBUGLOG(vslm, "vSLM batched fault fallback bdev=%s vpn=%" PRIu64
 					      " rc=%d\n", vslm->vbdev.name, vpn, rc);
@@ -4570,7 +4700,7 @@ vslm_copy_range_exec_read_batched(struct vbdev_vslm *vslm,
 
 		page = vslm_lookup_page(vslm, vpn);
 		if (page == NULL) {
-			rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, vpn, false, false, &page);
+			rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, src, vpn, false, false, &page);
 			if (rc != 0) {
 				vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
 				return rc;
@@ -4664,6 +4794,7 @@ vslm_stream_tile_drop_clean_locked(struct vbdev_vslm *vslm,
 static int
 vslm_copy_range_exec_read_streaming(struct vbdev_vslm *vslm,
 				    struct spdk_io_channel *base_ch,
+				    struct vslm_source_io *src,
 				    uint64_t starting_byte,
 				    uint32_t length,
 				    uint8_t *buf,
@@ -4682,6 +4813,8 @@ vslm_copy_range_exec_read_streaming(struct vbdev_vslm *vslm,
 	uint32_t run_len;
 	uint32_t pages_loaded;
 	uint32_t i;
+	struct spdk_bdev *run_src_bdev = NULL;
+	uint64_t run_src_off = 0;
 	int rc;
 
 	if ((starting_byte % VSLM_PAGE_SIZE) != 0 ||
@@ -4701,14 +4834,15 @@ vslm_copy_range_exec_read_streaming(struct vbdev_vslm *vslm,
 		VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
 		pthread_mutex_lock(&shard->lock);
 		lock_start_ticks = spdk_get_ticks();
-		run_len = vslm_find_clean_backing_batch_len(vslm, start_vpn, requested_pages);
+		run_len = vslm_find_clean_batch_run(vslm, start_vpn, requested_pages,
+						    &run_src_bdev, &run_src_off);
 		vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
 		if (run_len == 0) {
 			return -ENOTSUP;
 		}
 
-		rc = vslm_fault_in_clean_backing_batch_sync(vslm, base_ch, start_vpn, run_len,
-				true, &pages_loaded);
+		rc = vslm_fault_in_clean_backing_batch_sync(vslm, base_ch, src, run_src_bdev,
+				run_src_off, start_vpn, run_len, true, &pages_loaded);
 		if (rc != 0) {
 			return rc;
 		}
@@ -4721,7 +4855,7 @@ vslm_copy_range_exec_read_streaming(struct vbdev_vslm *vslm,
 			VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
 			pthread_mutex_lock(&shard->lock);
 			lock_start_ticks = spdk_get_ticks();
-			rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, start_vpn + i,
+			rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, src, start_vpn + i,
 							      false, false, &page);
 			if (rc != 0) {
 				vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
@@ -4779,7 +4913,8 @@ vslm_copy_range_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 	bool streaming_mode_enabled = false;
 	uint32_t readahead_pages = 0;
 	uint32_t streaming_tile_pages = 0;
-	int rc;
+	struct vslm_source_io src = {0};
+	int rc = 0;
 
 	if (exec_read) {
 		pthread_mutex_lock(&vslm->policy_lock);
@@ -4804,19 +4939,17 @@ vslm_copy_range_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 		      starting_byte, length, exec_read);
 
 	if (exec_read && !is_write && streaming_mode_enabled) {
-		rc = vslm_copy_range_exec_read_streaming(vslm, base_ch, starting_byte, length, buf,
+		rc = vslm_copy_range_exec_read_streaming(vslm, base_ch, &src, starting_byte, length, buf,
 				streaming_tile_pages);
-		if (rc == 0) {
-			return 0;
-		}
-		if (rc != -ENOTSUP) {
-			return rc;
+		if (rc == 0 || rc != -ENOTSUP) {
+			goto out;
 		}
 	}
 
 	if (exec_read && !is_write && fault_batch_enabled) {
-		return vslm_copy_range_exec_read_batched(vslm, base_ch, starting_byte, length, buf,
+		rc = vslm_copy_range_exec_read_batched(vslm, base_ch, &src, starting_byte, length, buf,
 				readahead_enabled, readahead_pages);
+		goto out;
 	}
 
 	while (offset < length) {
@@ -4843,13 +4976,13 @@ vslm_copy_range_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 			}
 		}
 
-		rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, vpn, is_write,
+		rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, &src, vpn, is_write,
 						      full_page_overwrite, &page);
 		if (rc != 0) {
 			vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
 			SPDK_DEBUGLOG(vslm, "vSLM copy-range failed bdev=%s vpn=%" PRIu64 " rc=%d\n",
 				      vslm->vbdev.name, vpn, rc);
-			return rc;
+			goto out;
 		}
 
 		ptr = vslm->sram_buffer + (page->ppn * VSLM_PAGE_SIZE) + page_offset;
@@ -4887,7 +5020,10 @@ vslm_copy_range_ex(struct vbdev_vslm *vslm, struct spdk_io_channel *base_ch,
 		      demand_miss_count, overwrite_miss_count);
 	(void)demand_miss_count;
 	(void)overwrite_miss_count;
-	return 0;
+	rc = 0;
+out:
+	vslm_source_io_release(&src);
+	return rc;
 }
 
 static int
@@ -5148,13 +5284,19 @@ vslm_init_internal_batch_policy(struct vbdev_vslm *vslm)
 	vslm->prefetch_queue_depth = VSLM_DEFAULT_PREFETCH_QUEUE_DEPTH;
 
 	if (vslm->fault_batch_enabled) {
+		/*
+		 * A batch is clamped to one shard stride, so that is the natural upper
+		 * bound on both the page count and the byte size of a single coalesced
+		 * fault-in readv (the on-stack scratch arrays are sized to it).
+		 */
 		if (vslm->fault_batch_pages == 0 ||
-		    vslm->fault_batch_pages > VSLM_MAX_READAHEAD_PAGES) {
+		    vslm->fault_batch_pages > VSLM_MMU_SHARD_STRIDE_PAGES) {
 			return -EINVAL;
 		}
 
 		if (vslm->fault_batch_max_bytes == 0 ||
-		    vslm->fault_batch_max_bytes > (1024U * 1024U)) {
+		    vslm->fault_batch_max_bytes >
+		    (VSLM_MMU_SHARD_STRIDE_PAGES * (uint32_t)VSLM_PAGE_SIZE)) {
 			return -EINVAL;
 		}
 
@@ -5800,7 +5942,7 @@ vbdev_vslm_mem_pin_range_by_bdev(struct spdk_bdev *bdev, uint64_t offset,
 		VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
 		pthread_mutex_lock(&shard->lock);
 		lock_start_ticks = spdk_get_ticks();
-		rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, vpn, for_write, false, &page);
+		rc = vslm_resolve_and_pin_page_locked(vslm, base_ch, NULL, vpn, for_write, false, &page);
 		if (rc == 0) {
 			entries[pinned_count].addr = vslm->sram_buffer +
 						     (page->ppn * VSLM_PAGE_SIZE) + page_offset;
@@ -6085,6 +6227,14 @@ struct vslm_exec_rw_async_ctx {
 	uint64_t fault_start_ticks;
 	bool source_desc_opened;
 	bool source_ch_owned;
+	struct vslm_source_io exec_src;	/* source desc+channel cached for the whole execute */
+	/* Bulk read-fault coalescing: a contiguous clean run is faulted in one readv. */
+	struct vslm_fault_batch_ctx batch;
+	struct vslm_fault_batch_page batch_pages[VSLM_MMU_SHARD_STRIDE_PAGES];
+	struct iovec batch_iov[VSLM_MMU_SHARD_STRIDE_PAGES];
+	struct spdk_bdev *batch_src_bdev;
+	uint64_t batch_src_off;
+	bool batch_active;
 	bool fault_read_is_default_backing;
 	bool fault_in_counted;
 	bool is_write;
@@ -6124,6 +6274,7 @@ vslm_exec_rw_async_complete_msg(void *arg)
 	if (ctx->vslm != NULL) {
 		vslm_put_io_ref(ctx->vslm);
 	}
+	vslm_source_io_release(&ctx->exec_src);
 	free(ctx);
 }
 
@@ -6133,6 +6284,12 @@ vslm_exec_rw_async_finish(struct vslm_exec_rw_async_ctx *ctx, int status)
 	int rc;
 
 	ctx->status = status;
+	/*
+	 * Release the cached source channel here, on the worker thread that created it
+	 * (SPDK I/O channels are thread-local), before any cross-thread completion
+	 * handoff. The later release sites are then idempotent no-ops.
+	 */
+	vslm_source_io_release(&ctx->exec_src);
 	if (ctx->submit_thread == NULL || ctx->submit_thread == spdk_get_thread()) {
 		ctx->cb_fn(ctx->cb_arg, ctx->status);
 		vslm_exec_rw_async_cleanup_source(ctx);
@@ -6142,6 +6299,7 @@ vslm_exec_rw_async_finish(struct vslm_exec_rw_async_ctx *ctx, int status)
 		if (ctx->vslm != NULL) {
 			vslm_put_io_ref(ctx->vslm);
 		}
+		vslm_source_io_release(&ctx->exec_src);
 		free(ctx);
 		return;
 	}
@@ -6156,6 +6314,7 @@ vslm_exec_rw_async_finish(struct vslm_exec_rw_async_ctx *ctx, int status)
 		if (ctx->vslm != NULL) {
 			vslm_put_io_ref(ctx->vslm);
 		}
+		vslm_source_io_release(&ctx->exec_src);
 		free(ctx);
 	}
 }
@@ -6642,13 +6801,10 @@ vslm_exec_rw_async_submit_source_fault(struct vslm_exec_rw_async_ctx *ctx)
 	struct spdk_bdev *source_bdev;
 	struct spdk_bdev_desc *source_desc = NULL;
 	struct spdk_io_channel *source_ch = NULL;
-	const char *source_name;
 	uint64_t source_block_size;
 	uint64_t source_page_blocks;
 	uint64_t source_offset_blocks;
 	uint64_t source_num_blocks;
-	bool opened_source_desc = false;
-	bool source_ch_owned = false;
 	int rc;
 
 	if (lpage == NULL ||
@@ -6674,34 +6830,23 @@ vslm_exec_rw_async_submit_source_fault(struct vslm_exec_rw_async_ctx *ctx)
 		return vslm_exec_rw_async_submit_backing_fault(ctx);
 	}
 
-	if (source_bdev == vslm->base_bdev) {
-		source_desc = vslm->base_desc;
-		source_ch = ctx->base_ch;
-	} else {
-		source_name = source_bdev->name;
-		if (source_name == NULL) {
-			return vslm_exec_rw_async_submit_backing_fault(ctx);
-		}
-
-		rc = spdk_bdev_open_ext(source_name, false, vbdev_vslm_bdev_event_cb,
-					vslm, &source_desc);
-		if (rc != 0) {
-			return vslm_exec_rw_async_submit_backing_fault(ctx);
-		}
-		opened_source_desc = true;
-
-		source_ch = spdk_bdev_get_io_channel(source_desc);
-		if (source_ch == NULL) {
-			spdk_bdev_close(source_desc);
-			return vslm_exec_rw_async_submit_backing_fault(ctx);
-		}
-		source_ch_owned = true;
+	/*
+	 * Cache the source desc + per-thread channel on the exec ctx and reuse them
+	 * for every fault in this execute, instead of opening a descriptor and creating
+	 * (then destroying) an NVMe qpair per 4 KiB page. Falls back to the backing
+	 * fault if the source cannot be opened.
+	 */
+	rc = vslm_source_io_acquire(vslm, &ctx->exec_src, ctx->base_ch, source_bdev,
+				    &source_desc, &source_ch);
+	if (rc != 0) {
+		return vslm_exec_rw_async_submit_backing_fault(ctx);
 	}
 
+	/* exec_src owns the cached desc+channel; the per-fault cleanup must not close them. */
 	ctx->source_desc = source_desc;
 	ctx->source_ch = source_ch;
-	ctx->source_desc_opened = opened_source_desc;
-	ctx->source_ch_owned = source_ch_owned;
+	ctx->source_desc_opened = false;
+	ctx->source_ch_owned = false;
 	rc = vslm_exec_rw_async_submit_fault_io(ctx, source_desc, source_ch,
 						source_offset_blocks, source_page_blocks,
 						false);
@@ -6711,6 +6856,111 @@ vslm_exec_rw_async_submit_source_fault(struct vslm_exec_rw_async_ctx *ctx)
 
 	vslm_exec_rw_async_cleanup_source(ctx);
 	return vslm_exec_rw_async_submit_backing_fault(ctx);
+}
+
+/*
+ * Completion for a coalesced bulk fault-in readv. Commits the whole run, copies
+ * each page out to the caller's buffer (under the shard lock, so the just-committed
+ * frames cannot be clean-evicted mid-copy), advances past the run, and continues.
+ */
+static void
+vslm_exec_rw_async_fault_batch_complete(struct spdk_bdev_io *bdev_io, bool success,
+					void *cb_arg)
+{
+	struct vslm_exec_rw_async_ctx *ctx = cb_arg;
+	struct vbdev_vslm *vslm = ctx->vslm;
+	struct vslm_mmu_shard *shard;
+	struct vslm_page_waiter_list waiters;
+	uint64_t fault_ns;
+	uint32_t i;
+
+	TAILQ_INIT(&waiters);
+	spdk_bdev_free_io(bdev_io);
+
+	fault_ns = vslm_ticks_delta_to_ns(ctx->fault_start_ticks, spdk_get_ticks());
+	ctx->fault_start_ticks = 0;
+	ctx->fault_in_counted = false;
+	VSLM_PERF_ADD(vslm, fault_in_io_ns_total, fault_ns);
+	vslm_perf_max_u64(&vslm->perf_stats.fault_in_io_ns_max, fault_ns);
+
+	shard = vslm_shard_for_vpn(vslm, ctx->batch.start_vpn);
+	VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
+	pthread_mutex_lock(&shard->lock);
+
+	if (!success) {
+		for (i = 0; i < ctx->batch.nr_pages; i++) {
+			struct vslm_page *p = ctx->batch.pages[i].page;
+
+			if (p != NULL) {
+				vslm_page_take_waiters_locked(p, -EIO, NULL, &waiters);
+			}
+		}
+		vslm_batch_rollback_reserved_pages(vslm, &ctx->batch);
+		vslm_debug_validate_page_lists(vslm);
+		pthread_mutex_unlock(&shard->lock);
+		vslm_page_complete_waiters(&waiters);
+		ctx->batch_active = false;
+		vslm_exec_rw_async_finish(ctx, -EIO);
+		return;
+	}
+
+	vslm_batch_commit_pages(vslm, &ctx->batch, true);
+	for (i = 0; i < ctx->batch.nr_pages; i++) {
+		struct vslm_page *p = ctx->batch.pages[i].page;
+		uint8_t *frame = vslm->sram_buffer + (p->ppn * VSLM_PAGE_SIZE);
+
+		vslm_page_take_waiters_locked(p, 0, p, &waiters);
+		memcpy(ctx->buf + ctx->processed + (uint64_t)i * VSLM_PAGE_SIZE,
+		       frame, VSLM_PAGE_SIZE);
+	}
+	vslm_debug_validate_page_lists(vslm);
+	pthread_mutex_unlock(&shard->lock);
+	vslm_page_complete_waiters(&waiters);
+
+	ctx->processed += (uint64_t)ctx->batch.nr_pages * VSLM_PAGE_SIZE;
+	ctx->batch_active = false;
+	vslm_exec_rw_async_schedule_step(ctx);
+}
+
+/* Submit the coalesced readv from the run's source (cached exec_src channel). */
+static int
+vslm_exec_rw_async_submit_batch_readv(struct vslm_exec_rw_async_ctx *ctx)
+{
+	struct vbdev_vslm *vslm = ctx->vslm;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *ch = NULL;
+	uint64_t block_size;
+	uint64_t page_blocks;
+	uint64_t off_blocks;
+	uint64_t num_blocks;
+	int rc;
+
+	block_size = spdk_bdev_get_block_size(ctx->batch_src_bdev);
+	if (block_size == 0 || (VSLM_PAGE_SIZE % block_size) != 0 ||
+	    (ctx->batch_src_off % block_size) != 0) {
+		return -EINVAL;
+	}
+	page_blocks = VSLM_PAGE_SIZE / block_size;
+	off_blocks = ctx->batch_src_off / block_size;
+	num_blocks = (uint64_t)ctx->batch.nr_pages * page_blocks;
+
+	rc = vslm_source_io_acquire(vslm, &ctx->exec_src, ctx->base_ch,
+				    ctx->batch_src_bdev, &desc, &ch);
+	if (rc != 0) {
+		return rc;
+	}
+
+	if (!ctx->fault_in_counted) {
+		VSLM_PERF_INC(vslm, fault_in_total);
+		ctx->fault_start_ticks = spdk_get_ticks();
+		ctx->fault_in_counted = true;
+	}
+	VSLM_PERF_INC(vslm, fault_batch_attempt_total);
+	VSLM_PERF_INC(vslm, fault_in_batched_readv_total);
+
+	return spdk_bdev_readv_blocks(desc, ch, ctx->batch.iov, (int)ctx->batch.nr_pages,
+				      off_blocks, num_blocks,
+				      vslm_exec_rw_async_fault_batch_complete, ctx);
 }
 
 static void
@@ -6787,6 +7037,91 @@ vslm_exec_rw_async_page_step(struct vslm_exec_rw_async_ctx *ctx)
 		ctx->processed += chunk;
 		vslm_exec_rw_async_schedule_step(ctx);
 		return;
+	}
+
+	/*
+	 * Bulk read-fault coalescing: a contiguous run of clean-backed pages (default
+	 * backing or same-source contiguous aliases) is faulted in ONE readv instead of
+	 * one read per page. Read-only, page-aligned, full-page chunks; the run is held
+	 * within one MMU shard so the held lock covers reserve and the iov build. On a
+	 * run of <= 1 page we roll back and fall through to the single-page path.
+	 */
+	if (!ctx->is_write && page_offset == 0 && chunk == VSLM_PAGE_SIZE &&
+	    (ctx->length - ctx->processed) >= VSLM_PAGE_SIZE &&
+	    vslm->fault_batch_enabled) {
+		struct spdk_bdev *rsb = NULL;
+		uint64_t rso = 0;
+		uint64_t rem_pages = (ctx->length - ctx->processed) / VSLM_PAGE_SIZE;
+		uint64_t shard_room = VSLM_MMU_SHARD_STRIDE_PAGES -
+				      (vpn % VSLM_MMU_SHARD_STRIDE_PAGES);
+		uint32_t by_bytes = vslm->fault_batch_max_bytes / VSLM_PAGE_SIZE;
+		uint32_t max_run = vslm->fault_batch_pages;
+		uint32_t run_len;
+
+		if (by_bytes == 0) {
+			by_bytes = 1;
+		}
+		if (max_run > by_bytes) {
+			max_run = by_bytes;
+		}
+		if ((uint64_t)max_run > rem_pages) {
+			max_run = (uint32_t)rem_pages;
+		}
+		if ((uint64_t)max_run > shard_room) {
+			max_run = (uint32_t)shard_room;
+		}
+
+		run_len = vslm_find_clean_batch_run(vslm, vpn, max_run, &rsb, &rso);
+		if (run_len > 1) {
+			ctx->batch.vslm = vslm;
+			ctx->batch.base_ch = ctx->base_ch;
+			ctx->batch.start_vpn = vpn;
+			ctx->batch.pages = ctx->batch_pages;
+			ctx->batch.iov = ctx->batch_iov;
+			ctx->batch.bounce_buf = NULL;
+			ctx->batch.used_bounce = false;
+			ctx->batch.nr_pages = 0;
+			memset(ctx->batch_pages, 0, run_len * sizeof(ctx->batch_pages[0]));
+
+			rc = vslm_batch_reserve_free_pages(vslm, shard, vpn, run_len, &ctx->batch);
+			if (rc == 0 && ctx->batch.nr_pages > 1) {
+				vslm_batch_build_iov(vslm, &ctx->batch);
+				ctx->batch_src_bdev = rsb;
+				ctx->batch_src_off = rso;
+				ctx->batch_active = true;
+				vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
+
+				rc = vslm_exec_rw_async_submit_batch_readv(ctx);
+				if (rc != 0) {
+					uint32_t i;
+
+					VSLM_PERF_INC(vslm, mmu_lock_acquire_total);
+					pthread_mutex_lock(&shard->lock);
+					lock_start_ticks = spdk_get_ticks();
+					for (i = 0; i < ctx->batch.nr_pages; i++) {
+						struct vslm_page *p = ctx->batch.pages[i].page;
+
+						if (p != NULL) {
+							vslm_page_take_waiters_locked(p, rc, NULL,
+										      &waiters);
+						}
+					}
+					vslm_batch_rollback_reserved_pages(vslm, &ctx->batch);
+					vslm_debug_validate_page_lists(vslm);
+					vslm_mmu_unlock_measured(vslm, shard, lock_start_ticks);
+					vslm_page_complete_waiters(&waiters);
+					ctx->batch_active = false;
+					vslm_exec_rw_async_finish(ctx, rc);
+				}
+				return;
+			}
+
+			/* Reserved 0 or 1 page: roll back and fall through (lock still held). */
+			if (ctx->batch.nr_pages > 0) {
+				vslm_batch_rollback_reserved_pages(vslm, &ctx->batch);
+			}
+			ctx->batch_active = false;
+		}
 	}
 
 	rc = vslm_reserve_page_for_fault_locked(vslm, vpn, ctx->is_write,
