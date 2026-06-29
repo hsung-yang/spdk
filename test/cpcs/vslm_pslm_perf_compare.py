@@ -1565,6 +1565,8 @@ def validate_args_and_derive(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--passthru-lcores cannot be empty")
     if args.vslm_max_copy_mb <= 0:
         raise ValueError("--vslm-max-copy-mb must be > 0")
+    if args.fault_bulk_mb < 0:
+        raise ValueError("--fault-bulk-mb must be >= 0 (0 = decouple from pSLM copy bulk)")
     if args.builtin_exec_max_mb <= 0:
         raise ValueError("--builtin-exec-max-mb must be > 0")
     if args.vslm_execute_repeats <= 0:
@@ -1620,7 +1622,12 @@ def validate_args_and_derive(args: argparse.Namespace) -> Dict[str, Any]:
         "pslm_bytes": pslm_bytes,
         "sram_bytes": sram_bytes,
         "backing_min_bytes": backing_min_bytes,
-        "vslm_max_copy_bytes": args.vslm_max_copy_mb * (1 << 20),
+        # Fairness: when --fault-bulk-mb > 0, the pSLM bulk-copy unit is forced equal
+        # to the vSLM fault-in bulk unit so both systems move data at the same
+        # granularity (host-managed vs controller-managed at matched bulk size).
+        "vslm_max_copy_bytes": (args.fault_bulk_mb * (1 << 20)) if args.fault_bulk_mb > 0
+        else args.vslm_max_copy_mb * (1 << 20),
+        "fault_bulk_bytes": args.fault_bulk_mb * (1 << 20),
         "mrs_align_bytes": mrs_align_bytes,
         "execute_bytes": execute_bytes,
         "builtin_exec_max_bytes": builtin_exec_max_bytes,
@@ -1735,6 +1742,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--chunk-size-mb", type=int, default=32, help="pSLM chunk size in MiB")
     parser.add_argument("--vslm-max-copy-mb", type=int, default=1024,
                         help="Maximum bytes per single vSLM COPY command in MiB")
+    parser.add_argument("--fault-bulk-mb", type=int, default=2,
+                        help="vSLM page-fault bulk-read size in MiB. This mirrors the firmware "
+                             "VSLM_DEFAULT_FAULT_BATCH_MAX_BYTES (the size of one coalesced "
+                             "fault-in readv). When > 0, the pSLM SLM-Copy bulk size is forced "
+                             "equal to this so pSLM and vSLM move data in the SAME bulk unit "
+                             "(apples-to-apples). Set 0 to decouple and honor --vslm-max-copy-mb.")
     parser.add_argument("--vslm-backing-min-gb", type=int, default=64,
                         help="Minimum required backing bdev size in GiB for validation")
     readahead_group = parser.add_mutually_exclusive_group()
@@ -2020,7 +2033,11 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
             f"  vslm_execute_repeats={args.vslm_execute_repeats}\n"
             f"  vslm_readahead={args.vslm_readahead_enabled} pages={args.vslm_readahead_pages}\n"
             f"  builtin_exec_max_bytes={derived['builtin_exec_max_bytes']} ({args.builtin_exec_max_mb} MiB)\n"
-            f"  vslm_max_copy_bytes={derived['vslm_max_copy_bytes']} ({args.vslm_max_copy_mb} MiB)\n"
+            f"  vslm_max_copy_bytes={derived['vslm_max_copy_bytes']} "
+            f"({derived['vslm_max_copy_bytes'] // (1 << 20)} MiB)\n"
+            f"  fault_bulk_bytes={derived['fault_bulk_bytes']} ({args.fault_bulk_mb} MiB)"
+            f"  [pSLM copy bulk == vSLM fault bulk: "
+            f"{'YES (matched)' if args.fault_bulk_mb > 0 else 'decoupled'}]\n"
             f"  chunk_count={chunk_count}\n"
             f"  pSLM expected copy commands/run={chunk_count}\n"
             f"  vSLM planned copy commands/run={len(vslm_groups)}\n"
