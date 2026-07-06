@@ -3577,8 +3577,8 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 
 	desc = (const struct cs_direct_ns_desc *)ctx->data_buffer;
 
-	SPDK_NOTICELOG("DIRECT_NS_AGG entry: nsid=%u n_uint64=%u lba_offset=%" PRIu64 " workload=%u data_len=%u\n",
-		       desc->nsid, desc->n_uint64, desc->lba_offset, desc->workload, ctx->data_len);
+	SPDK_DEBUGLOG(nvmf_cpcs, "DIRECT_NS_AGG entry: nsid=%u n_uint64=%u lba_offset=%" PRIu64 " workload=%u data_len=%u\n",
+		      desc->nsid, desc->n_uint64, desc->lba_offset, desc->workload, ctx->data_len);
 
 	if (desc->n_uint64 == 0) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
@@ -3590,8 +3590,8 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 	}
 
-	SPDK_NOTICELOG("DIRECT_NS_AGG: using bdev=%s for nsid=%u\n",
-		       spdk_bdev_get_name(bdev), desc->nsid);
+	SPDK_DEBUGLOG(nvmf_cpcs, "DIRECT_NS_AGG: using bdev=%s for nsid=%u\n",
+		      spdk_bdev_get_name(bdev), desc->nsid);
 
 	total_bytes = (uint64_t)desc->n_uint64 * sizeof(uint64_t);
 	offset = desc->lba_offset;
@@ -3849,8 +3849,8 @@ write_result:
 	result.result = agg;
 	result.count  = count;
 
-	SPDK_NOTICELOG("DIRECT_NS_AGG complete: result=%" PRIu64 " count=%" PRIu64 "\n",
-		       result.result, result.count);
+	SPDK_DEBUGLOG(nvmf_cpcs, "DIRECT_NS_AGG complete: result=%" PRIu64 " count=%" PRIu64 "\n",
+		      result.result, result.count);
 
 	memcpy((uint8_t *)ctx->data_buffer + sizeof(*desc), &result, sizeof(result));
 	*return_value = sizeof(result);
