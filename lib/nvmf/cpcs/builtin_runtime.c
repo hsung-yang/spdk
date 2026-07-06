@@ -2788,8 +2788,21 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			}
 			rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
 			if (rc != 0) {
-				SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
-					    desc->nsid, offset + processed, chunk, rc);
+				if (rc == -ENOTSUP) {
+					/*
+					 * bdev_slm_read_by_bdev() returns -ENOTSUP for bdevs with
+					 * no SLM backing (i.e. desc->nsid names a plain NVMe
+					 * namespace, not an SLM one) -- fail fast with a
+					 * diagnostic so the nsid mismatch is obvious.
+					 */
+					SPDK_ERRLOG("DIRECT_NS_AGG: bdev=%s nsid=%u has no SLM backing."
+						    " desc->nsid must point to an SLM namespace,"
+						    " not a plain NVMe namespace. Check host-side nsid argument.\n",
+						    spdk_bdev_get_name(bdev), desc->nsid);
+				} else {
+					SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+						    desc->nsid, offset + processed, chunk, rc);
+				}
 				spdk_dma_free(full_buf);
 				if (rc == -ENOENT || rc == -ENOTSUP) {
 					return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
@@ -2830,8 +2843,15 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 
 		rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf);
 		if (rc != 0) {
-			SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
-				    desc->nsid, offset + processed, chunk, rc);
+			if (rc == -ENOTSUP) {
+				SPDK_ERRLOG("DIRECT_NS_AGG: bdev=%s nsid=%u has no SLM backing."
+					    " desc->nsid must point to an SLM namespace,"
+					    " not a plain NVMe namespace. Check host-side nsid argument.\n",
+					    spdk_bdev_get_name(bdev), desc->nsid);
+			} else {
+				SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+					    desc->nsid, offset + processed, chunk, rc);
+			}
 			spdk_dma_free(buf);
 			if (rc == -ENOENT || rc == -ENOTSUP) {
 				return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;

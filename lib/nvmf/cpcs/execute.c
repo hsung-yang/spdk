@@ -307,6 +307,21 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 		if (req->iovcnt == 1 && req->iov[0].iov_len >= dlen) {
 			ctx->data_buffer = req->iov[0].iov_base;
 			ctx->data_buffer_owned = false;
+			/* Diagnostic: show raw bytes received from host to catch nsid corruption */
+			if (dlen >= 8) {
+				const uint8_t *raw = (const uint8_t *)ctx->data_buffer;
+				SPDK_NOTICELOG("cpcs_execute_parse_cmd: raw data_buffer[0..7]:"
+					       " %02x %02x %02x %02x %02x %02x %02x %02x"
+					       " (nsid_field=%u) iovcnt=%d iov_len=%zu dlen=%u\n",
+					       raw[0], raw[1], raw[2], raw[3],
+					       raw[4], raw[5], raw[6], raw[7],
+					       *(const uint32_t *)raw,
+					       req->iovcnt, req->iov[0].iov_len, dlen);
+			}
+		} else if (req->iovcnt == 0) {
+			SPDK_ERRLOG("Execute Program: no IOVs in request (dlen=%u req->length=%u)\n",
+				    dlen, req->length);
+			return -SPDK_NVME_SC_INVALID_FIELD;
 		} else {
 			ctx->data_buffer = malloc(dlen);
 			if (!ctx->data_buffer) {
