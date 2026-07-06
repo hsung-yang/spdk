@@ -20,6 +20,7 @@
 
 #include "spdk/bdev.h"
 #include "spdk/bdev_slm.h"
+#include "spdk/endian.h"
 #include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/thread.h"
@@ -156,58 +157,131 @@ _passthrough_forward_chunk(const void *src, void *scratch, uint64_t len)
 }
 
 /*
+ * Read from a resolved memory range.  Equivalent in spirit to
+ * _cpcs_exec_read_range_sync() in builtin_runtime.c but accessible here
+ * (that one is static to its own translation unit). Only handles
+ * ctx->resolved_ranges, already populated by execute.c's
+ * cpcs_execute_setup_memory() by the time a runtime's execute_async() runs
+ * -- unlike builtin_runtime.c's version, this has no fallback path for
+ * in-process test harnesses that call cpcs_execute_run() directly.
+ */
+static int
+_passthrough_read_range(const struct cpcs_exec_context *ctx,
+			uint64_t mr_id, uint64_t off, uint64_t len, void *buf)
+{
+	const struct cpcs_exec_resolved_range *mr;
+	uint64_t absolute_offset;
+
+	if (mr_id == 0 || ctx->resolved_ranges == NULL ||
+	    ctx->resolved_range_count == 0) {
+		return -EINVAL;
+	}
+	if (mr_id > ctx->resolved_range_count) {
+		return -EINVAL;
+	}
+	mr = &ctx->resolved_ranges[mr_id - 1];
+	if (mr->bdev == NULL) {
+		return -EINVAL;
+	}
+	if (off > mr->length || len > mr->length - off) {
+		return -EINVAL;
+	}
+
+	absolute_offset = mr->starting_byte + off;
+	return bdev_slm_read_by_bdev(mr->bdev, absolute_offset, len, buf);
+}
+
+/* Descriptor layout matches builtin SUM64: {mr_id(u64), off(u64), len(u64)} */
+struct passthrough_sum64_desc {
+	uint64_t mr_id;
+	uint64_t off;
+	uint64_t len;
+};
+
+/*
  * Execute SUM64 by forwarding through the backing bdev (modelling the
  * device-side execute) and then reducing locally over the data that came
- * back.  Mirrors the direct-data branch of the built-in SUM64 handler.
+ * back.  Supports both direct-data and MRS-staged input.
  */
 static int
 _passthrough_execute_sum64(struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
 	const uint64_t *vals;
 	uint8_t *scratch;
+	uint8_t *read_buf = NULL;
 	uint64_t total;
 	uint64_t processed = 0;
 	uint64_t chunk;
 	uint64_t sum = 0;
+	uint64_t mr_id = 0, off = 0;
+	bool use_mrs = false;
 	size_t i;
 	int rc;
 
-	if (ctx == NULL || ctx->data_buffer == NULL || return_value == NULL) {
+	if (ctx == NULL || return_value == NULL) {
 		return -EINVAL;
 	}
 
-	/*
-	 * PoC scope: this runtime expects the host to pass the input inline via
-	 * the direct-data path (resolved_range_count == 0), the same convention
-	 * used by the direct-data branch of the built-in SUM64 handler.  MRS-
-	 * staged input is not implemented for the PoC.
-	 */
-	if (ctx->resolved_range_count != 0) {
-		SPDK_WARNLOG("Passthrough runtime: MRS-staged input not supported in PoC\n");
-		return -ENOTSUP;
-	}
-
-	if (ctx->data_len == 0 || (ctx->data_len % sizeof(uint64_t)) != 0) {
+	if (ctx->resolved_range_count > 0 && ctx->data_buffer != NULL &&
+	    ctx->data_len >= sizeof(struct passthrough_sum64_desc)) {
+		/* MRS-staged path: parse descriptor (little-endian wire format) */
+		const struct passthrough_sum64_desc *desc =
+			(const struct passthrough_sum64_desc *)ctx->data_buffer;
+		mr_id = from_le64(&desc->mr_id);
+		off   = from_le64(&desc->off);
+		total = from_le64(&desc->len);
+		use_mrs = true;
+		if (total == 0 || (total % sizeof(uint64_t)) != 0) {
+			return -EINVAL;
+		}
+	} else if (ctx->data_buffer != NULL && ctx->data_len > 0) {
+		/* Direct-data path */
+		total = ctx->data_len;
+		if (total % sizeof(uint64_t) != 0) {
+			return -EINVAL;
+		}
+	} else {
 		return -EINVAL;
 	}
 
-	total = ctx->data_len;
 	scratch = malloc(CPCS_PASSTHROUGH_IO_CHUNK);
 	if (scratch == NULL) {
 		return -ENOMEM;
 	}
+	if (use_mrs) {
+		read_buf = malloc(CPCS_PASSTHROUGH_IO_CHUNK);
+		if (read_buf == NULL) {
+			free(scratch);
+			return -ENOMEM;
+		}
+	}
 
 	while (processed < total) {
+		const void *src;
+
 		chunk = total - processed;
 		if (chunk > CPCS_PASSTHROUGH_IO_CHUNK) {
 			chunk = CPCS_PASSTHROUGH_IO_CHUNK;
 			chunk -= chunk % sizeof(uint64_t);
 		}
 
-		rc = _passthrough_forward_chunk((const uint8_t *)ctx->data_buffer + processed,
-						scratch, chunk);
+		if (use_mrs) {
+			rc = _passthrough_read_range(ctx, mr_id, off + processed,
+						     chunk, read_buf);
+			if (rc != 0) {
+				free(scratch);
+				free(read_buf);
+				return rc;
+			}
+			src = read_buf;
+		} else {
+			src = (const uint8_t *)ctx->data_buffer + processed;
+		}
+
+		rc = _passthrough_forward_chunk(src, scratch, chunk);
 		if (rc != 0) {
 			free(scratch);
+			free(read_buf);
 			return rc;
 		}
 
@@ -225,6 +299,7 @@ _passthrough_execute_sum64(struct cpcs_exec_context *ctx, uint64_t *return_value
 	}
 
 	free(scratch);
+	free(read_buf);
 	*return_value = sum;
 	return 0;
 }
@@ -299,16 +374,13 @@ passthrough_execute_msg(void *arg)
 
 	_passthrough_resolve_backing();
 
-	switch (pctx->prog->pind) {
-	case CPCS_BUILTIN_PIND_SUM64:
-		status = _passthrough_execute_sum64(pctx->exec_ctx, &return_value);
-		break;
-	default:
-		SPDK_WARNLOG("Passthrough runtime: PIND %u not supported in PoC "
-			     "(only SUM64 forwarding is implemented)\n", pctx->prog->pind);
-		status = -ENOTSUP;
-		break;
-	}
+	/*
+	 * PoC: all passthrough PINDs route to SUM64 forwarding. The PIND value
+	 * selects the runtime (builtin vs passthrough) but the workload is
+	 * always SUM64 -- this is the architectural demonstration.
+	 */
+	(void)pctx->prog->pind;
+	status = _passthrough_execute_sum64(pctx->exec_ctx, &return_value);
 
 	pctx->done_cb(pctx->done_arg, status, return_value);
 	free(pctx);

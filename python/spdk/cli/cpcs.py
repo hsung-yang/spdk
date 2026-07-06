@@ -63,3 +63,14 @@ def add_parser(subparsers):
     p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
     p.add_argument('--nsid', dest='nsid', required=True, type=int, help='Namespace ID')
     p.set_defaults(func=cpcs_mrs_list)
+
+    def cpcs_program_install_passthrough(args):
+        params = remove_null(strip_globals(vars(args)))
+        print_json(args.client.cpcs_program_install_passthrough(**params))
+
+    p = subparsers.add_parser('cpcs_program_install_passthrough',
+                              help='Install a passthrough (ptype=0xC2) program at a PIND')
+    p.add_argument('--subsystem-nqn', dest='subsystem_nqn', required=True, help='NVMf subsystem NQN')
+    p.add_argument('--nsid', dest='nsid', required=True, type=int, help='Namespace ID')
+    p.add_argument('--pind', dest='pind', required=True, type=int, help='Program Index (PIND)')
+    p.set_defaults(func=cpcs_program_install_passthrough)
