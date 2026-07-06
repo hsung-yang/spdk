@@ -309,6 +309,7 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 			if (!ctx->data_buffer) {
 				return -ENOMEM;
 			}
+			ctx->data_buffer_base = ctx->data_buffer;
 			ctx->data_buffer_owned = true;
 
 			copied = spdk_nvmf_request_copy_to_buf(req, ctx->data_buffer, dlen);
@@ -404,6 +405,10 @@ cpcs_execute_setup_memory(struct cpcs_exec_context *ctx)
 			ctx->inline_ranges = NULL;
 			return rc;
 		}
+
+		/* Advance data_buffer past the range descriptors so builtins see their own descriptor */
+		ctx->data_buffer = (uint8_t *)ctx->data_buffer + required_size;
+		ctx->data_len -= (uint32_t)required_size;
 
 		SPDK_DEBUGLOG(nvmf_cpcs, "Parsed %u inline memory ranges\n", ctx->inline_range_count);
 	}
@@ -546,8 +551,8 @@ cpcs_execute_complete(struct cpcs_exec_context *ctx, int status)
 		free(ctx->resolved_ranges);
 	}
 
-	if (ctx->data_buffer && ctx->data_buffer_owned) {
-		free(ctx->data_buffer);
+	if (ctx->data_buffer_owned) {
+		free(ctx->data_buffer_base != NULL ? ctx->data_buffer_base : ctx->data_buffer);
 	}
 
 	/* Complete request */

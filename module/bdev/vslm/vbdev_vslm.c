@@ -2456,8 +2456,25 @@ vslm_submit_sync_base_io(struct vbdev_vslm *vslm, struct spdk_io_channel *base_c
 	if (held_shard != NULL) {
 		pthread_mutex_unlock(&held_shard->lock);
 	}
-	while (!ctx.done) {
-		spdk_thread_poll(thread, 0, 0);
+	{
+		/*
+		 * This loop cannot time out and break early: doing so would leave
+		 * ctx on the stack while vslm_sync_io_completion_cb() may still fire
+		 * later and write through a dangling pointer. Log a warning only,
+		 * so a hung backing device is visible instead of silently stalling
+		 * forever.
+		 */
+		uint64_t poll_start_ticks = spdk_get_ticks();
+		bool warned = false;
+
+		while (!ctx.done) {
+			spdk_thread_poll(thread, 0, 0);
+			if (!warned &&
+			    vslm_ticks_delta_to_ns(poll_start_ticks, spdk_get_ticks()) >= 30ull * 1000 * 1000 * 1000) {
+				SPDK_ERRLOG("vSLM sync base I/O pending >30s -- possible backing device hang\n");
+				warned = true;
+			}
+		}
 	}
 	if (held_shard != NULL) {
 		pthread_mutex_lock(&held_shard->lock);
