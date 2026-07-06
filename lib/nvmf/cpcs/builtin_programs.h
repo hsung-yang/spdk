@@ -40,6 +40,9 @@ enum cpcs_builtin_program {
 	CPCS_BUILTIN_FILTER_GT = 14,
 	CPCS_BUILTIN_MEMCPY_INLINE = 15,
 	CPCS_BUILTIN_RLE_COMPRESS = 16,
+	CPCS_BUILTIN_MULTI_AGG64 = 17,
+	CPCS_BUILTIN_L2_DISTANCE_SQ = 18,
+	CPCS_BUILTIN_COSINE_SIMILARITY = 19,
 	CPCS_BUILTIN_MAX,
 };
 
@@ -66,6 +69,14 @@ enum cpcs_builtin_program {
 #define CPCS_BUILTIN_PIND_FILTER_GT     14u
 #define CPCS_BUILTIN_PIND_MEMCPY_INLINE 15u
 #define CPCS_BUILTIN_PIND_RLE_COMPRESS  16u
+/*
+ * PIND 17-19: ported from github/e2e_benchmark, which had assigned these to
+ * PIND 9-11 -- colliding with KV_LAYOUT_REPACK/KV_BLOCK_SELECT/KV_PREFIX_LOOKUP
+ * above. Renumbered to the next free slots, same rationale as PIND 13-16.
+ */
+#define CPCS_BUILTIN_PIND_MULTI_AGG64        17u
+#define CPCS_BUILTIN_PIND_L2_DISTANCE_SQ     18u
+#define CPCS_BUILTIN_PIND_COSINE_SIMILARITY  19u
 
 /* PUID values are a stable ABI for experiments (host can refer to them). */
 #define CPCS_BUILTIN_PUID_MEMCPY  0x0000000000000001ull
@@ -85,6 +96,9 @@ enum cpcs_builtin_program {
 #define CPCS_BUILTIN_PUID_FILTER_GT      0x000000000000000Full
 #define CPCS_BUILTIN_PUID_MEMCPY_INLINE  0x0000000000000010ull
 #define CPCS_BUILTIN_PUID_RLE_COMPRESS   0x0000000000000011ull
+#define CPCS_BUILTIN_PUID_MULTI_AGG64        0x0000000000000012ull
+#define CPCS_BUILTIN_PUID_L2_DISTANCE_SQ     0x0000000000000013ull
+#define CPCS_BUILTIN_PUID_COSINE_SIMILARITY  0x0000000000000014ull
 
 bool cpcs_program_index_is_builtin(uint16_t pind);
 int cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns);

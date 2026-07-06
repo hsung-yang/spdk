@@ -21,6 +21,8 @@
 
 #include "spdk/stdinc.h"
 
+#include <math.h>
+
 struct cpcs_builtin_memcpy_desc {
 	uint64_t src_mr_id;
 	uint64_t src_off;
@@ -41,6 +43,13 @@ struct cpcs_builtin_sum64_desc {
 	uint64_t mr_id;
 	uint64_t off;
 	uint64_t len;
+};
+
+struct cpcs_builtin_multi_agg64_result {
+	uint64_t count;
+	double sum;
+	double min;
+	double max;
 };
 
 struct cpcs_builtin_metadata_record {
@@ -2317,6 +2326,149 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	return 0;
 }
 
+/*
+ * Ported from github/e2e_benchmark 861c5a92b (originally PIND 9-11, direct-
+ * data-only builtins). Renumbered to PIND 17-19 to avoid colliding with this
+ * branch's KV_LAYOUT_REPACK/KV_BLOCK_SELECT/KV_PREFIX_LOOKUP. At this point in
+ * the ported history these three ops only support the inline "direct data"
+ * calling convention (RSID=0, NUMR=0, no MRS at all) -- MRS/SLM-backed input
+ * is added later by e3d6b3848. Unlike DOT_PRODUCT, which b187526dc already
+ * rewrote to be MRS-only, these three have no MRS path yet, so the
+ * direct-data check is not optional here.
+ */
+static bool
+_builtin_has_direct_data(const struct cpcs_exec_context *ctx)
+{
+	return ctx != NULL && ctx->resolved_range_count == 0;
+}
+
+static int
+_builtin_execute_vector_float_direct(const struct cpcs_exec_context *ctx, uint16_t pind, uint64_t *return_value)
+{
+	const float *vals;
+	size_t count;
+	size_t half;
+	float result = 0.0f;
+	uint32_t bits = 0;
+	size_t i;
+
+	if (ctx == NULL || ctx->data_buffer == NULL || return_value == NULL) {
+		return -EINVAL;
+	}
+	if (ctx->data_len == 0 || (ctx->data_len % (2 * sizeof(float))) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	vals = (const float *)ctx->data_buffer;
+	count = ctx->data_len / sizeof(float);
+	half = count / 2;
+
+	if (pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ) {
+		for (i = 0; i < half; i++) {
+			float diff = vals[i] - vals[i + half];
+			result += diff * diff;
+		}
+	} else if (pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY) {
+		float dot = 0.0f;
+		float lhs_norm = 0.0f;
+		float rhs_norm = 0.0f;
+
+		for (i = 0; i < half; i++) {
+			float lhs = vals[i];
+			float rhs = vals[i + half];
+			dot += lhs * rhs;
+			lhs_norm += lhs * lhs;
+			rhs_norm += rhs * rhs;
+		}
+
+		result = dot / sqrtf(lhs_norm * rhs_norm);
+		if (result < -1.0f) {
+			result = -1.0f;
+		} else if (result > 1.0f) {
+			result = 1.0f;
+		}
+	} else {
+		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
+	}
+
+	memcpy(&bits, &result, sizeof(bits));
+	*return_value = (uint64_t)bits;
+	return 0;
+}
+
+static int
+_builtin_execute_multi_agg64_direct(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	struct cpcs_builtin_multi_agg64_result result;
+	const double *vals;
+	uint8_t *out;
+	size_t input_len;
+	size_t count;
+	size_t i;
+
+	if (ctx == NULL || ctx->data_buffer == NULL || return_value == NULL) {
+		return -EINVAL;
+	}
+	if (ctx->data_len <= sizeof(result)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	input_len = ctx->data_len - sizeof(result);
+	if (input_len == 0 || (input_len % sizeof(double)) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	vals = (const double *)ctx->data_buffer;
+	count = input_len / sizeof(double);
+	result.count = count;
+	result.sum = 0.0;
+	result.min = vals[0];
+	result.max = vals[0];
+
+	for (i = 0; i < count; i++) {
+		double value = vals[i];
+		result.sum += value;
+		if (value < result.min) {
+			result.min = value;
+		}
+		if (value > result.max) {
+			result.max = value;
+		}
+	}
+
+	out = (uint8_t *)ctx->data_buffer + input_len;
+	memcpy(out, &result, sizeof(result));
+	*return_value = sizeof(result);
+	return 0;
+}
+
+static int
+_builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	if (!_builtin_has_direct_data(ctx)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	return _builtin_execute_multi_agg64_direct(ctx, return_value);
+}
+
+static int
+_builtin_execute_l2_distance_sq(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	if (!_builtin_has_direct_data(ctx)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_L2_DISTANCE_SQ, return_value);
+}
+
+static int
+_builtin_execute_cosine_similarity(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	if (!_builtin_has_direct_data(ctx)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+	return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_COSINE_SIMILARITY, return_value);
+}
+
 static int
 _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
@@ -2463,6 +2615,15 @@ _cpcs_builtin_extended_msg(void *arg)
 			break;
 		case CPCS_BUILTIN_PIND_RLE_COMPRESS:
 			status = _builtin_execute_rle_compress(ctx->exec_ctx, &return_value);
+			break;
+		case CPCS_BUILTIN_PIND_MULTI_AGG64:
+			status = _builtin_execute_multi_agg64(ctx->exec_ctx, &return_value);
+			break;
+		case CPCS_BUILTIN_PIND_L2_DISTANCE_SQ:
+			status = _builtin_execute_l2_distance_sq(ctx->exec_ctx, &return_value);
+			break;
+		case CPCS_BUILTIN_PIND_COSINE_SIMILARITY:
+			status = _builtin_execute_cosine_similarity(ctx->exec_ctx, &return_value);
 			break;
 		default:
 			status = -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
@@ -3615,7 +3776,10 @@ builtin_execute_async(struct cpcs_program *prog,
 	if (prog->pind == CPCS_BUILTIN_PIND_DOT_PRODUCT ||
 	    prog->pind == CPCS_BUILTIN_PIND_FILTER_GT ||
 	    prog->pind == CPCS_BUILTIN_PIND_MEMCPY_INLINE ||
-	    prog->pind == CPCS_BUILTIN_PIND_RLE_COMPRESS) {
+	    prog->pind == CPCS_BUILTIN_PIND_RLE_COMPRESS ||
+	    prog->pind == CPCS_BUILTIN_PIND_MULTI_AGG64 ||
+	    prog->pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ ||
+	    prog->pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY) {
 		return _cpcs_builtin_execute_extended(prog, ctx, done_cb, cb_arg);
 	}
 

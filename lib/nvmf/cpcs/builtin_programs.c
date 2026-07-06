@@ -48,6 +48,12 @@ _builtin_puid_for_pind(uint16_t pind)
 		return CPCS_BUILTIN_PUID_MEMCPY_INLINE;
 	case CPCS_BUILTIN_PIND_RLE_COMPRESS:
 		return CPCS_BUILTIN_PUID_RLE_COMPRESS;
+	case CPCS_BUILTIN_PIND_MULTI_AGG64:
+		return CPCS_BUILTIN_PUID_MULTI_AGG64;
+	case CPCS_BUILTIN_PIND_L2_DISTANCE_SQ:
+		return CPCS_BUILTIN_PUID_L2_DISTANCE_SQ;
+	case CPCS_BUILTIN_PIND_COSINE_SIMILARITY:
+		return CPCS_BUILTIN_PUID_COSINE_SIMILARITY;
 	default:
 		return 0;
 	}
@@ -72,7 +78,10 @@ cpcs_program_index_is_builtin(uint16_t pind)
 		pind == CPCS_BUILTIN_PIND_DOT_PRODUCT ||
 		pind == CPCS_BUILTIN_PIND_FILTER_GT ||
 		pind == CPCS_BUILTIN_PIND_MEMCPY_INLINE ||
-		pind == CPCS_BUILTIN_PIND_RLE_COMPRESS);
+		pind == CPCS_BUILTIN_PIND_RLE_COMPRESS ||
+		pind == CPCS_BUILTIN_PIND_MULTI_AGG64 ||
+		pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ ||
+		pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY);
 }
 
 static int
@@ -131,7 +140,7 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 
 	pthread_mutex_lock(&ns->lock);
 
-	if (ns->max_programs <= CPCS_BUILTIN_PIND_RLE_COMPRESS) {
+	if (ns->max_programs <= CPCS_BUILTIN_PIND_COSINE_SIMILARITY) {
 		pthread_mutex_unlock(&ns->lock);
 		return -EINVAL;
 	}
@@ -185,6 +194,15 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 	if (rc == 0) {
 		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_RLE_COMPRESS);
 	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_MULTI_AGG64);
+	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_L2_DISTANCE_SQ);
+	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_COSINE_SIMILARITY);
+	}
 
 	pthread_mutex_unlock(&ns->lock);
 
@@ -192,7 +210,8 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 		SPDK_NOTICELOG("Installed CPCS built-in programs: memcpy, memfill, sum64, max64, min64, "
 			       "filter_agg, filtered_topk_exact, kv_pack_store, kv_unpack_load, "
 			       "kv_layout_repack, kv_block_select, kv_prefix_lookup, kv_batch_read, "
-			       "dot_product, filter_gt, memcpy_inline, rle_compress\n");
+			       "dot_product, filter_gt, memcpy_inline, rle_compress, "
+			       "multi_agg64, l2_distance_sq, cosine_similarity\n");
 	}
 
 	return rc;
