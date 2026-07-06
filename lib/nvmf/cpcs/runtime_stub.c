@@ -197,7 +197,7 @@ cpcs_runtime_init_all(void)
 		return rc;
 	}
 
-	/* Register passthrough runtime (Z1 PoC: substrate-agnostic dispatch). */
+	/* Register passthrough runtime (Z1 PoC: hardware-independent dispatch). */
 	rc = cpcs_passthrough_runtime_register();
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to register passthrough runtime\n");
