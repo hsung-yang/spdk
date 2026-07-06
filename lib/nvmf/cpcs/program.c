@@ -129,8 +129,8 @@ cpcs_program_load(struct spdk_nvmf_cpcs_ns *ns,
 		}
 	}
 
-	/* Check bounds */
-	if (loff + numb > prog->total_size) {
+	/* Check bounds (overflow-safe) */
+	if (loff > prog->total_size || numb > prog->total_size - loff) {
 		pthread_mutex_unlock(&ns->lock);
 		return -SPDK_NVME_CPCS_SC_PROGRAM_TOO_BIG;
 	}
@@ -279,6 +279,15 @@ _cpcs_program_unload_locked(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind,
 
 	if (!allow_device_defined && prog->peocc == SPDK_NVME_CPCS_PEOCC_DEVICE_DEFINED) {
 		return -SPDK_NVME_CPCS_SC_PROGRAM_INDEX_NOT_DOWNLOADABLE;
+	}
+
+	/* Block unload while activation is in flight: cpcs_program_activate
+	 * drops the namespace lock around runtime init/activate, leaving a
+	 * window where activated=false and exec_count=0 -- without this guard
+	 * the unloader could free prog while the activator still holds a
+	 * pointer to it. */
+	if (prog->state == CPCS_PROGRAM_STATE_ACTIVATING) {
+		return -SPDK_NVME_CPCS_SC_PROGRAM_IN_USE;
 	}
 
 	if (prog->exec_count > 0) {

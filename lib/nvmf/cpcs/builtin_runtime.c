@@ -2293,7 +2293,8 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	uint64_t chunk;
 	uint64_t len;
 	uint64_t half_len;
-	float sum = 0.0f;
+	double sum_d = 0.0;
+	float sum;
 	uint32_t sum_bits = 0;
 	uint8_t *buf_a = NULL;
 	size_t i;
@@ -2361,7 +2362,7 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 
 		p = (const float *)buf;
 		for (i = 0; i < (chunk / sizeof(float)); i++) {
-			sum += ((const float *)buf_a)[processed / sizeof(float) + i] * p[i];
+			sum_d += (double)((const float *)buf_a)[processed / sizeof(float) + i] * (double)p[i];
 		}
 		processed += chunk;
 	}
@@ -2369,6 +2370,7 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	free(buf);
 	free(buf_a);
 
+	sum = (float)sum_d;
 	memcpy(&sum_bits, &sum, sizeof(sum_bits));
 	*return_value = (uint64_t)sum_bits;
 	return 0;

@@ -41,7 +41,7 @@ spdk_nvmf_cpcs_ns_opts_init(struct spdk_nvmf_cpcs_ns_opts *opts)
 	opts->max_mrs = 256;            /* Default: 256 MRS */
 	opts->max_ranges_per_mrs = 32;  /* Default: 32 ranges per MRS */
 	opts->mrs_granularity = 2;      /* Default: 2^2 = 4 bytes */
-	opts->max_program_bytes = 1024; /* Default: 1 GiB */
+	opts->max_program_bytes = 1024; /* Default: 1024 MiB = 1 GiB (multiplied by 1 MiB at create time) */
 	opts->load_program_gran = 12;   /* Default: 2^12 = 4 KiB */
 	opts->reach_group_id = 0;       /* Default: group 0 */
 }
