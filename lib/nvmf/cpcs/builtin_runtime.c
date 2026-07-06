@@ -52,6 +52,35 @@ struct cpcs_builtin_multi_agg64_result {
 	double max;
 };
 
+/*
+ * Direct namespace aggregation descriptor (24 bytes).
+ * Sent by the host in the data buffer when invoking DIRECT_NS_AGG.
+ * Reads straight from a CSD-local NVMe namespace instead of an MRS,
+ * eliminating host round-trips for the input data.
+ */
+struct cs_direct_ns_desc {
+	uint32_t nsid;        /* NVMe namespace ID to read from */
+	uint32_t n_uint64;     /* number of uint64 elements to process */
+	uint64_t lba_offset;  /* starting byte offset into the namespace */
+	uint8_t  workload;    /* 0=SUM, 1=MAX, 2=MIN, 3=FILTER_GT */
+	uint8_t  pad[7];      /* reserved, must be zero */
+};
+
+/*
+ * Direct namespace aggregation result (16 bytes).
+ * Written back into the data buffer just past the descriptor.
+ */
+struct cs_direct_ns_result {
+	uint64_t result; /* aggregation result (SUM/MAX/MIN value, or FILTER_GT count) */
+	uint64_t count;  /* elements processed */
+};
+
+/* Workload codes for cs_direct_ns_desc.workload */
+#define CS_DIRECT_NS_WORKLOAD_SUM       0
+#define CS_DIRECT_NS_WORKLOAD_MAX       1
+#define CS_DIRECT_NS_WORKLOAD_MIN       2
+#define CS_DIRECT_NS_WORKLOAD_FILTER_GT 3
+
 struct cpcs_builtin_metadata_record {
 	uint64_t doc_id;
 	uint32_t category_id;
@@ -2583,6 +2612,126 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	return 0;
 }
 
+/*
+ * DIRECT_NS_AGG reads straight from a CSD-local NVMe namespace (identified
+ * by nsid in the descriptor) rather than through an MRS/SLM range, so it
+ * bypasses _cpcs_exec_read_range_sync entirely and calls bdev_slm_read_by_bdev
+ * directly against the resolved bdev. Reuses the existing nsid->bdev lookup
+ * helper (_cpcs_find_bdev_by_nsid) rather than duplicating it.
+ */
+static int
+_builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *return_value)
+{
+	const struct cs_direct_ns_desc *desc;
+	struct cs_direct_ns_result result;
+	struct spdk_bdev *bdev;
+	const uint64_t *p;
+	uint8_t *buf;
+	uint64_t offset;
+	uint64_t total_bytes;
+	uint64_t processed = 0;
+	uint64_t chunk;
+	uint64_t agg = 0;
+	uint64_t count = 0;
+	bool initialized = false;
+	size_t i;
+	size_t n;
+	int rc;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc) + sizeof(result)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	desc = (const struct cs_direct_ns_desc *)ctx->data_buffer;
+
+	if (desc->n_uint64 == 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	bdev = _cpcs_find_bdev_by_nsid(desc->nsid);
+	if (bdev == NULL) {
+		return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+	}
+
+	total_bytes = (uint64_t)desc->n_uint64 * sizeof(uint64_t);
+	offset = desc->lba_offset;
+
+	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	if (buf == NULL) {
+		return -ENOMEM;
+	}
+
+	while (processed < total_bytes) {
+		chunk = total_bytes - processed;
+		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_IO_CHUNK;
+			chunk -= chunk % sizeof(uint64_t);
+		}
+
+		rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			if (rc == -ENOENT || rc == -ENOTSUP) {
+				return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+			}
+			if (rc == -EINVAL) {
+				return -SPDK_NVME_SC_INVALID_FIELD;
+			}
+			return rc;
+		}
+
+		p = (const uint64_t *)buf;
+		n = chunk / sizeof(uint64_t);
+
+		switch (desc->workload) {
+		case CS_DIRECT_NS_WORKLOAD_SUM:
+			for (i = 0; i < n; i++) {
+				agg += p[i];
+			}
+			break;
+		case CS_DIRECT_NS_WORKLOAD_MAX:
+			for (i = 0; i < n; i++) {
+				if (!initialized || p[i] > agg) {
+					agg = p[i];
+					initialized = true;
+				}
+			}
+			break;
+		case CS_DIRECT_NS_WORKLOAD_MIN:
+			for (i = 0; i < n; i++) {
+				if (!initialized || p[i] < agg) {
+					agg = p[i];
+					initialized = true;
+				}
+			}
+			break;
+		case CS_DIRECT_NS_WORKLOAD_FILTER_GT:
+			/* Threshold = 0: count all non-zero elements */
+			for (i = 0; i < n; i++) {
+				if (p[i] > 0) {
+					agg++;
+				}
+			}
+			break;
+		default:
+			free(buf);
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+
+		count += n;
+		processed += chunk;
+	}
+
+	free(buf);
+
+	result.result = agg;
+	result.count  = count;
+
+	memcpy((uint8_t *)ctx->data_buffer + sizeof(*desc), &result, sizeof(result));
+	*return_value = sizeof(result);
+	return 0;
+}
+
 static void
 _cpcs_builtin_extended_msg(void *arg)
 {
@@ -2633,6 +2782,9 @@ _cpcs_builtin_extended_msg(void *arg)
 			break;
 		case CPCS_BUILTIN_PIND_COSINE_SIMILARITY:
 			status = _builtin_execute_cosine_similarity(ctx->exec_ctx, &return_value);
+			break;
+		case CPCS_BUILTIN_PIND_DIRECT_NS_AGG:
+			status = _builtin_execute_direct_ns_agg(ctx->exec_ctx, &return_value);
 			break;
 		default:
 			status = -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
@@ -3788,7 +3940,8 @@ builtin_execute_async(struct cpcs_program *prog,
 	    prog->pind == CPCS_BUILTIN_PIND_RLE_COMPRESS ||
 	    prog->pind == CPCS_BUILTIN_PIND_MULTI_AGG64 ||
 	    prog->pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ ||
-	    prog->pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY) {
+	    prog->pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY ||
+	    prog->pind == CPCS_BUILTIN_PIND_DIRECT_NS_AGG) {
 		return _cpcs_builtin_execute_extended(prog, ctx, done_cb, cb_arg);
 	}
 

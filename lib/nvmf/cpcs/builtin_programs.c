@@ -54,6 +54,8 @@ _builtin_puid_for_pind(uint16_t pind)
 		return CPCS_BUILTIN_PUID_L2_DISTANCE_SQ;
 	case CPCS_BUILTIN_PIND_COSINE_SIMILARITY:
 		return CPCS_BUILTIN_PUID_COSINE_SIMILARITY;
+	case CPCS_BUILTIN_PIND_DIRECT_NS_AGG:
+		return CPCS_BUILTIN_PUID_DIRECT_NS_AGG;
 	default:
 		return 0;
 	}
@@ -81,7 +83,8 @@ cpcs_program_index_is_builtin(uint16_t pind)
 		pind == CPCS_BUILTIN_PIND_RLE_COMPRESS ||
 		pind == CPCS_BUILTIN_PIND_MULTI_AGG64 ||
 		pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ ||
-		pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY);
+		pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY ||
+		pind == CPCS_BUILTIN_PIND_DIRECT_NS_AGG);
 }
 
 static int
@@ -140,7 +143,7 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 
 	pthread_mutex_lock(&ns->lock);
 
-	if (ns->max_programs <= CPCS_BUILTIN_PIND_COSINE_SIMILARITY) {
+	if (ns->max_programs <= CPCS_BUILTIN_PIND_DIRECT_NS_AGG) {
 		pthread_mutex_unlock(&ns->lock);
 		return -EINVAL;
 	}
@@ -203,6 +206,9 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 	if (rc == 0) {
 		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_COSINE_SIMILARITY);
 	}
+	if (rc == 0) {
+		rc = _install_one_builtin(ns, CPCS_BUILTIN_PIND_DIRECT_NS_AGG);
+	}
 
 	pthread_mutex_unlock(&ns->lock);
 
@@ -211,7 +217,7 @@ cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns)
 			       "filter_agg, filtered_topk_exact, kv_pack_store, kv_unpack_load, "
 			       "kv_layout_repack, kv_block_select, kv_prefix_lookup, kv_batch_read, "
 			       "dot_product, filter_gt, memcpy_inline, rle_compress, "
-			       "multi_agg64, l2_distance_sq, cosine_similarity\n");
+			       "multi_agg64, l2_distance_sq, cosine_similarity, direct_ns_agg\n");
 	}
 
 	return rc;

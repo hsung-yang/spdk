@@ -43,6 +43,7 @@ enum cpcs_builtin_program {
 	CPCS_BUILTIN_MULTI_AGG64 = 17,
 	CPCS_BUILTIN_L2_DISTANCE_SQ = 18,
 	CPCS_BUILTIN_COSINE_SIMILARITY = 19,
+	CPCS_BUILTIN_DIRECT_NS_AGG = 20,
 	CPCS_BUILTIN_MAX,
 };
 
@@ -77,6 +78,16 @@ enum cpcs_builtin_program {
 #define CPCS_BUILTIN_PIND_MULTI_AGG64        17u
 #define CPCS_BUILTIN_PIND_L2_DISTANCE_SQ     18u
 #define CPCS_BUILTIN_PIND_COSINE_SIMILARITY  19u
+/*
+ * Ported from github/e2e_benchmark, which originally assigned this PIND
+ * 0x20 (32), leaving an exploitable gap at PIND 12-31 where a host could
+ * load arbitrary programs into reserved-but-unused slots. That gap was
+ * later closed upstream (see e2e_benchmark 14d751ce0) by moving it down to
+ * PIND 12, immediately after their last real builtin. On this branch the
+ * next free slot after COSINE_SIMILARITY is 20, so it is assigned directly
+ * here with no gap in the first place.
+ */
+#define CPCS_BUILTIN_PIND_DIRECT_NS_AGG      20u
 
 /* PUID values are a stable ABI for experiments (host can refer to them). */
 #define CPCS_BUILTIN_PUID_MEMCPY  0x0000000000000001ull
@@ -99,6 +110,7 @@ enum cpcs_builtin_program {
 #define CPCS_BUILTIN_PUID_MULTI_AGG64        0x0000000000000012ull
 #define CPCS_BUILTIN_PUID_L2_DISTANCE_SQ     0x0000000000000013ull
 #define CPCS_BUILTIN_PUID_COSINE_SIMILARITY  0x0000000000000014ull
+#define CPCS_BUILTIN_PUID_DIRECT_NS_AGG      0x0000000000000015ull
 
 bool cpcs_program_index_is_builtin(uint16_t pind);
 int cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns);
