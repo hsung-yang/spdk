@@ -196,12 +196,17 @@ cpcs_mrs_delete_all(struct spdk_nvmf_cpcs_ns *ns)
 	pthread_mutex_lock(&ns->lock);
 
 	TAILQ_FOREACH_SAFE(mrs, &ns->mrs_list, link, tmp) {
+		if (__atomic_load_n(&mrs->ref_count, __ATOMIC_ACQUIRE) > 0) {
+			pthread_mutex_unlock(&ns->lock);
+			SPDK_ERRLOG("Cannot delete MRS %u: still in use\n", mrs->rsid);
+			return -SPDK_NVME_CPCS_SC_MEMORY_RANGE_SET_IN_USE;
+		}
 		TAILQ_REMOVE(&ns->mrs_list, mrs, link);
+		ns->mrs_count--;
 		free(mrs->ranges);
 		free(mrs);
 	}
 
-	ns->mrs_count = 0;
 	pthread_mutex_unlock(&ns->lock);
 
 	return 0;
@@ -246,9 +251,10 @@ cpcs_mrs_get_and_acquire(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
 			 * Increment the reference count while still holding
 			 * ns->lock so that a concurrent cpcs_mrs_delete() cannot
 			 * observe ref_count==0 and free the MRS between lookup
-			 * and acquire.
+			 * and acquire. The mutex provides ordering, so relaxed
+			 * is sufficient.
 			 */
-			__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
+			__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_RELAXED);
 			pthread_mutex_unlock(&ns->lock);
 			return mrs;
 		}
@@ -265,7 +271,7 @@ cpcs_mrs_acquire(struct cpcs_memory_range_set *mrs)
 		return -EINVAL;
 	}
 
-	__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
+	__atomic_add_fetch(&mrs->ref_count, 1, __ATOMIC_ACQUIRE);
 
 	return 0;
 }
@@ -277,7 +283,7 @@ cpcs_mrs_release(struct cpcs_memory_range_set *mrs)
 		return;
 	}
 
-	__atomic_sub_fetch(&mrs->ref_count, 1, __ATOMIC_SEQ_CST);
+	__atomic_sub_fetch(&mrs->ref_count, 1, __ATOMIC_RELEASE);
 }
 
 int
