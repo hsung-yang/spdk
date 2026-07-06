@@ -2504,28 +2504,289 @@ _builtin_execute_multi_agg64_direct(const struct cpcs_exec_context *ctx, uint64_
 static int
 _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
-	if (!_builtin_has_direct_data(ctx)) {
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_multi_agg64_direct(ctx, return_value);
+	}
+
+	/* MRS path: read double array from SLM, compute count/sum/min/max */
+	const struct cpcs_builtin_sum64_desc *desc;
+	struct cpcs_builtin_multi_agg64_result result;
+	uint8_t *buf;
+	uint64_t mr_id, off, len;
+	uint64_t processed = 0, chunk;
+	const double *vals;
+	size_t i, n;
+	bool initialized = false;
+	int rc;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
-	return _builtin_execute_multi_agg64_direct(ctx, return_value);
+
+	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+	len = from_le64(&desc->len);
+	if (len == 0 || (len % sizeof(double)) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+
+	buf = malloc(CPCS_BUILTIN_EXT_IO_CHUNK);
+	if (buf == NULL) {
+		return -ENOMEM;
+	}
+
+	result.count = 0;
+	result.sum = 0.0;
+	result.min = 0.0;
+	result.max = 0.0;
+
+	while (processed < len) {
+		chunk = len - processed;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+			chunk -= chunk % sizeof(double);
+		}
+
+		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			return rc;
+		}
+
+		vals = (const double *)buf;
+		n = chunk / sizeof(double);
+		for (i = 0; i < n; i++) {
+			double value = vals[i];
+			result.sum += value;
+			if (!initialized || value < result.min) {
+				result.min = value;
+			}
+			if (!initialized || value > result.max) {
+				result.max = value;
+			}
+			initialized = true;
+		}
+		result.count += n;
+		processed += chunk;
+	}
+
+	free(buf);
+
+	/* Write result struct back into data buffer after descriptor */
+	if (ctx->data_len >= sizeof(*desc) + sizeof(result)) {
+		uint8_t *out = (uint8_t *)ctx->data_buffer + sizeof(*desc);
+		memcpy(out, &result, sizeof(result));
+	}
+	*return_value = sizeof(result);
+	return 0;
 }
 
 static int
 _builtin_execute_l2_distance_sq(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
-	if (!_builtin_has_direct_data(ctx)) {
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_L2_DISTANCE_SQ, return_value);
+	}
+
+	/* MRS path: read two vectors from SLM, compute sum of squared differences */
+	const struct cpcs_builtin_sum64_desc *desc;
+	uint8_t *buf_a = NULL;
+	uint8_t *buf = NULL;
+	uint64_t mr_id, off, len, half_len;
+	uint64_t processed = 0, chunk;
+	double sum_d = 0.0;
+	float result_f;
+	uint32_t result_bits = 0;
+	size_t i;
+	int rc;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
-	return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_L2_DISTANCE_SQ, return_value);
+
+	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+	len = from_le64(&desc->len);
+	if (len == 0 || (len % (2 * sizeof(float))) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+	half_len = len / 2;
+
+	/* Read vector A (first half) */
+	buf_a = malloc(half_len);
+	if (buf_a == NULL) {
+		return -ENOMEM;
+	}
+
+	processed = 0;
+	while (processed < half_len) {
+		chunk = half_len - processed;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+			chunk -= chunk % sizeof(float);
+		}
+		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, buf_a + processed);
+		if (rc != 0) {
+			free(buf_a);
+			return rc;
+		}
+		processed += chunk;
+	}
+
+	/* Stream vector B and accumulate L2 distance squared */
+	buf = malloc(CPCS_BUILTIN_EXT_IO_CHUNK);
+	if (buf == NULL) {
+		free(buf_a);
+		return -ENOMEM;
+	}
+
+	processed = 0;
+	while (processed < half_len) {
+		chunk = half_len - processed;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+			chunk -= chunk % sizeof(float);
+		}
+		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + half_len + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			free(buf_a);
+			return rc;
+		}
+
+		{
+			const float *pb = (const float *)buf;
+			const float *pa = (const float *)(buf_a + processed);
+			for (i = 0; i < (chunk / sizeof(float)); i++) {
+				float diff = pa[i] - pb[i];
+				sum_d += (double)diff * (double)diff;
+			}
+		}
+		processed += chunk;
+	}
+
+	free(buf);
+	free(buf_a);
+
+	result_f = (float)sum_d;
+	memcpy(&result_bits, &result_f, sizeof(result_bits));
+	*return_value = (uint64_t)result_bits;
+	return 0;
 }
 
 static int
 _builtin_execute_cosine_similarity(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
-	if (!_builtin_has_direct_data(ctx)) {
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_COSINE_SIMILARITY, return_value);
+	}
+
+	/* MRS path: read two vectors from SLM, compute cosine similarity */
+	const struct cpcs_builtin_sum64_desc *desc;
+	uint8_t *buf_a = NULL;
+	uint8_t *buf = NULL;
+	uint64_t mr_id, off, len, half_len;
+	uint64_t processed = 0, chunk;
+	double dot = 0.0, lhs_norm = 0.0, rhs_norm = 0.0;
+	float result_f;
+	uint32_t result_bits = 0;
+	size_t i;
+	int rc;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
-	return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_COSINE_SIMILARITY, return_value);
+
+	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+	len = from_le64(&desc->len);
+	if (len == 0 || (len % (2 * sizeof(float))) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+	half_len = len / 2;
+
+	/* Read vector A (first half) */
+	buf_a = malloc(half_len);
+	if (buf_a == NULL) {
+		return -ENOMEM;
+	}
+
+	processed = 0;
+	while (processed < half_len) {
+		chunk = half_len - processed;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+			chunk -= chunk % sizeof(float);
+		}
+		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, buf_a + processed);
+		if (rc != 0) {
+			free(buf_a);
+			return rc;
+		}
+		processed += chunk;
+	}
+
+	/* Stream vector B and accumulate dot, norms */
+	buf = malloc(CPCS_BUILTIN_EXT_IO_CHUNK);
+	if (buf == NULL) {
+		free(buf_a);
+		return -ENOMEM;
+	}
+
+	processed = 0;
+	while (processed < half_len) {
+		chunk = half_len - processed;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+			chunk -= chunk % sizeof(float);
+		}
+		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + half_len + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			free(buf_a);
+			return rc;
+		}
+
+		{
+			const float *pb = (const float *)buf;
+			const float *pa = (const float *)(buf_a + processed);
+			for (i = 0; i < (chunk / sizeof(float)); i++) {
+				double a = (double)pa[i];
+				double b = (double)pb[i];
+				dot += a * b;
+				lhs_norm += a * a;
+				rhs_norm += b * b;
+			}
+		}
+		processed += chunk;
+	}
+
+	free(buf);
+	free(buf_a);
+
+	{
+		double denom = sqrt(lhs_norm * rhs_norm);
+		if (denom == 0.0) {
+			result_f = 0.0f;
+		} else {
+			result_f = (float)(dot / denom);
+			if (result_f < -1.0f) {
+				result_f = -1.0f;
+			} else if (result_f > 1.0f) {
+				result_f = 1.0f;
+			}
+		}
+	}
+
+	memcpy(&result_bits, &result_f, sizeof(result_bits));
+	*return_value = (uint64_t)result_bits;
+	return 0;
 }
 
 /*
@@ -2670,47 +2931,130 @@ _builtin_execute_memcpy_inline(const struct cpcs_exec_context *ctx, uint64_t *re
 static int
 _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
-	uint8_t *buf = (uint8_t *)ctx->data_buffer;
-	uint8_t *src;
-	uint8_t *dst;
-	uint64_t input_size = 0;
-	size_t out_capacity;
-	size_t out_pos = 0;
-	size_t i = 0;
+	if (_builtin_has_direct_data(ctx)) {
+		/* Direct-data path: input embedded in data buffer */
+		uint8_t *buf = (uint8_t *)ctx->data_buffer;
+		uint8_t *src;
+		uint8_t *dst;
+		uint64_t input_size = 0;
+		size_t out_capacity;
+		size_t out_pos = 0;
+		size_t i = 0;
 
-	if (buf == NULL || ctx->data_len < (8 + 1 + 1)) {
-		return -SPDK_NVME_SC_INVALID_FIELD;
-	}
-
-	memcpy(&input_size, buf, sizeof(input_size));
-	if (input_size == 0) {
-		return -SPDK_NVME_SC_INVALID_FIELD;
-	}
-	if (ctx->data_len < 8 + input_size + 1) {
-		return -SPDK_NVME_SC_INVALID_FIELD;
-	}
-
-	src = buf + 8;
-	dst = buf + 8 + input_size;
-	out_capacity = ctx->data_len - 8 - input_size;
-
-	while (i < input_size) {
-		uint8_t value = src[i];
-		uint8_t run = 1;
-
-		while ((i + run) < input_size && src[i + run] == value && run < 255) {
-			run++;
-		}
-
-		if (out_pos + 2 > out_capacity) {
+		if (buf == NULL || ctx->data_len < (8 + 1 + 1)) {
 			return -SPDK_NVME_SC_INVALID_FIELD;
 		}
 
-		dst[out_pos++] = run;
-		dst[out_pos++] = value;
-		i += run;
+		memcpy(&input_size, buf, sizeof(input_size));
+		if (input_size == 0) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+		if (ctx->data_len < 8 + input_size + 1) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+
+		src = buf + 8;
+		dst = buf + 8 + input_size;
+		out_capacity = ctx->data_len - 8 - input_size;
+
+		while (i < input_size) {
+			uint8_t value = src[i];
+			uint8_t run = 1;
+
+			while ((i + run) < input_size && src[i + run] == value && run < 255) {
+				run++;
+			}
+
+			if (out_pos + 2 > out_capacity) {
+				return -SPDK_NVME_SC_INVALID_FIELD;
+			}
+
+			dst[out_pos++] = run;
+			dst[out_pos++] = value;
+			i += run;
+		}
+
+		*return_value = out_pos;
+		return 0;
 	}
 
+	/* MRS path: read input from SLM, compress in-place */
+	const struct cpcs_builtin_sum64_desc *desc;
+	uint8_t *src_buf = NULL;
+	uint8_t *dst_buf = NULL;
+	uint64_t mr_id, off, len;
+	uint64_t processed = 0, chunk;
+	size_t out_pos = 0;
+	int rc;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+	len = from_le64(&desc->len);
+	if (len == 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+
+	src_buf = malloc(CPCS_BUILTIN_EXT_IO_CHUNK);
+	if (src_buf == NULL) {
+		return -ENOMEM;
+	}
+	/* Worst-case RLE output: 2 bytes per input byte (no runs) */
+	dst_buf = malloc(2 * len);
+	if (dst_buf == NULL) {
+		free(src_buf);
+		return -ENOMEM;
+	}
+
+	uint8_t prev_value = 0;
+	uint8_t prev_run = 0;
+	bool has_prev = false;
+
+	while (processed < len) {
+		size_t i;
+
+		chunk = len - processed;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+		}
+
+		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, src_buf);
+		if (rc != 0) {
+			free(src_buf);
+			free(dst_buf);
+			return rc;
+		}
+
+		for (i = 0; i < chunk; i++) {
+			uint8_t value = src_buf[i];
+
+			if (has_prev && value == prev_value && prev_run < 255) {
+				prev_run++;
+			} else {
+				if (has_prev) {
+					dst_buf[out_pos++] = prev_run;
+					dst_buf[out_pos++] = prev_value;
+				}
+				prev_value = value;
+				prev_run = 1;
+				has_prev = true;
+			}
+		}
+		processed += chunk;
+	}
+
+	if (has_prev) {
+		dst_buf[out_pos++] = prev_run;
+		dst_buf[out_pos++] = prev_value;
+	}
+
+	free(src_buf);
+	free(dst_buf);
 	*return_value = out_pos;
 	return 0;
 }
