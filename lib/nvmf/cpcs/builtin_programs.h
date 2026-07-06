@@ -36,6 +36,10 @@ enum cpcs_builtin_program {
 	CPCS_BUILTIN_KV_BLOCK_SELECT = 10,
 	CPCS_BUILTIN_KV_PREFIX_LOOKUP = 11,
 	CPCS_BUILTIN_KV_BATCH_READ = 12,
+	CPCS_BUILTIN_DOT_PRODUCT = 13,
+	CPCS_BUILTIN_FILTER_GT = 14,
+	CPCS_BUILTIN_MEMCPY_INLINE = 15,
+	CPCS_BUILTIN_RLE_COMPRESS = 16,
 	CPCS_BUILTIN_MAX,
 };
 
@@ -53,6 +57,15 @@ enum cpcs_builtin_program {
 #define CPCS_BUILTIN_PIND_KV_BLOCK_SELECT 10u
 #define CPCS_BUILTIN_PIND_KV_PREFIX_LOOKUP 11u
 #define CPCS_BUILTIN_PIND_KV_BATCH_READ 12u
+/*
+ * PIND 13-16: ported from github/e2e_benchmark, which had assigned these
+ * builtins to PIND 5-8 — colliding with FILTER_AGG/FILTERED_TOPK_EXACT/
+ * KV_PACK_STORE/KV_UNPACK_LOAD above. Renumbered to the next free slots.
+ */
+#define CPCS_BUILTIN_PIND_DOT_PRODUCT   13u
+#define CPCS_BUILTIN_PIND_FILTER_GT     14u
+#define CPCS_BUILTIN_PIND_MEMCPY_INLINE 15u
+#define CPCS_BUILTIN_PIND_RLE_COMPRESS  16u
 
 /* PUID values are a stable ABI for experiments (host can refer to them). */
 #define CPCS_BUILTIN_PUID_MEMCPY  0x0000000000000001ull
@@ -68,6 +81,10 @@ enum cpcs_builtin_program {
 #define CPCS_BUILTIN_PUID_KV_BLOCK_SELECT 0x000000000000000Bull
 #define CPCS_BUILTIN_PUID_KV_PREFIX_LOOKUP 0x000000000000000Cull
 #define CPCS_BUILTIN_PUID_KV_BATCH_READ 0x000000000000000Dull
+#define CPCS_BUILTIN_PUID_DOT_PRODUCT    0x000000000000000Eull
+#define CPCS_BUILTIN_PUID_FILTER_GT      0x000000000000000Full
+#define CPCS_BUILTIN_PUID_MEMCPY_INLINE  0x0000000000000010ull
+#define CPCS_BUILTIN_PUID_RLE_COMPRESS   0x0000000000000011ull
 
 bool cpcs_program_index_is_builtin(uint16_t pind);
 int cpcs_program_install_builtins(struct spdk_nvmf_cpcs_ns *ns);
