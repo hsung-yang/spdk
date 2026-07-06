@@ -278,6 +278,9 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
 	}
 
+	SPDK_NOTICELOG("CPCS execute parse: cmd_nsid=%u pind=%u rsid=%u numr=%u dlen=%u activated=%s\n",
+		       cmd->nsid, pind, rsid, numr, dlen, prog->activated ? "yes" : "no");
+
 	if (!prog->activated) {
 		SPDK_ERRLOG("Program %u not activated\n", pind);
 		return -SPDK_NVME_CPCS_SC_PROGRAM_NOT_ACTIVATED;
