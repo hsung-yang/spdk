@@ -12,6 +12,7 @@
 #include "runtime.h"
 #include "builtin_runtime.h"
 #include "ebpf_runtime.h"
+#include "passthrough_runtime.h"
 #include "program.h"
 #include "spdk/log.h"
 
@@ -193,6 +194,13 @@ cpcs_runtime_init_all(void)
 	rc = cpcs_ebpf_runtime_register();
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to register eBPF runtime\n");
+		return rc;
+	}
+
+	/* Register passthrough runtime (Z1 PoC: substrate-agnostic dispatch). */
+	rc = cpcs_passthrough_runtime_register();
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to register passthrough runtime\n");
 		return rc;
 	}
 
