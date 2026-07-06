@@ -256,6 +256,19 @@ struct cpcs_builtin_kv_async_ctx {
 #define CPCS_BUILTIN_REDUCE_MAX_SG_ENTRIES 32
 #define CPCS_BUILTIN_COPY_MAX_SG_ENTRIES 64
 #define CPCS_BUILTIN_FILL_MAX_SG_ENTRIES 64
+/*
+ * Chunk size for the synchronous "extended" builtins (DOT_PRODUCT, FILTER_GT
+ * MRS path, DIRECT_NS_AGG, ...) ported from github/e2e_benchmark, which reads
+ * with a plain heap buffer and has no SG-entry budget to respect. Kept
+ * separate from CPCS_BUILTIN_IO_CHUNK above: that constant also bounds the
+ * chunk size handed to _cpcs_exec_pin_range_raw() in the async SG-based state
+ * machine below (builtin_async_step()), whose fixed-size entries[] arrays
+ * (CPCS_BUILTIN_{REDUCE,COPY,FILL}_MAX_SG_ENTRIES) would almost always
+ * overflow at multi-MB chunk sizes -- not incorrect (pin falls back to the
+ * async read/write path on -ENOSPC), but it would silently defeat that SG
+ * fast path for MEMCPY/MEMFILL/SUM64/MAX64/MIN64 on every call.
+ */
+#define CPCS_BUILTIN_EXT_IO_CHUNK (2 * 1024 * 1024)
 #define CPCS_BUILTIN_KV_ABI_VERSION 1u
 #define CPCS_BUILTIN_KV_MAGIC "CPCSREQ1"
 #define CPCS_BUILTIN_KV_MAGIC_LOSSLESS "KVL1"
@@ -2309,8 +2322,8 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	processed = 0;
 	while (processed < half_len) {
 		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 			chunk -= chunk % sizeof(float);
 		}
 
@@ -2324,7 +2337,7 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	}
 
 	/* Stream vector B (second half) and accumulate dot product */
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	buf = malloc(CPCS_BUILTIN_EXT_IO_CHUNK);
 	if (buf == NULL) {
 		free(buf_a);
 		return -ENOMEM;
@@ -2333,8 +2346,8 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	processed = 0;
 	while (processed < half_len) {
 		chunk = half_len - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 			chunk -= chunk % sizeof(float);
 		}
 
@@ -2572,15 +2585,15 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		tbits = from_le32(&desc->threshold_bits);
 		memcpy(&thr, &tbits, sizeof(thr));
 
-		chunk_buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+		chunk_buf = malloc(CPCS_BUILTIN_EXT_IO_CHUNK);
 		if (chunk_buf == NULL) {
 			return -ENOMEM;
 		}
 
 		while (processed < len) {
 			chunk = len - processed;
-			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-				chunk = CPCS_BUILTIN_IO_CHUNK;
+			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 				chunk -= chunk % sizeof(float);
 			}
 
@@ -2770,8 +2783,8 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		processed = 0;
 		while (processed < total_bytes) {
 			chunk = total_bytes - processed;
-			if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-				chunk = CPCS_BUILTIN_IO_CHUNK;
+			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 			}
 			rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
 			if (rc != 0) {
@@ -2803,15 +2816,15 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	}
 
 	/* DMA-safe: bdev_slm_read_by_bdev() may issue real backing-device I/O. */
-	buf = spdk_dma_malloc(CPCS_BUILTIN_IO_CHUNK, 4096, NULL);
+	buf = spdk_dma_malloc(CPCS_BUILTIN_EXT_IO_CHUNK, 4096, NULL);
 	if (buf == NULL) {
 		return -ENOMEM;
 	}
 
 	while (processed < total_bytes) {
 		chunk = total_bytes - processed;
-		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
-			chunk = CPCS_BUILTIN_IO_CHUNK;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 		}
 		chunk -= chunk % sizeof(uint64_t);
 
