@@ -3664,28 +3664,32 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	}
 
 	/*
-	 * DOT_PRODUCT needs both vector halves in memory at once, so read
-	 * the entire buffer up-front. For other workloads the chunked
-	 * streaming path below is still used (lower peak memory).
+	 * DOT_PRODUCT needs vector A resident while it walks vector B. Rather
+	 * than allocating the whole input up-front (unbounded in n_uint64),
+	 * hold only vector A (half the input) and stream vector B one IO chunk
+	 * at a time, mirroring the SLM DOT builtin. Caps peak DMA memory at
+	 * ~half_len + one chunk instead of the full total_bytes. (Reached only
+	 * on the non-pSLM fallback; pSLM computes in place via zero-copy above.)
 	 */
 	if (desc->workload == CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT) {
-		uint8_t *full_buf;
-		const float *fvals;
+		uint8_t *buf_a;
+		uint8_t *buf_b;
 		double dp = 0.0;
-		size_t half;
+		uint64_t half_bytes = total_bytes / 2;
 
-		full_buf = spdk_dma_malloc(total_bytes, 4096, NULL);
-		if (full_buf == NULL) {
+		buf_a = spdk_dma_malloc(half_bytes, 4096, NULL);
+		if (buf_a == NULL) {
 			return -ENOMEM;
 		}
 
+		/* Read all of vector A. */
 		processed = 0;
-		while (processed < total_bytes) {
-			chunk = total_bytes - processed;
+		while (processed < half_bytes) {
+			chunk = half_bytes - processed;
 			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
 				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 			}
-			rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, full_buf + processed);
+			rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf_a + processed);
 			if (rc != 0) {
 				if (rc == -ENOTSUP) {
 					/*
@@ -3702,7 +3706,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 					SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
 						    desc->nsid, offset + processed, chunk, rc);
 				}
-				spdk_dma_free(full_buf);
+				spdk_dma_free(buf_a);
 				if (rc == -ENOENT || rc == -ENOTSUP) {
 					return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 				}
@@ -3711,18 +3715,52 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			processed += chunk;
 		}
 
-		/* Layout: [a0..a_{dim-1}, b0..b_{dim-1}] as float32 */
-		fvals = (const float *)full_buf;
-		half = total_bytes / (2 * sizeof(float));
-		for (i = 0; i < half; i++) {
-			dp += (double)fvals[i] * (double)fvals[i + half];
+		buf_b = spdk_dma_malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(half_bytes), 4096, NULL);
+		if (buf_b == NULL) {
+			spdk_dma_free(buf_a);
+			return -ENOMEM;
 		}
 
-		spdk_dma_free(full_buf);
+		/* Stream vector B and accumulate the dot product. */
+		processed = 0;
+		while (processed < half_bytes) {
+			const float *fa;
+			const float *fb;
+			size_t nf;
+			size_t k;
+
+			chunk = half_bytes - processed;
+			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+				chunk -= chunk % sizeof(float);
+			}
+			rc = bdev_slm_read_by_bdev(bdev, offset + half_bytes + processed, chunk, buf_b);
+			if (rc != 0) {
+				SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+					    desc->nsid, offset + half_bytes + processed, chunk, rc);
+				spdk_dma_free(buf_b);
+				spdk_dma_free(buf_a);
+				if (rc == -ENOENT || rc == -ENOTSUP) {
+					return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
+				}
+				return rc;
+			}
+
+			fa = (const float *)(buf_a + processed);
+			fb = (const float *)buf_b;
+			nf = chunk / sizeof(float);
+			for (k = 0; k < nf; k++) {
+				dp += (double)fa[k] * (double)fb[k];
+			}
+			processed += chunk;
+		}
+
+		spdk_dma_free(buf_b);
+		spdk_dma_free(buf_a);
 
 		/* Pack the full double bit-pattern into the uint64_t result field. */
 		memcpy(&agg, &dp, sizeof(double));
-		count = half;
+		count = half_bytes / sizeof(float);
 
 		goto write_result;
 	}
