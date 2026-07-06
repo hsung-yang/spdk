@@ -642,6 +642,226 @@ out:
 	return rc;
 }
 
+/*
+ * Ported from github/e2e_benchmark 182a03bf7, dropped in Phase 1 because
+ * CPCS_BUILTIN_PIND_DOT_PRODUCT/FILTER_GT/MEMCPY_INLINE/RLE_COMPRESS did not
+ * exist yet on this branch. Reintroduced now that c05799a5d/b187526dc's ports
+ * have installed those builtins at PIND 13-16 -- these tests reference the
+ * symbolic PIND_* constants, so they automatically pick up this branch's
+ * numbering without any changes to the test bodies themselves.
+ *
+ * DOT_PRODUCT is adapted to be MRS-based (mirroring _run_sum64 above) since
+ * b187526dc rewrote that builtin to require an SLM-backed {mr_id, off, len}
+ * descriptor; it no longer accepts inline float data directly the way
+ * upstream's version of this test assumed. FILTER_GT, MEMCPY_INLINE, and
+ * RLE_COMPRESS still support the direct-data calling convention unchanged,
+ * so those three are ported as-is.
+ */
+static int
+_run_dot_product(struct cpcs_test_ctx *tctx, struct spdk_nvmf_cpcs_ns *ns,
+		 const char *slm_name, uint32_t slm_nsid)
+{
+	struct cpcs_program *prog;
+	struct cpcs_exec_context ctx = {};
+	struct cpcs_memory_range range = {};
+	struct cpcs_builtin_sum64_desc {
+		uint64_t mr_id;
+		uint64_t off;
+		uint64_t len;
+	} desc;
+	void *buf;
+	float *p;
+	float expected = 30.0f; /* {1,2,3,4} dot {1,2,3,4} = 1+4+9+16 */
+	uint32_t expected_bits = 0;
+	uint32_t got_bits = 0;
+	int rc;
+	const uint64_t off = 8192;
+	const size_t half = 4;
+	size_t i;
+
+	SPDK_NOTICELOG("CPCS builtin: dot_product\n");
+
+	prog = cpcs_program_get(ns, CPCS_BUILTIN_PIND_DOT_PRODUCT);
+	if (prog == NULL) {
+		return -EINVAL;
+	}
+
+	range.mnsid = slm_nsid;
+	range.starting_byte = 0;
+	range.length = 64 * 1024;
+
+	rc = bdev_slm_get_buffer_ptr(slm_name, off, 2 * half * sizeof(float), &buf);
+	if (rc != 0) {
+		tctx->error_count++;
+		return rc;
+	}
+
+	p = buf;
+	for (i = 0; i < half; i++) {
+		p[i] = (float)(i + 1);
+		p[i + half] = (float)(i + 1);
+	}
+	memcpy(&expected_bits, &expected, sizeof(expected_bits));
+
+	memset(&desc, 0, sizeof(desc));
+	to_le64(&desc.mr_id, 1);
+	to_le64(&desc.off, off);
+	to_le64(&desc.len, 2 * half * sizeof(float));
+
+	ctx.program = prog;
+	ctx.inline_ranges = &range;
+	ctx.inline_range_count = 1;
+	ctx.data_buffer = &desc;
+	ctx.data_len = sizeof(desc);
+
+	rc = _run_exec_with_setup(&ctx);
+	if (rc != 0) {
+		return rc;
+	}
+
+	got_bits = (uint32_t)ctx.return_value;
+	if (got_bits != expected_bits) {
+		SPDK_ERRLOG("dot_product mismatch: expected_bits=0x%x got_bits=0x%x\n",
+			    expected_bits, got_bits);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+_run_filter_gt(struct spdk_nvmf_cpcs_ns *ns)
+{
+	struct cpcs_program *prog;
+	struct cpcs_exec_context ctx = {};
+	uint8_t buf[4 + (8 * sizeof(float)) + (8 * sizeof(float))] = { 0 };
+	const float input[8] = { 1.0f, 5.0f, 2.0f, 8.0f, 3.0f, 7.0f, 4.0f, 6.0f };
+	const float expected[4] = { 5.0f, 8.0f, 7.0f, 6.0f };
+	float threshold = 4.0f;
+	float *in;
+	float *out;
+	int rc;
+	size_t i;
+
+	SPDK_NOTICELOG("CPCS builtin: filter_gt\n");
+
+	prog = cpcs_program_get(ns, CPCS_BUILTIN_PIND_FILTER_GT);
+	if (prog == NULL) {
+		return -EINVAL;
+	}
+
+	memcpy(buf, &threshold, sizeof(threshold));
+	in = (float *)(buf + 4);
+	out = (float *)(buf + 4 + sizeof(input));
+	memcpy(in, input, sizeof(input));
+	memset(out, 0, sizeof(input));
+
+	ctx.program = prog;
+	ctx.data_buffer = buf;
+	ctx.data_len = sizeof(buf);
+
+	rc = cpcs_execute_run(&ctx);
+	if (rc != 0) {
+		return rc;
+	}
+	if (ctx.return_value != 4) {
+		SPDK_ERRLOG("filter_gt count mismatch: expected=4 got=%llu\n",
+			    (unsigned long long)ctx.return_value);
+		return -EINVAL;
+	}
+	for (i = 0; i < 4; i++) {
+		if (out[i] != expected[i]) {
+			SPDK_ERRLOG("filter_gt output mismatch at %zu: expected=%f got=%f\n",
+				    i, expected[i], out[i]);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static int
+_run_memcpy_inline(struct spdk_nvmf_cpcs_ns *ns)
+{
+	struct cpcs_program *prog;
+	struct cpcs_exec_context ctx = {};
+	uint8_t buf[128] = { 0 };
+	size_t i;
+	int rc;
+
+	SPDK_NOTICELOG("CPCS builtin: memcpy_inline\n");
+
+	prog = cpcs_program_get(ns, CPCS_BUILTIN_PIND_MEMCPY_INLINE);
+	if (prog == NULL) {
+		return -EINVAL;
+	}
+
+	for (i = 0; i < 64; i++) {
+		buf[i] = (uint8_t)(0x10 + i);
+	}
+
+	ctx.program = prog;
+	ctx.data_buffer = buf;
+	ctx.data_len = sizeof(buf);
+
+	rc = cpcs_execute_run(&ctx);
+	if (rc != 0) {
+		return rc;
+	}
+	if (ctx.return_value != 64) {
+		return -EINVAL;
+	}
+	if (memcmp(buf, buf + 64, 64) != 0) {
+		SPDK_ERRLOG("memcpy_inline mismatch\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+_run_rle_compress(struct spdk_nvmf_cpcs_ns *ns)
+{
+	struct cpcs_program *prog;
+	struct cpcs_exec_context ctx = {};
+	uint8_t buf[8 + 8 + 8] = { 0 };
+	const uint8_t input[8] = { 0xAA, 0xAA, 0xAA, 0xBB, 0xBB, 0xCC, 0xCC, 0xCC };
+	const uint8_t expected[6] = { 3, 0xAA, 2, 0xBB, 3, 0xCC };
+	uint64_t n = 8;
+	int rc;
+
+	SPDK_NOTICELOG("CPCS builtin: rle_compress\n");
+
+	prog = cpcs_program_get(ns, CPCS_BUILTIN_PIND_RLE_COMPRESS);
+	if (prog == NULL) {
+		return -EINVAL;
+	}
+
+	memcpy(buf, &n, sizeof(n));
+	memcpy(buf + 8, input, sizeof(input));
+	memset(buf + 16, 0, 8);
+
+	ctx.program = prog;
+	ctx.data_buffer = buf;
+	ctx.data_len = sizeof(buf);
+
+	rc = cpcs_execute_run(&ctx);
+	if (rc != 0) {
+		return rc;
+	}
+	if (ctx.return_value != 6) {
+		SPDK_ERRLOG("rle_compress size mismatch: expected=6 got=%llu\n",
+			    (unsigned long long)ctx.return_value);
+		return -EINVAL;
+	}
+	if (memcmp(buf + 16, expected, sizeof(expected)) != 0) {
+		SPDK_ERRLOG("rle_compress output mismatch\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -707,6 +927,30 @@ main(int argc, char **argv)
 	rc = _run_vslm_cold_sum64(ns);
 	if (rc != 0) {
 		SPDK_ERRLOG("vSLM cold sum64 FAILED: %d\n", rc);
+		failures++;
+	}
+
+	rc = _run_dot_product(&tctx, ns, slm_name, slm_nsid);
+	if (rc != 0) {
+		SPDK_ERRLOG("dot_product FAILED: %d\n", rc);
+		failures++;
+	}
+
+	rc = _run_filter_gt(ns);
+	if (rc != 0) {
+		SPDK_ERRLOG("filter_gt FAILED: %d\n", rc);
+		failures++;
+	}
+
+	rc = _run_memcpy_inline(ns);
+	if (rc != 0) {
+		SPDK_ERRLOG("memcpy_inline FAILED: %d\n", rc);
+		failures++;
+	}
+
+	rc = _run_rle_compress(ns);
+	if (rc != 0) {
+		SPDK_ERRLOG("rle_compress FAILED: %d\n", rc);
 		failures++;
 	}
 
