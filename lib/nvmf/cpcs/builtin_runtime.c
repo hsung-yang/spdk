@@ -2526,9 +2526,6 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 	buf = (const uint8_t *)ctx->data_buffer;
 	memcpy(&threshold, buf, sizeof(threshold));
 
-	if (ctx->data_len < 4) {
-		return -SPDK_NVME_SC_INVALID_FIELD;
-	}
 	bytes_after_header = ctx->data_len - 4;
 	if ((bytes_after_header % (2 * sizeof(float))) != 0) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
@@ -2656,7 +2653,8 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	total_bytes = (uint64_t)desc->n_uint64 * sizeof(uint64_t);
 	offset = desc->lba_offset;
 
-	buf = malloc(CPCS_BUILTIN_IO_CHUNK);
+	/* DMA-safe: bdev_slm_read_by_bdev() may issue real backing-device I/O. */
+	buf = spdk_dma_malloc(CPCS_BUILTIN_IO_CHUNK, 4096, NULL);
 	if (buf == NULL) {
 		return -ENOMEM;
 	}
@@ -2665,12 +2663,12 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		chunk = total_bytes - processed;
 		if (chunk > CPCS_BUILTIN_IO_CHUNK) {
 			chunk = CPCS_BUILTIN_IO_CHUNK;
-			chunk -= chunk % sizeof(uint64_t);
 		}
+		chunk -= chunk % sizeof(uint64_t);
 
 		rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf);
 		if (rc != 0) {
-			free(buf);
+			spdk_dma_free(buf);
 			if (rc == -ENOENT || rc == -ENOTSUP) {
 				return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 			}
@@ -2714,7 +2712,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			}
 			break;
 		default:
-			free(buf);
+			spdk_dma_free(buf);
 			return -SPDK_NVME_SC_INVALID_FIELD;
 		}
 
@@ -2722,7 +2720,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		processed += chunk;
 	}
 
-	free(buf);
+	spdk_dma_free(buf);
 
 	result.result = agg;
 	result.count  = count;
