@@ -861,6 +861,39 @@ _cpcs_exec_read_range_sync(const struct cpcs_exec_context *ctx,
 	return 0;
 }
 
+/*
+ * Zero-copy hatch for the read-only extended builtins: resolve an MRS range to
+ * a direct pointer into the memory-namespace backing store. pSLM is host-DRAM
+ * backed and hands back a live pointer into its flat buffer, so the compute
+ * kernels can run in place with no SLM->heap staging copy (the dominant cost of
+ * these ops at the common 16 MiB data size). vSLM and non-SLM bdevs return
+ * -ENOTSUP; the caller must then fall back to the read-into-buffer path.
+ *
+ * The returned pointer is valid for the duration of the execution: the range is
+ * leased and the compute namespace bdev is not destructed while an Execute is in
+ * flight, exactly the lifetime the existing copy path already depends on. The
+ * pointer is READ-ONLY -- callers must not write through it.
+ */
+static int
+_cpcs_exec_get_range_ptr(const struct cpcs_exec_context *ctx,
+			 uint64_t mr_id, uint64_t off, uint64_t len, void **ptr_out)
+{
+	struct spdk_bdev *bdev;
+	uint64_t absolute_offset;
+	int rc;
+
+	if (ptr_out == NULL) {
+		return -EINVAL;
+	}
+
+	rc = _cpcs_exec_resolve_range(ctx, mr_id, off, len, &bdev, &absolute_offset);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return bdev_slm_get_buffer_ptr_by_bdev(bdev, absolute_offset, len, ptr_out);
+}
+
 static int
 __attribute__((unused))
 _cpcs_exec_write_range_sync(const struct cpcs_exec_context *ctx,
@@ -2610,6 +2643,26 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	off = from_le64(&desc->off);
 	half_len = len / 2;
 
+	/*
+	 * Zero-copy fast path (pSLM): both vectors live contiguously in the
+	 * SLM buffer, so compute the dot product directly in place with no
+	 * staging copy. vSLM/non-SLM fall through to the read-into-buffer path.
+	 */
+	{
+		void *zc = NULL;
+
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+		if (rc == 0 && zc != NULL) {
+			const float *a = (const float *)zc;
+			const float *b = a + half_len / sizeof(float);
+
+			sum = _avx2_dot_product(a, b, half_len / sizeof(float));
+			memcpy(&sum_bits, &sum, sizeof(sum_bits));
+			*return_value = (uint64_t)sum_bits;
+			return 0;
+		}
+	}
+
 	/* Read both vectors in one contiguous buffer when possible (saves one
 	 * SLM read call at the common 16MB size). Falls back to two-pass for
 	 * very large inputs that exceed IO_CHUNK. */
@@ -2816,6 +2869,29 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
+	/*
+	 * Zero-copy fast path (pSLM): the whole double array is contiguous in
+	 * the SLM buffer, so reduce it in place with no staging copy.
+	 * vSLM/non-SLM fall through to the read-into-buffer path below.
+	 */
+	{
+		void *zc = NULL;
+
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+		if (rc == 0 && zc != NULL) {
+			result.count = len / sizeof(double);
+			_avx2_multi_agg64((const double *)zc, result.count,
+					  &result.sum, &result.min, &result.max);
+
+			if (ctx->data_len >= sizeof(*desc) + sizeof(result)) {
+				uint8_t *out = (uint8_t *)ctx->data_buffer + sizeof(*desc);
+				memcpy(out, &result, sizeof(result));
+			}
+			*return_value = sizeof(result);
+			return 0;
+		}
+	}
+
 	buf = malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(len));
 	if (buf == NULL) {
 		return -ENOMEM;
@@ -2905,6 +2981,26 @@ _builtin_execute_l2_distance_sq(const struct cpcs_exec_context *ctx, uint64_t *r
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 	half_len = len / 2;
+
+	/*
+	 * Zero-copy fast path (pSLM): compute L2 distance in place over the two
+	 * contiguous halves in the SLM buffer, no staging copy. vSLM/non-SLM
+	 * fall through to the read-into-buffer path.
+	 */
+	{
+		void *zc = NULL;
+
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+		if (rc == 0 && zc != NULL) {
+			const float *a = (const float *)zc;
+			const float *b = a + half_len / sizeof(float);
+
+			result_f = _avx2_l2_distance_sq(a, b, half_len / sizeof(float));
+			memcpy(&result_bits, &result_f, sizeof(result_bits));
+			*return_value = (uint64_t)result_bits;
+			return 0;
+		}
+	}
 
 	buf_a = malloc(len <= CPCS_BUILTIN_EXT_IO_CHUNK ? len : half_len);
 	if (buf_a == NULL) {
@@ -3006,6 +3102,40 @@ _builtin_execute_cosine_similarity(const struct cpcs_exec_context *ctx, uint64_t
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 	half_len = len / 2;
+
+	/*
+	 * Zero-copy fast path (pSLM): accumulate cosine terms in place over the
+	 * two contiguous halves in the SLM buffer, no staging copy. vSLM/non-SLM
+	 * fall through to the read-into-buffer path.
+	 */
+	{
+		void *zc = NULL;
+
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+		if (rc == 0 && zc != NULL) {
+			const float *a = (const float *)zc;
+			const float *b = a + half_len / sizeof(float);
+			float f_dot, f_na, f_nb;
+			double denom;
+
+			_avx2_cosine_accum(a, b, half_len / sizeof(float),
+					   &f_dot, &f_na, &f_nb);
+			denom = sqrt((double)f_na * (double)f_nb);
+			if (denom == 0.0) {
+				result_f = 0.0f;
+			} else {
+				result_f = (float)((double)f_dot / denom);
+				if (result_f < -1.0f) {
+					result_f = -1.0f;
+				} else if (result_f > 1.0f) {
+					result_f = 1.0f;
+				}
+			}
+			memcpy(&result_bits, &result_f, sizeof(result_bits));
+			*return_value = (uint64_t)result_bits;
+			return 0;
+		}
+	}
 
 	buf_a = malloc(len <= CPCS_BUILTIN_EXT_IO_CHUNK ? len : half_len);
 	if (buf_a == NULL) {
@@ -3163,6 +3293,30 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		tbits = from_le32(&desc->threshold_bits);
 		memcpy(&thr, &tbits, sizeof(thr));
 
+		/*
+		 * Zero-copy fast path (pSLM): count elements > threshold directly
+		 * over the contiguous SLM range with no staging copy. vSLM/non-SLM
+		 * fall through to the streaming read path below.
+		 */
+		{
+			void *zc = NULL;
+
+			rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+			if (rc == 0 && zc != NULL) {
+				const float *p = (const float *)zc;
+				size_t nf = len / sizeof(float);
+				size_t j;
+
+				for (j = 0; j < nf; j++) {
+					if (p[j] > thr) {
+						out_count++;
+					}
+				}
+				*return_value = out_count;
+				return 0;
+			}
+		}
+
 		chunk_buf = malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(len));
 		if (chunk_buf == NULL) {
 			return -ENOMEM;
@@ -3314,6 +3468,34 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
+	/*
+	 * Zero-copy fast path (pSLM): run-length count over the contiguous SLM
+	 * range in place, no staging copy. A single pass replaces the chunked
+	 * loop's cross-chunk run carry. vSLM/non-SLM fall through below.
+	 */
+	{
+		void *zc = NULL;
+
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+		if (rc == 0 && zc != NULL) {
+			const uint8_t *s = (const uint8_t *)zc;
+			uint64_t i = 0;
+
+			while (i < len) {
+				uint8_t value = s[i];
+				uint8_t run = 1;
+
+				while ((i + run) < len && s[i + run] == value && run < 255) {
+					run++;
+				}
+				out_pos += 2;
+				i += run;
+			}
+			*return_value = out_pos;
+			return 0;
+		}
+	}
+
 	src_buf = malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(len));
 	if (src_buf == NULL) {
 		return -ENOMEM;
@@ -3413,6 +3595,73 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 
 	total_bytes = (uint64_t)desc->n_uint64 * sizeof(uint64_t);
 	offset = desc->lba_offset;
+
+	/*
+	 * Zero-copy fast path (pSLM): DIRECT_NS_AGG reads from an SLM namespace
+	 * bdev. When that bdev is pSLM (host-DRAM backed) we get a direct pointer
+	 * to the whole range and aggregate in place -- no DMA staging buffer and
+	 * no per-chunk read at all. vSLM/plain-NVMe bdevs return -ENOTSUP and
+	 * fall through to the streaming read path below.
+	 */
+	{
+		void *zc = NULL;
+
+		rc = bdev_slm_get_buffer_ptr_by_bdev(bdev, offset, total_bytes, &zc);
+		if (rc == 0 && zc != NULL) {
+			if (desc->workload == CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT) {
+				const float *fvals = (const float *)zc;
+				double dp = 0.0;
+				size_t half = total_bytes / (2 * sizeof(float));
+
+				for (i = 0; i < half; i++) {
+					dp += (double)fvals[i] * (double)fvals[i + half];
+				}
+				memcpy(&agg, &dp, sizeof(double));
+				count = half;
+				goto write_result;
+			}
+
+			p = (const uint64_t *)zc;
+			n = total_bytes / sizeof(uint64_t);
+			switch (desc->workload) {
+			case CS_DIRECT_NS_WORKLOAD_SUM:
+				for (i = 0; i < n; i++) {
+					agg += p[i];
+				}
+				break;
+			case CS_DIRECT_NS_WORKLOAD_MAX:
+				for (i = 0; i < n; i++) {
+					if (!initialized || p[i] > agg) {
+						agg = p[i];
+						initialized = true;
+					}
+				}
+				break;
+			case CS_DIRECT_NS_WORKLOAD_MIN:
+				for (i = 0; i < n; i++) {
+					if (!initialized || p[i] < agg) {
+						agg = p[i];
+						initialized = true;
+					}
+				}
+				break;
+			case CS_DIRECT_NS_WORKLOAD_FILTER_GT: {
+				uint64_t thr = desc->threshold;
+
+				for (i = 0; i < n; i++) {
+					if (p[i] > thr) {
+						agg++;
+					}
+				}
+				break;
+			}
+			default:
+				return -SPDK_NVME_SC_INVALID_FIELD;
+			}
+			count = n;
+			goto write_result;
+		}
+	}
 
 	/*
 	 * DOT_PRODUCT needs both vector halves in memory at once, so read
