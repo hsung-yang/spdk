@@ -2804,6 +2804,100 @@ _builtin_execute_vector_float_direct(const struct cpcs_exec_context *ctx, uint16
 	return 0;
 }
 
+/*
+ * Optional output-range trailer appended by the host to the FILTER_GT /
+ * MULTI_AGG64 / RLE_COMPRESS execute descriptors. When present, the builtin
+ * writes its result bytes into the designated SLM range (out_mr_id is a 1-based
+ * MRS range index, out_off a byte offset within it, out_cap the reserved
+ * capacity) and returns the result length via cdw0; the host then reads the
+ * range back with an SLM Memory Read. When absent (data_len too small, or
+ * out_mr_id == 0) the builtin keeps its legacy scalar/count-only behaviour.
+ */
+struct cpcs_builtin_output_desc {
+	uint64_t out_mr_id;
+	uint64_t out_off;
+	uint32_t out_cap;
+	uint32_t rsvd;
+};
+SPDK_STATIC_ASSERT(sizeof(struct cpcs_builtin_output_desc) == 24,
+		   "Unexpected output descriptor size");
+
+static bool
+_cpcs_builtin_parse_output(const struct cpcs_exec_context *ctx, size_t base_size,
+			   uint64_t *out_mr_id, uint64_t *out_off, uint32_t *out_cap)
+{
+	const struct cpcs_builtin_output_desc *o;
+
+	if (ctx->data_buffer == NULL ||
+	    ctx->data_len < base_size + sizeof(struct cpcs_builtin_output_desc)) {
+		return false;
+	}
+
+	o = (const struct cpcs_builtin_output_desc *)((const uint8_t *)ctx->data_buffer + base_size);
+	*out_mr_id = from_le64(&o->out_mr_id);
+	if (*out_mr_id == 0) {
+		return false;
+	}
+	*out_off = from_le64(&o->out_off);
+	*out_cap = from_le32(&o->out_cap);
+	return true;
+}
+
+/*
+ * Emit a MULTI_AGG64 result. If the host supplied an output range, write the
+ * 32-byte result struct into SLM there (returned to the host via SLM Memory
+ * Read); otherwise fall back to the legacy inline write into the data buffer
+ * (which is not returned over fabrics). cdw0 carries the result length either
+ * way.
+ */
+static int
+_multi_agg64_emit(const struct cpcs_exec_context *ctx,
+		  const struct cpcs_builtin_multi_agg64_result *result,
+		  uint64_t mr_id, uint64_t off, uint64_t len,
+		  uint64_t *return_value)
+{
+	uint64_t out_mr_id, out_off;
+	uint32_t out_cap;
+
+	if (_cpcs_builtin_parse_output(ctx, sizeof(struct cpcs_builtin_sum64_desc),
+				       &out_mr_id, &out_off, &out_cap)) {
+		int rc;
+
+		if (out_cap < sizeof(*result)) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+		rc = _cpcs_exec_write_range_sync(ctx, out_mr_id, out_off,
+						 sizeof(*result), result);
+		if (rc != 0) {
+			return rc;
+		}
+	} else {
+		if (ctx->data_len >= sizeof(struct cpcs_builtin_sum64_desc) + sizeof(*result)) {
+			uint8_t *out = (uint8_t *)ctx->data_buffer +
+				       sizeof(struct cpcs_builtin_sum64_desc);
+
+			memcpy(out, result, sizeof(*result));
+		}
+		/*
+		 * Execute (opcode 0x01) is host->controller only, so the data_buffer
+		 * write above never reaches the host. With no output range supplied,
+		 * also publish the 32-byte result into the SLM input range at
+		 * [off, off+sizeof(*result)) so a host that did not send an output
+		 * descriptor can still fetch it with a MEMORY_READ. The input doubles
+		 * there have already been reduced, so overwriting the range start is
+		 * safe. Best-effort: a write failure does not fail the Execute (CDW0
+		 * still returns sizeof(*result)).
+		 */
+		if (len >= sizeof(*result)) {
+			(void)_cpcs_exec_write_range_sync(ctx, mr_id, off,
+							  sizeof(*result), result);
+		}
+	}
+
+	*return_value = sizeof(*result);
+	return 0;
+}
+
 static int
 _builtin_execute_multi_agg64_direct(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
@@ -2882,23 +2976,7 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 			_avx2_multi_agg64((const double *)zc, result.count,
 					  &result.sum, &result.min, &result.max);
 
-			if (ctx->data_len >= sizeof(*desc) + sizeof(result)) {
-				uint8_t *out = (uint8_t *)ctx->data_buffer + sizeof(*desc);
-				memcpy(out, &result, sizeof(result));
-			}
-			/*
-			 * Execute (opcode 0x01) is host->controller only, so the data_buffer
-			 * write above never reaches the host. Also publish the 32-byte result
-			 * into the SLM input range at [off, off+sizeof(result)) so the host can
-			 * fetch it with a MEMORY_READ. The input doubles there have already been
-			 * reduced, so overwriting the range start is safe. Best-effort: a write
-			 * failure does not fail the Execute (CDW0 still returns sizeof(result)).
-			 */
-			if (len >= sizeof(result)) {
-				(void)_cpcs_exec_write_range_sync(ctx, mr_id, off, sizeof(result), &result);
-			}
-			*return_value = sizeof(result);
-			return 0;
+			return _multi_agg64_emit(ctx, &result, mr_id, off, len, return_value);
 		}
 	}
 
@@ -2951,24 +3029,7 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 
 	free(buf);
 
-	/* Write result struct back into data buffer after descriptor */
-	if (ctx->data_len >= sizeof(*desc) + sizeof(result)) {
-		uint8_t *out = (uint8_t *)ctx->data_buffer + sizeof(*desc);
-		memcpy(out, &result, sizeof(result));
-	}
-	/*
-	 * Execute (opcode 0x01) is host->controller only, so the data_buffer
-	 * write above never reaches the host. Also publish the 32-byte result
-	 * into the SLM input range at [off, off+sizeof(result)) so the host can
-	 * fetch it with a MEMORY_READ. The input doubles there have already been
-	 * reduced, so overwriting the range start is safe. Best-effort: a write
-	 * failure does not fail the Execute (CDW0 still returns sizeof(result)).
-	 */
-	if (len >= sizeof(result)) {
-		(void)_cpcs_exec_write_range_sync(ctx, mr_id, off, sizeof(result), &result);
-	}
-	*return_value = sizeof(result);
-	return 0;
+	return _multi_agg64_emit(ctx, &result, mr_id, off, len, return_value);
 }
 
 static int
@@ -3298,6 +3359,13 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		uint32_t tbits;
 		float thr;
 		int rc;
+		uint64_t out_mr_id = 0, out_off = 0;
+		uint32_t out_cap = 0;
+		bool want_output = false;
+		float *survivors = NULL;
+		size_t sv_cap_f = 0;
+		size_t stored;
+		int wrc = 0;
 
 		if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 			return -SPDK_NVME_SC_INVALID_FIELD;
@@ -3315,9 +3383,25 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		memcpy(&thr, &tbits, sizeof(thr));
 
 		/*
-		 * Zero-copy fast path (pSLM): count elements > threshold directly
-		 * over the contiguous SLM range with no staging copy. vSLM/non-SLM
-		 * fall through to the streaming read path below.
+		 * Optional output range: when the host reserves an SLM range for the
+		 * surviving elements, collect them into a staging buffer and write
+		 * them there so the host reads back the filtered rows instead of
+		 * recomputing. cdw0 still carries the survivor count; the host reads
+		 * count * sizeof(float) bytes.
+		 */
+		want_output = _cpcs_builtin_parse_output(ctx, sizeof(*desc),
+							 &out_mr_id, &out_off, &out_cap);
+		if (want_output) {
+			survivors = malloc(out_cap ? out_cap : 1);
+			if (survivors == NULL) {
+				return -ENOMEM;
+			}
+			sv_cap_f = out_cap / sizeof(float);
+		}
+
+		/*
+		 * Zero-copy fast path (pSLM): scan the contiguous SLM range in place.
+		 * vSLM/non-SLM fall through to the streaming read path below.
 		 */
 		{
 			void *zc = NULL;
@@ -3330,16 +3414,19 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 
 				for (j = 0; j < nf; j++) {
 					if (p[j] > thr) {
+						if (survivors != NULL && out_count < sv_cap_f) {
+							survivors[out_count] = p[j];
+						}
 						out_count++;
 					}
 				}
-				*return_value = out_count;
-				return 0;
+				goto filter_emit;
 			}
 		}
 
 		chunk_buf = malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(len));
 		if (chunk_buf == NULL) {
+			free(survivors);
 			return -ENOMEM;
 		}
 
@@ -3354,6 +3441,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 							chunk_buf);
 			if (rc != 0) {
 				free(chunk_buf);
+				free(survivors);
 				return rc;
 			}
 
@@ -3364,6 +3452,9 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 
 				for (j = 0; j < nf; j++) {
 					if (p[j] > thr) {
+						if (survivors != NULL && out_count < sv_cap_f) {
+							survivors[out_count] = p[j];
+						}
 						out_count++;
 					}
 				}
@@ -3372,6 +3463,21 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		}
 
 		free(chunk_buf);
+
+filter_emit:
+		if (want_output) {
+			stored = (out_count < sv_cap_f) ? out_count : sv_cap_f;
+			if (stored > 0) {
+				wrc = _cpcs_exec_write_range_sync(ctx, out_mr_id, out_off,
+								  stored * sizeof(float), survivors);
+			}
+			free(survivors);
+			if (wrc != 0) {
+				return wrc;
+			}
+			*return_value = stored;
+			return 0;
+		}
 		*return_value = out_count;
 		return 0;
 	}
@@ -3468,13 +3574,27 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 		return 0;
 	}
 
-	/* MRS path: read input from SLM, count compressed size */
+	/*
+	 * MRS path: read input from SLM and RLE-encode. When the host supplies an
+	 * output range, the compressed [run,value] pairs are written into that SLM
+	 * range for readback; otherwise only the compressed size is counted and
+	 * returned via cdw0 (legacy behaviour). cdw0 carries the compressed byte
+	 * length either way.
+	 */
 	const struct cpcs_builtin_sum64_desc *desc;
 	uint8_t *src_buf = NULL;
 	uint64_t mr_id, off, len;
 	uint64_t processed = 0, chunk;
 	size_t out_pos = 0;
 	int rc;
+	uint64_t out_mr_id = 0, out_off = 0;
+	uint32_t out_cap = 0;
+	bool want_output = false;
+	uint8_t *rle_out = NULL;
+	int wrc = 0;
+	uint8_t prev_value = 0;
+	uint8_t prev_run = 0;
+	bool has_prev = false;
 
 	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
@@ -3489,8 +3609,17 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	mr_id = from_le64(&desc->mr_id);
 	off = from_le64(&desc->off);
 
+	want_output = _cpcs_builtin_parse_output(ctx, sizeof(*desc),
+						 &out_mr_id, &out_off, &out_cap);
+	if (want_output) {
+		rle_out = malloc(out_cap ? out_cap : 1);
+		if (rle_out == NULL) {
+			return -ENOMEM;
+		}
+	}
+
 	/*
-	 * Zero-copy fast path (pSLM): run-length count over the contiguous SLM
+	 * Zero-copy fast path (pSLM): run-length encode over the contiguous SLM
 	 * range in place, no staging copy. A single pass replaces the chunked
 	 * loop's cross-chunk run carry. vSLM/non-SLM fall through below.
 	 */
@@ -3509,22 +3638,26 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 				while ((i + run) < len && s[i + run] == value && run < 255) {
 					run++;
 				}
+				if (rle_out != NULL) {
+					if (out_pos + 2 > out_cap) {
+						free(rle_out);
+						return -SPDK_NVME_SC_INVALID_FIELD;
+					}
+					rle_out[out_pos] = run;
+					rle_out[out_pos + 1] = value;
+				}
 				out_pos += 2;
 				i += run;
 			}
-			*return_value = out_pos;
-			return 0;
+			goto rle_emit;
 		}
 	}
 
 	src_buf = malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(len));
 	if (src_buf == NULL) {
+		free(rle_out);
 		return -ENOMEM;
 	}
-
-	uint8_t prev_value = 0;
-	uint8_t prev_run = 0;
-	bool has_prev = false;
 
 	while (processed < len) {
 		size_t i;
@@ -3537,6 +3670,7 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, src_buf);
 		if (rc != 0) {
 			free(src_buf);
+			free(rle_out);
 			return rc;
 		}
 
@@ -3547,6 +3681,15 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 				prev_run++;
 			} else {
 				if (has_prev) {
+					if (rle_out != NULL) {
+						if (out_pos + 2 > out_cap) {
+							free(src_buf);
+							free(rle_out);
+							return -SPDK_NVME_SC_INVALID_FIELD;
+						}
+						rle_out[out_pos] = prev_run;
+						rle_out[out_pos + 1] = prev_value;
+					}
 					out_pos += 2;
 				}
 				prev_value = value;
@@ -3558,10 +3701,31 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	}
 
 	if (has_prev) {
+		if (rle_out != NULL) {
+			if (out_pos + 2 > out_cap) {
+				free(src_buf);
+				free(rle_out);
+				return -SPDK_NVME_SC_INVALID_FIELD;
+			}
+			rle_out[out_pos] = prev_run;
+			rle_out[out_pos + 1] = prev_value;
+		}
 		out_pos += 2;
 	}
 
 	free(src_buf);
+
+rle_emit:
+	if (want_output) {
+		if (out_pos > 0) {
+			wrc = _cpcs_exec_write_range_sync(ctx, out_mr_id, out_off,
+							  out_pos, rle_out);
+		}
+		free(rle_out);
+		if (wrc != 0) {
+			return wrc;
+		}
+	}
 	*return_value = out_pos;
 	return 0;
 }
