@@ -109,7 +109,7 @@ vbdev_slm_find_provider_locked(const struct spdk_vbdev_slm_ops *ops)
 	return NULL;
 }
 
-static const struct spdk_vbdev_slm_ops *
+const struct spdk_vbdev_slm_ops *
 vbdev_slm_lookup_ops_by_bdev(struct spdk_bdev *bdev)
 {
 	struct vbdev_slm_provider *provider;

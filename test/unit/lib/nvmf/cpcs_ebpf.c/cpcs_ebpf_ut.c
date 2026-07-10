@@ -198,7 +198,7 @@ test_ebpf_user_program(void)
 	CU_ASSERT_PTR_NOT_NULL_FATAL(ops);
 
 	exec_ctx.program = prog;
-	rc = ops->execute(prog, &exec_ctx, &ret);
+	rc = ebpf_execute_sync(prog, &exec_ctx, &ret);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(ret == 0x1234);
 

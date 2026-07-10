@@ -109,4 +109,6 @@ int vbdev_slm_exec_publish_lease(uint64_t lease_id);
 int vbdev_slm_exec_discard_lease(uint64_t lease_id);
 int vbdev_slm_lease_release(uint64_t lease_id);
 
+const struct spdk_vbdev_slm_ops *vbdev_slm_lookup_ops_by_bdev(struct spdk_bdev *bdev);
+
 #endif /* SPDK_INTERNAL_VBDEV_SLM_H */

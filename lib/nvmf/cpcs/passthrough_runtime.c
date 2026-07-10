@@ -78,7 +78,7 @@ _passthrough_resolve_backing(void)
 	}
 
 	g_passthrough_state.backing_bdev = bdev;
-	g_passthrough_state.backing_ops = vbdev_slm_lookup_ops(bdev);
+	g_passthrough_state.backing_ops = vbdev_slm_lookup_ops_by_bdev(bdev);
 	if (g_passthrough_state.backing_ops == NULL) {
 		SPDK_WARNLOG("Passthrough runtime: backing bdev '%s' is not SLM-capable; "
 			     "execute will fall back to bdev_slm_*_by_bdev which may"

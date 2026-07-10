@@ -385,6 +385,39 @@ out:
 }
 
 static void
+vbdev_pslm_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
+{
+	struct spdk_bdev_slm *slm = SPDK_CONTAINEROF(bdev_io->bdev,
+				    struct spdk_bdev_slm, bdev);
+	uint64_t offset, length, copied = 0;
+	int i;
+
+	if (!success) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	offset = bdev_io->u.bdev.offset_blocks * slm->bdev.blocklen;
+	length = bdev_io->u.bdev.num_blocks * slm->bdev.blocklen;
+
+	if (offset + length > slm->buffer_size) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	for (i = 0; i < bdev_io->u.bdev.iovcnt && copied < length; i++) {
+		uint64_t to_copy = bdev_io->u.bdev.iovs[i].iov_len;
+		if (copied + to_copy > length) {
+			to_copy = length - copied;
+		}
+		memcpy(bdev_io->u.bdev.iovs[i].iov_base,
+		       (uint8_t *)slm->buffer + offset + copied, to_copy);
+		copied += to_copy;
+	}
+	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+}
+
+static void
 vbdev_pslm_submit_request(struct spdk_io_channel *ch,
 			  struct spdk_bdev_io *bdev_io)
 {
@@ -398,6 +431,35 @@ vbdev_pslm_submit_request(struct spdk_io_channel *ch,
 		vbdev_pslm_submit_nvme_passthru(slm, bdev_io);
 		break;
 
+	case SPDK_BDEV_IO_TYPE_READ: {
+		uint64_t length = bdev_io->u.bdev.num_blocks * slm->bdev.blocklen;
+		spdk_bdev_io_get_buf(bdev_io, vbdev_pslm_read_get_buf_cb, length);
+		break;
+	}
+
+	case SPDK_BDEV_IO_TYPE_WRITE: {
+		uint64_t offset = bdev_io->u.bdev.offset_blocks * slm->bdev.blocklen;
+		uint64_t length = bdev_io->u.bdev.num_blocks * slm->bdev.blocklen;
+		if (offset + length > slm->buffer_size) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			break;
+		}
+		struct iovec *iovs = bdev_io->u.bdev.iovs;
+		int iovcnt = bdev_io->u.bdev.iovcnt;
+		uint64_t copied = 0;
+		for (int i = 0; i < iovcnt; i++) {
+			uint64_t to_copy = iovs[i].iov_len;
+			if (copied + to_copy > length) {
+				to_copy = length - copied;
+			}
+			memcpy((uint8_t *)slm->buffer + offset + copied,
+			       iovs[i].iov_base, to_copy);
+			copied += to_copy;
+		}
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		break;
+	}
+
 	default:
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		break;
@@ -408,6 +470,8 @@ static bool
 vbdev_pslm_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
 	switch (io_type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+	case SPDK_BDEV_IO_TYPE_WRITE:
 	case SPDK_BDEV_IO_TYPE_NVME_IO:
 	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
 	case SPDK_BDEV_IO_TYPE_NVME_IOV_MD:

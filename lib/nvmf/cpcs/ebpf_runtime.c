@@ -428,6 +428,41 @@ ebpf_init(struct cpcs_program *prog)
 	return 0;
 }
 
+/*
+ * Find the actual bytecode length by stripping trailing zero padding.
+ * eBPF instructions are 8 bytes each. The host-side xNVMe library pads
+ * program data to 4096-byte alignment (lpg_align), so uBPF sees the
+ * zero padding as invalid instructions. eBPF programs always end with
+ * an 'exit' instruction (opcode 0x95), so we scan backwards over
+ * all-zero 8-byte blocks to find the real program boundary.
+ */
+static uint32_t
+ebpf_strip_zero_padding(const uint8_t *data, uint32_t total_size)
+{
+	uint32_t real_len = total_size;
+
+	while (real_len >= 8) {
+		const uint8_t *insn = data + real_len - 8;
+		bool is_zero = true;
+		for (int i = 0; i < 8; i++) {
+			if (insn[i] != 0) {
+				is_zero = false;
+				break;
+			}
+		}
+		if (!is_zero) {
+			break;
+		}
+		real_len -= 8;
+	}
+
+	if (real_len == 0) {
+		real_len = total_size;
+	}
+
+	return real_len;
+}
+
 static int
 ebpf_validate(struct cpcs_program *prog)
 {
@@ -447,8 +482,15 @@ ebpf_validate(struct cpcs_program *prog)
 #if UBPF_AVAILABLE
 	char *errmsg = NULL;
 
+	/* Strip trailing zero padding from 4096-byte alignment */
+	uint32_t real_len = ebpf_strip_zero_padding(prog->data, prog->total_size);
+	if (real_len != prog->total_size) {
+		SPDK_NOTICELOG("Stripped zero padding: %u → %u bytes (pind=%u)\n",
+			       prog->total_size, real_len, prog->pind);
+	}
+
 	/* Load eBPF bytecode into VM */
-	int rc = ubpf_load(ctx->vm, prog->data, prog->total_size, &errmsg);
+	int rc = ubpf_load(ctx->vm, prog->data, real_len, &errmsg);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to load eBPF program: %s\n",
 			    errmsg ? errmsg : "unknown error");
@@ -457,7 +499,7 @@ ebpf_validate(struct cpcs_program *prog)
 	}
 
 	SPDK_DEBUGLOG(nvmf_cpcs, "eBPF program %u validated (%u bytes)\n",
-		      prog->pind, prog->total_size);
+		      prog->pind, real_len);
 #else
 	/* In simulation mode, just verify data exists */
 	SPDK_DEBUGLOG(nvmf_cpcs, "eBPF program %u validated in simulation mode (%u bytes)\n",
