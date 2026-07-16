@@ -2,11 +2,10 @@
 
 This directory contains the SPDK implementation of NVMe Computational Programs Command Set (CPCS) Specification Revision 1.1.
 
-Design and documentation are in:
-- `design/cpcs.md`
-- `design/cpcs_rt.md`
-- `design/cpcs_implementation.md`
-- `paper.md`
+Design and documentation are in the project-level `docs/` directory:
+- [`docs/wiki/cpcs-overview.md`](../../../../../docs/wiki/cpcs-overview.md) — CPCS overview and concepts
+- [`docs/wiki/cpcs-architecture.md`](../../../../../docs/wiki/cpcs-architecture.md) — CPCS architecture deep dive
+- [`docs/components/spdk-cpcs-target.md`](../../../../../docs/components/spdk-cpcs-target.md) — SPDK CPCS target component guide
 
 ## Overview
 
