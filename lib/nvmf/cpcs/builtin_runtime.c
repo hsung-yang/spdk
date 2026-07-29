@@ -895,7 +895,6 @@ _cpcs_exec_get_range_ptr(const struct cpcs_exec_context *ctx,
 }
 
 static int
-__attribute__((unused))
 _cpcs_exec_write_range_sync(const struct cpcs_exec_context *ctx,
 			    uint64_t mr_id, uint64_t off, uint64_t len, const void *buf)
 {
@@ -2887,6 +2886,17 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 				uint8_t *out = (uint8_t *)ctx->data_buffer + sizeof(*desc);
 				memcpy(out, &result, sizeof(result));
 			}
+			/*
+			 * Execute (opcode 0x01) is host->controller only, so the data_buffer
+			 * write above never reaches the host. Also publish the 32-byte result
+			 * into the SLM input range at [off, off+sizeof(result)) so the host can
+			 * fetch it with a MEMORY_READ. The input doubles there have already been
+			 * reduced, so overwriting the range start is safe. Best-effort: a write
+			 * failure does not fail the Execute (CDW0 still returns sizeof(result)).
+			 */
+			if (len >= sizeof(result)) {
+				(void)_cpcs_exec_write_range_sync(ctx, mr_id, off, sizeof(result), &result);
+			}
 			*return_value = sizeof(result);
 			return 0;
 		}
@@ -2945,6 +2955,17 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 	if (ctx->data_len >= sizeof(*desc) + sizeof(result)) {
 		uint8_t *out = (uint8_t *)ctx->data_buffer + sizeof(*desc);
 		memcpy(out, &result, sizeof(result));
+	}
+	/*
+	 * Execute (opcode 0x01) is host->controller only, so the data_buffer
+	 * write above never reaches the host. Also publish the 32-byte result
+	 * into the SLM input range at [off, off+sizeof(result)) so the host can
+	 * fetch it with a MEMORY_READ. The input doubles there have already been
+	 * reduced, so overwriting the range start is safe. Best-effort: a write
+	 * failure does not fail the Execute (CDW0 still returns sizeof(result)).
+	 */
+	if (len >= sizeof(result)) {
+		(void)_cpcs_exec_write_range_sync(ctx, mr_id, off, sizeof(result), &result);
 	}
 	*return_value = sizeof(result);
 	return 0;
