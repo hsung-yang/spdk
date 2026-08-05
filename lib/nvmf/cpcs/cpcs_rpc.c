@@ -9,11 +9,13 @@
  */
 
 #include "nvmf_cpcs.h"
+#include "nvmf_internal.h"
 #include "builtin_programs.h"
 #include "passthrough_runtime.h"
 #include "program.h"
 #include "program_activation.h"
 #include "memory_range_set.h"
+#include "reachability.h"
 
 #include "spdk/rpc.h"
 #include "spdk/string.h"
@@ -507,3 +509,93 @@ cleanup:
 	free_rpc_cpcs_mrs_list(&req);
 }
 SPDK_RPC_REGISTER("cpcs_mrs_list", rpc_cpcs_mrs_list, SPDK_RPC_RUNTIME)
+
+/* RPC: cpcs_reachability_add_ns */
+struct rpc_cpcs_reachability_add_ns {
+	char *subsystem_nqn;
+	uint32_t memory_nsid;
+	uint16_t group_id;
+};
+
+static void
+free_rpc_cpcs_reachability_add_ns(struct rpc_cpcs_reachability_add_ns *req)
+{
+	free(req->subsystem_nqn);
+}
+
+static const struct spdk_json_object_decoder rpc_cpcs_reachability_add_ns_decoders[] = {
+	{"subsystem_nqn", offsetof(struct rpc_cpcs_reachability_add_ns, subsystem_nqn), spdk_json_decode_string},
+	{"memory_nsid", offsetof(struct rpc_cpcs_reachability_add_ns, memory_nsid), spdk_json_decode_uint32},
+	{"group_id", offsetof(struct rpc_cpcs_reachability_add_ns, group_id), spdk_json_decode_uint16},
+};
+
+static void
+rpc_cpcs_reachability_add_ns(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_cpcs_reachability_add_ns req = {};
+	struct spdk_nvmf_subsystem *subsystem;
+	struct spdk_nvmf_ns *mem_ns;
+	struct cpcs_reachability_manager *mgr;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_cpcs_reachability_add_ns_decoders,
+				    SPDK_COUNTOF(rpc_cpcs_reachability_add_ns_decoders), &req)) {
+		SPDK_ERRLOG("Failed to decode RPC parameters\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+
+	subsystem = get_subsystem_by_nqn(req.subsystem_nqn);
+	if (!subsystem) {
+		SPDK_ERRLOG("Subsystem not found: %s\n", req.subsystem_nqn);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Subsystem not found: %s", req.subsystem_nqn);
+		goto cleanup;
+	}
+
+	if (req.memory_nsid == 0 || req.memory_nsid > spdk_nvmf_subsystem_get_max_nsid(subsystem)) {
+		SPDK_ERRLOG("Invalid memory NSID %u\n", req.memory_nsid);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Invalid memory NSID %u", req.memory_nsid);
+		goto cleanup;
+	}
+
+	mem_ns = spdk_nvmf_subsystem_get_ns(subsystem, req.memory_nsid);
+	if (!mem_ns) {
+		SPDK_ERRLOG("Memory namespace not found: NSID %u\n", req.memory_nsid);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Memory namespace not found: NSID %u",
+						     req.memory_nsid);
+		goto cleanup;
+	}
+
+	mgr = cpcs_reachability_mgr_get(subsystem);
+	if (!mgr) {
+		SPDK_ERRLOG("Failed to get reachability manager\n");
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						     "Failed to get reachability manager");
+		goto cleanup;
+	}
+
+	rc = cpcs_reachability_add_ns(mgr, req.group_id, mem_ns);
+	cpcs_reachability_mgr_put(subsystem);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to add NSID=%u to reachability group %u: %d\n",
+			    req.memory_nsid, req.group_id, rc);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						     "Failed to add NSID=%u to reachability group %u: %d",
+						     req.memory_nsid, req.group_id, rc);
+		goto cleanup;
+	}
+
+	SPDK_NOTICELOG("Added memory NSID=%u to reachability group %u\n",
+		       req.memory_nsid, req.group_id);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_cpcs_reachability_add_ns(&req);
+}
+SPDK_RPC_REGISTER("cpcs_reachability_add_ns", rpc_cpcs_reachability_add_ns, SPDK_RPC_RUNTIME)
+

@@ -176,6 +176,66 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 	subsystem->ns[nsid - 1] = base_ns;
 	subsystem->ana_group[anagrpid - 1]++;
 
+	/* Auto-create reachability group and add this namespace if reach_group_id is set.
+	 * Without this, cpcs_reachability_get_memory_ns() returns 0 memory NSIDs
+	 * and Execute Program fails with SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE (0x8B). */
+	if (ns->reach_group_id != 0) {
+		uint16_t new_group_id;
+		rc = cpcs_reachability_create_group(ns->reach_mgr, &new_group_id);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to create reachability group for NSID=%u: %d\n", nsid, rc);
+			subsystem->ns[nsid - 1] = NULL;
+			subsystem->ana_group[anagrpid - 1]--;
+			free(base_ns);
+			pthread_mutex_destroy(&ns->lock);
+			cpcs_reachability_mgr_put(subsystem);
+			free(ns);
+			return rc;
+		}
+		ns->reach_group_id = new_group_id;
+		SPDK_NOTICELOG("Auto-created reachability group %u for CPCS NSID=%u\n",
+			       ns->reach_group_id, nsid);
+
+		rc = cpcs_reachability_add_ns(ns->reach_mgr, ns->reach_group_id, base_ns);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to add CPCS NSID=%u to reachability group %u: %d\n",
+				    nsid, ns->reach_group_id, rc);
+			cpcs_reachability_delete_group(ns->reach_mgr, ns->reach_group_id);
+			subsystem->ns[nsid - 1] = NULL;
+			subsystem->ana_group[anagrpid - 1]--;
+			free(base_ns);
+			pthread_mutex_destroy(&ns->lock);
+			cpcs_reachability_mgr_put(subsystem);
+			free(ns);
+			return rc;
+		}
+		SPDK_NOTICELOG("Added CPCS NSID=%u to reachability group %u\n",
+			       nsid, ns->reach_group_id);
+
+		/* Also add all non-CPCS namespaces (e.g. SLM, Malloc) to the reachability group.
+		 * Without this, MRS create fails with "Memory namespace X is not reachable"
+		 * because cpcs_mrs_validate_locked() checks reachability via
+		 * cpcs_reachability_get_memory_ns() which only returns namespaces in the group. */
+		for (uint32_t i = 0; i < subsystem->max_nsid; i++) {
+			struct spdk_nvmf_ns *other_ns = subsystem->ns[i];
+			if (other_ns == NULL || other_ns == base_ns) {
+				continue;
+			}
+			/* Skip CPCS namespaces (they have their own reachability group) */
+			if (other_ns->cpcs_ns != NULL) {
+				continue;
+			}
+			rc = cpcs_reachability_add_ns(ns->reach_mgr, ns->reach_group_id, other_ns);
+			if (rc != 0) {
+				SPDK_WARNLOG("Failed to add NSID=%u to reachability group %u: %d (non-fatal)\n",
+					     other_ns->nsid, ns->reach_group_id, rc);
+			} else {
+				SPDK_NOTICELOG("Added memory NSID=%u to reachability group %u\n",
+					       other_ns->nsid, ns->reach_group_id);
+			}
+		}
+	}
+
 	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
 		nvmf_ctrlr_ns_set_visible(ctrlr, nsid, true);
 	}

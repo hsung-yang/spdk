@@ -3873,8 +3873,14 @@ write_result:
 	SPDK_DEBUGLOG(nvmf_cpcs, "DIRECT_NS_AGG complete: result=%" PRIu64 " count=%" PRIu64 "\n",
 		      result.result, result.count);
 
-	memcpy((uint8_t *)ctx->data_buffer + sizeof(*desc), &result, sizeof(result));
-	*return_value = sizeof(result);
+	/*
+	 * Return the aggregation result via *return_value (cdw0/cdw1 in the
+	 * completion queue entry) rather than writing it back to the data
+	 * buffer. The xNVMe SPDK backend sets up a unidirectional SGL for
+	 * xnvme_cmd_pass(), so device->host writes to the data buffer are
+	 * silently dropped. cdw0/cdw1 is always delivered reliably.
+	 */
+	*return_value = result.result;
 	return 0;
 }
 
