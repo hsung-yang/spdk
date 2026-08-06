@@ -4844,7 +4844,15 @@ struct nvmf_ctrlr_slm_copy_lba_ctx {
 	struct spdk_nvmf_ns				*dest_ns;
 	struct nvmf_slm_copy_lba_range			*ranges;
 	struct nvmf_ctrlr_slm_copy_lba_read_ctx	*read_ctxs;
+	/*
+	 * At most one of these is set, and only once the staging path has been
+	 * chosen. coalesced_buf is an owned bounce buffer that still has to be
+	 * written out to the memory namespace after every read lands; direct_buf
+	 * is a borrowed pointer into the memory namespace backing store that the
+	 * reads DMA into, and must never be freed here.
+	 */
 	void						*coalesced_buf;
+	void						*direct_buf;
 	uint64_t					coalesced_len;
 	uint64_t					sdaddr;
 	enum spdk_nvme_slm_copy_desc_fmt		desc_fmt;
@@ -4928,6 +4936,11 @@ nvmf_ctrlr_slm_copy_lba_maybe_finish(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
 	}
 
+	/*
+	 * Only the coalesced staging path owes the memory namespace a write-out.
+	 * When the reads went straight into the namespace (ctx->direct_buf) there
+	 * is nothing left to copy, so coalesced_buf stays NULL and this is skipped.
+	 */
 	if (!ctx->failed && ctx->desc_fmt != SPDK_NVME_SLM_COPY_DESC_FMT_4H &&
 	    ctx->coalesced_buf != NULL && ctx->coalesced_len != 0) {
 		if (!ctx->coalesced_write_submitted) {
@@ -5007,11 +5020,56 @@ nvmf_ctrlr_slm_copy_lba_read_complete(struct spdk_bdev_io *bdev_io, bool success
 	nvmf_ctrlr_slm_copy_lba_maybe_finish(ctx);
 }
 
+/*
+ * Resolve the whole destination extent to a direct pointer into the memory
+ * namespace backing store, so that each source read can land in the memory
+ * namespace itself instead of in a bounce buffer.
+ *
+ * The coalesced staging path below reads every range into one hugepage buffer
+ * and then writes that buffer out to the memory namespace, which costs two
+ * touches per byte plus a spdk_dma_malloc() sized to the entire transfer. The
+ * destination is a single contiguous extent -- nvmf_slm_parse_copy_lba_cmd()
+ * packs the ranges by handing each one the running byte total as its
+ * dest_offset -- so reading range i straight into dst + dest_offset writes
+ * exactly the same bytes without either cost.
+ *
+ * Returns NULL when the direct path is not usable and the caller must keep the
+ * coalesced staging path: a memory namespace provider that pages its backing
+ * store declines to hand out a raw pointer at all, and a source bdev may
+ * declare a buffer alignment that the destination address does not satisfy.
+ */
+static void *
+nvmf_ctrlr_slm_copy_lba_resolve_direct(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
+{
+	struct nvmf_slm_copy_lba_range *range;
+	void *dst = NULL;
+	size_t align;
+	uint32_t i;
+	int rc;
+
+	rc = bdev_slm_get_buffer_ptr_by_bdev(ctx->dest_ns->bdev, ctx->sdaddr,
+					     ctx->coalesced_len, &dst);
+	if (rc != 0 || dst == NULL) {
+		return NULL;
+	}
+
+	for (i = 0; i < ctx->range_count; i++) {
+		range = &ctx->ranges[i];
+		align = spdk_bdev_get_buf_align(range->src_bdev);
+		if ((((uintptr_t)dst + range->dest_offset) & (align - 1)) != 0) {
+			return NULL;
+		}
+	}
+
+	return dst;
+}
+
 static int
 nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 {
 	struct nvmf_slm_copy_lba_range *range;
 	uint8_t *dst;
+	void *stage_base;
 	uint64_t dest_start;
 	uint64_t src_start;
 	uint64_t src_block_size;
@@ -5032,7 +5090,7 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 		switch (ctx->desc_fmt) {
 		case SPDK_NVME_SLM_COPY_DESC_FMT_2H:
 		case SPDK_NVME_SLM_COPY_DESC_FMT_3H:
-			if (ctx->coalesced_buf == NULL) {
+			if (ctx->coalesced_buf == NULL && ctx->direct_buf == NULL) {
 				src_block_size = spdk_bdev_get_block_size(range->src_bdev);
 				if (src_block_size == 0 || range->slba > UINT64_MAX / src_block_size) {
 					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
@@ -5061,11 +5119,14 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 					break;
 				}
 
-				ctx->coalesced_buf = spdk_dma_malloc(ctx->coalesced_len, 0x1000, NULL);
-				if (ctx->coalesced_buf == NULL) {
-					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
-								     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
-					break;
+				ctx->direct_buf = nvmf_ctrlr_slm_copy_lba_resolve_direct(ctx);
+				if (ctx->direct_buf == NULL) {
+					ctx->coalesced_buf = spdk_dma_malloc(ctx->coalesced_len, 0x1000, NULL);
+					if (ctx->coalesced_buf == NULL) {
+						nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+									     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+						break;
+					}
 				}
 
 				ctx->read_ctxs = calloc(ctx->range_count, sizeof(*ctx->read_ctxs));
@@ -5079,7 +5140,8 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 			assert(range->nbytes > 0);
 			assert(range->dest_offset <= ctx->coalesced_len);
 			assert(range->nbytes <= ctx->coalesced_len - range->dest_offset);
-			dst = (uint8_t *)ctx->coalesced_buf + range->dest_offset;
+			stage_base = ctx->direct_buf != NULL ? ctx->direct_buf : ctx->coalesced_buf;
+			dst = (uint8_t *)stage_base + range->dest_offset;
 
 			ctx->read_ctxs[i].ctx = ctx;
 			ctx->read_ctxs[i].iov.iov_base = dst;

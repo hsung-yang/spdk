@@ -278,8 +278,9 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
 	}
 
-	SPDK_NOTICELOG("CPCS execute parse: cmd_nsid=%u pind=%u rsid=%u numr=%u dlen=%u activated=%s\n",
-		       cmd->nsid, pind, rsid, numr, dlen, prog->activated ? "yes" : "no");
+	SPDK_DEBUGLOG(nvmf_cpcs,
+		      "CPCS execute parse: cmd_nsid=%u pind=%u rsid=%u numr=%u dlen=%u activated=%s\n",
+		      cmd->nsid, pind, rsid, numr, dlen, prog->activated ? "yes" : "no");
 
 	if (!prog->activated) {
 		SPDK_ERRLOG("Program %u not activated\n", pind);
@@ -310,13 +311,14 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 			/* Diagnostic: show raw bytes received from host to catch nsid corruption */
 			if (dlen >= 8) {
 				const uint8_t *raw = (const uint8_t *)ctx->data_buffer;
-				SPDK_NOTICELOG("cpcs_execute_parse_cmd: raw data_buffer[0..7]:"
-					       " %02x %02x %02x %02x %02x %02x %02x %02x"
-					       " (nsid_field=%u) iovcnt=%d iov_len=%zu dlen=%u\n",
-					       raw[0], raw[1], raw[2], raw[3],
-					       raw[4], raw[5], raw[6], raw[7],
-					       *(const uint32_t *)raw,
-					       req->iovcnt, req->iov[0].iov_len, dlen);
+				SPDK_DEBUGLOG(nvmf_cpcs,
+					      "cpcs_execute_parse_cmd: raw data_buffer[0..7]:"
+					      " %02x %02x %02x %02x %02x %02x %02x %02x"
+					      " (nsid_field=%u) iovcnt=%d iov_len=%zu dlen=%u\n",
+					      raw[0], raw[1], raw[2], raw[3],
+					      raw[4], raw[5], raw[6], raw[7],
+					      *(const uint32_t *)raw,
+					      req->iovcnt, req->iov[0].iov_len, dlen);
 			}
 		} else if (req->iovcnt == 0) {
 			SPDK_ERRLOG("Execute Program: no IOVs in request (dlen=%u req->length=%u)\n",

@@ -12,6 +12,12 @@
 
 #define VBDEV_SLM_COPY_FALLBACK_CHUNK_SIZE (1U << 20)
 
+/* Slice size for the zero-copy copy path.  The direct path touches each byte
+ * once (a single memmove) instead of twice (read into a bounce buffer, then
+ * write out of it), but a multi-megabyte memmove would monopolise the reactor
+ * poller, so it is issued in slices with a yield in between. */
+#define VBDEV_SLM_COPY_DIRECT_SLICE_SIZE   (4U << 20)
+
 struct vbdev_slm_provider {
 	const struct spdk_vbdev_slm_ops *ops;
 	TAILQ_ENTRY(vbdev_slm_provider)		link;
@@ -37,6 +43,9 @@ struct vbdev_slm_copy_async_ctx {
 	uint64_t length;
 	uint64_t processed;
 	uint8_t *tmp;
+	/* Non-NULL only on the zero-copy path; then tmp stays NULL. */
+	uint8_t *dst_ptr;
+	uint8_t *src_ptr;
 	spdk_bdev_slm_io_completion_cb cb_fn;
 	void *cb_arg;
 };
@@ -392,6 +401,7 @@ vbdev_slm_write_by_bdev(struct spdk_bdev *bdev, uint64_t offset, uint64_t length
 }
 
 static void vbdev_slm_copy_by_bdev_async_step(struct vbdev_slm_copy_async_ctx *ctx);
+static void vbdev_slm_copy_direct_step(struct vbdev_slm_copy_async_ctx *ctx);
 
 static void
 vbdev_slm_copy_by_bdev_async_finish(struct vbdev_slm_copy_async_ctx *ctx, int status)
@@ -410,6 +420,52 @@ vbdev_slm_copy_by_bdev_async_continue(void *arg)
 	struct vbdev_slm_copy_async_ctx *ctx = arg;
 
 	vbdev_slm_copy_by_bdev_async_step(ctx);
+}
+
+static void
+vbdev_slm_copy_direct_continue(void *arg)
+{
+	struct vbdev_slm_copy_async_ctx *ctx = arg;
+
+	vbdev_slm_copy_direct_step(ctx);
+}
+
+/*
+ * Zero-copy copy path.  Both endpoints have already resolved to direct pointers
+ * into their backing buffers, so the transfer is a memmove rather than a
+ * read into a bounce buffer followed by a write out of it.  memmove (not
+ * memcpy) because a copy within a single bdev may overlap.
+ */
+static void
+vbdev_slm_copy_direct_step(struct vbdev_slm_copy_async_ctx *ctx)
+{
+	struct spdk_thread *thread;
+	uint64_t slice;
+	int rc;
+
+	while (ctx->processed < ctx->length) {
+		slice = spdk_min(ctx->length - ctx->processed,
+				 (uint64_t)VBDEV_SLM_COPY_DIRECT_SLICE_SIZE);
+		memmove(ctx->dst_ptr + ctx->processed,
+			ctx->src_ptr + ctx->processed, slice);
+		ctx->processed += slice;
+
+		if (ctx->processed >= ctx->length) {
+			break;
+		}
+
+		/* Yield between slices so a large copy does not starve the poller. */
+		thread = spdk_get_thread();
+		if (thread != NULL) {
+			rc = spdk_thread_send_msg(thread, vbdev_slm_copy_direct_continue, ctx);
+			if (rc != 0) {
+				vbdev_slm_copy_by_bdev_async_finish(ctx, rc);
+			}
+			return;
+		}
+	}
+
+	vbdev_slm_copy_by_bdev_async_finish(ctx, 0);
 }
 
 static void
@@ -486,6 +542,8 @@ vbdev_slm_copy_by_bdev_async(struct spdk_bdev *dst_bdev, uint64_t dst_offset,
 	const struct spdk_vbdev_slm_ops *dst_ops;
 	const struct spdk_vbdev_slm_ops *src_ops;
 	struct vbdev_slm_copy_async_ctx *ctx;
+	void *dst_ptr;
+	void *src_ptr;
 	int rc;
 
 	if (cb_fn == NULL || dst_bdev == NULL || src_bdev == NULL) {
@@ -528,13 +586,6 @@ vbdev_slm_copy_by_bdev_async(struct spdk_bdev *dst_bdev, uint64_t dst_offset,
 		return -ENOMEM;
 	}
 
-	ctx->tmp = spdk_zmalloc(VBDEV_SLM_COPY_FALLBACK_CHUNK_SIZE, 4096, NULL,
-				SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
-	if (ctx->tmp == NULL) {
-		free(ctx);
-		return -ENOMEM;
-	}
-
 	ctx->dst_bdev = dst_bdev;
 	ctx->src_bdev = src_bdev;
 	ctx->dst_offset = dst_offset;
@@ -543,6 +594,37 @@ vbdev_slm_copy_by_bdev_async(struct spdk_bdev *dst_bdev, uint64_t dst_offset,
 	ctx->processed = 0;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+
+	/*
+	 * Zero-copy fast path.  vbdev_slm_register_ops() rejects any provider
+	 * that does not implement get_buffer_ptr_by_bdev, so both hooks are
+	 * always present here; a provider may still decline a particular range
+	 * (for example one that is not contiguous in its backing buffer), in
+	 * which case we fall through to the bounce-buffer path below.
+	 */
+	dst_ptr = NULL;
+	src_ptr = NULL;
+	if (dst_ops->get_buffer_ptr_by_bdev(dst_bdev, dst_offset, length, &dst_ptr) == 0 &&
+	    dst_ptr != NULL &&
+	    src_ops->get_buffer_ptr_by_bdev(src_bdev, src_offset, length, &src_ptr) == 0 &&
+	    src_ptr != NULL) {
+		ctx->dst_ptr = dst_ptr;
+		ctx->src_ptr = src_ptr;
+		vbdev_slm_copy_direct_step(ctx);
+		return 0;
+	}
+
+	/*
+	 * Not zeroed: the chunk is fully overwritten by each read before it is
+	 * written out, so pre-zeroing it is pure overhead.
+	 */
+	ctx->tmp = spdk_malloc(VBDEV_SLM_COPY_FALLBACK_CHUNK_SIZE, 4096, NULL,
+			       SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (ctx->tmp == NULL) {
+		free(ctx);
+		return -ENOMEM;
+	}
+
 	vbdev_slm_copy_by_bdev_async_step(ctx);
 	return 0;
 }

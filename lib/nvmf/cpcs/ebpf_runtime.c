@@ -112,6 +112,29 @@ ebpf_slm_wait(struct cpcs_ebpf_wait_ctx *wait)
  */
 static __thread struct cpcs_ebpf_exec_scope *g_ebpf_active_scope;
 
+/*
+ * Per-thread VM memory buffer, reused across Executes instead of
+ * calloc()/free() on every call.
+ *
+ * This is thread-local, not per-program (struct cpcs_ebpf_ctx, stashed in
+ * prog->runtime, is a single instance shared by every Execute of a given
+ * program -- see ebpf_runtime.h). Concurrent Executes of the *same*
+ * program can run on different SPDK reactor threads at the same time:
+ * struct cpcs_program.exec_count ("Active executions", program.h:52)
+ * tracks multiple simultaneous in-flight executions, and in
+ * cpcs_execute_run() (execute.c:519-522) ctx->program->lock is only held
+ * around the runtime->execute_async() submission call -- ebpf_execute_async()
+ * (below) enqueues a message via spdk_thread_send_msg() and returns
+ * immediately, well before ebpf_execute_sync() actually runs on whatever
+ * thread that message lands on. A buffer owned by struct cpcs_ebpf_ctx
+ * would therefore be raced by two connections executing the same pind
+ * concurrently. A thread-local buffer avoids that: it is only ever
+ * touched by the single reactor thread that allocated it, matching the
+ * existing g_ebpf_active_scope thread-local above.
+ */
+static __thread void   *g_ebpf_vm_mem;
+static __thread size_t  g_ebpf_vm_mem_size;
+
 /**
  * Translate a guest-supplied offset into a validated host pointer inside the
  * sandbox VM memory region.
@@ -558,12 +581,35 @@ ebpf_execute_sync(struct cpcs_program *prog,
 	struct cpcs_ebpf_guest_ctx guest_ctx;
 	struct cpcs_ebpf_exec_scope scope;
 
-	/* Allocate zeroed VM memory so no host heap contents leak to the guest. */
-	void *mem = calloc(1, ctx->mem_size);
-	if (!mem) {
-		SPDK_ERRLOG("Failed to allocate VM memory\n");
-		return -ENOMEM;
+	/*
+	 * Reuse this thread's VM memory buffer across Executes (see
+	 * g_ebpf_vm_mem above for why it is thread-local rather than stored
+	 * in ctx / struct cpcs_ebpf_ctx). ctx->mem_size is constant per
+	 * program (set once in ebpf_init(), never changed), and in practice
+	 * identical -- EBPF_VM_MEM_SIZE -- across every eBPF program, so this
+	 * malloc() only actually runs once per reactor thread; the size check
+	 * just guards against that assumption changing later.
+	 */
+	if (g_ebpf_vm_mem == NULL || g_ebpf_vm_mem_size < ctx->mem_size) {
+		free(g_ebpf_vm_mem);
+		g_ebpf_vm_mem = malloc(ctx->mem_size);
+		if (g_ebpf_vm_mem == NULL) {
+			g_ebpf_vm_mem_size = 0;
+			SPDK_ERRLOG("Failed to allocate VM memory\n");
+			return -ENOMEM;
+		}
+		g_ebpf_vm_mem_size = ctx->mem_size;
 	}
+	void *mem = g_ebpf_vm_mem;
+
+	/*
+	 * Zero the buffer on every Execute -- this is sandbox hygiene, not an
+	 * allocation detail: it stops both host heap contents and the
+	 * *previous* Execute's leftover VM state (potentially another
+	 * guest's data, since the buffer is now reused across calls) from
+	 * leaking into this run.
+	 */
+	memset(mem, 0, ctx->mem_size);
 
 	/*
 	 * Expose only a sanitized, scalar view of the execution context to the
@@ -603,7 +649,7 @@ ebpf_execute_sync(struct cpcs_program *prog,
 		if (exec_rc != 0) {
 			SPDK_ERRLOG("eBPF program %u interpreter execution failed\n", prog->pind);
 			g_ebpf_active_scope = NULL;
-			free(mem);
+			/* mem is the thread-local g_ebpf_vm_mem buffer; not freed, only reused. */
 			return -EIO;
 		}
 		SPDK_DEBUGLOG(nvmf_cpcs, "eBPF program %u executed (interpreter) returned 0x%lx\n",
@@ -611,7 +657,7 @@ ebpf_execute_sync(struct cpcs_program *prog,
 	}
 
 	g_ebpf_active_scope = NULL;
-	free(mem);
+	/* mem is the thread-local g_ebpf_vm_mem buffer; not freed, only reused (see above). */
 #else
 	/* Simulation mode - just return success */
 	ret = 0xDEADBEEF; /* Distinctive pattern for testing */

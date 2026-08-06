@@ -4651,6 +4651,67 @@ _cpcs_builtin_reduce_apply_sg(struct cpcs_builtin_async_exec_ctx *ctx,
 	return 0;
 }
 
+/*
+ * Zero-copy fast-path reducer for SUM64/MAX64/MIN64: reduces the whole
+ * uint64 array in one pass over a direct SLM pointer, no SG pin/unpin and
+ * no chunk loop. SUM64 uses 4 independent accumulators to hide add latency
+ * (same rationale as the AVX2 helpers above, :285-289) -- unsigned 64-bit
+ * addition wraps modulo 2^64, which is associative/commutative, so the
+ * split-accumulator result is bit-identical to the single-accumulator
+ * chunked path regardless of grouping. MAX64/MIN64 are order-independent
+ * for the same reason. Caller guarantees n >= 1.
+ */
+static void
+_cpcs_builtin_reduce_apply_direct(uint16_t pind, const uint64_t *vals, size_t n,
+				  uint64_t *out_value)
+{
+	switch (pind) {
+	case CPCS_BUILTIN_PIND_SUM64: {
+		uint64_t sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+		size_t i = 0;
+
+		for (; i + 3 < n; i += 4) {
+			sum0 += vals[i];
+			sum1 += vals[i + 1];
+			sum2 += vals[i + 2];
+			sum3 += vals[i + 3];
+		}
+		for (; i < n; i++) {
+			sum0 += vals[i];
+		}
+		*out_value = sum0 + sum1 + sum2 + sum3;
+		break;
+	}
+	case CPCS_BUILTIN_PIND_MAX64: {
+		uint64_t max_v = vals[0];
+		size_t i;
+
+		for (i = 1; i < n; i++) {
+			if (vals[i] > max_v) {
+				max_v = vals[i];
+			}
+		}
+		*out_value = max_v;
+		break;
+	}
+	case CPCS_BUILTIN_PIND_MIN64: {
+		uint64_t min_v = vals[0];
+		size_t i;
+
+		for (i = 1; i < n; i++) {
+			if (vals[i] < min_v) {
+				min_v = vals[i];
+			}
+		}
+		*out_value = min_v;
+		break;
+	}
+	default:
+		*out_value = 0;
+		break;
+	}
+}
+
 static bool
 _cpcs_range_overlap_u64(uint64_t offset_a, uint64_t length_a,
 			uint64_t offset_b, uint64_t length_b)
@@ -4938,6 +4999,32 @@ builtin_async_step(struct cpcs_builtin_async_exec_ctx *ctx)
 		if (ctx->processed >= ctx->len) {
 			builtin_async_finish(ctx, 0);
 			return 0;
+		}
+
+		/*
+		 * Zero-copy fast path (pSLM): the whole uint64 array is contiguous
+		 * in the SLM buffer, so reduce it in one pass with no SG pin/unpin
+		 * and no chunked read. Only tried on the first step -- on success
+		 * the whole range is consumed in a single shot. vSLM/non-SLM fall
+		 * through to the pinned-SG / chunked read path below, as does a
+		 * range shorter than one element (the reducer seeds MAX64/MIN64
+		 * from vals[0], so it requires at least one whole uint64).
+		 */
+		if (ctx->processed == 0 && ctx->len >= sizeof(uint64_t)) {
+			void *zc = NULL;
+			int zc_rc;
+
+			zc_rc = _cpcs_exec_get_range_ptr(ctx->exec_ctx, ctx->mr_id, ctx->off,
+							 ctx->len, &zc);
+			if (zc_rc == 0 && zc != NULL) {
+				_cpcs_builtin_reduce_apply_direct(ctx->pind, (const uint64_t *)zc,
+								  ctx->len / sizeof(uint64_t),
+								  &ctx->return_value);
+				ctx->initialized = true;
+				ctx->processed = ctx->len;
+				builtin_async_schedule_continue(ctx);
+				return 0;
+			}
 		}
 
 		ctx->chunk_len = spdk_min(ctx->len - ctx->processed, (uint64_t)CPCS_BUILTIN_IO_CHUNK);
