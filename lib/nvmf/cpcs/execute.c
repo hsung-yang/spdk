@@ -320,6 +320,8 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 					      *(const uint32_t *)raw,
 					      req->iovcnt, req->iov[0].iov_len, dlen);
 			}
+			SPDK_NOTICELOG("cpcs_execute: zero-copy fast path (iov[0].iov_len=%zu >= dlen=%u)\n",
+				       req->iov[0].iov_len, dlen);
 		} else if (req->iovcnt == 0) {
 			SPDK_ERRLOG("Execute Program: no IOVs in request (dlen=%u req->length=%u)\n",
 				    dlen, req->length);
@@ -341,6 +343,8 @@ cpcs_execute_parse_cmd(struct spdk_nvmf_request *req,
 				ctx->data_buffer_owned = false;
 				return -SPDK_NVME_SC_INVALID_FIELD;
 			}
+			SPDK_NOTICELOG("cpcs_execute: memcpy slow path (iovcnt=%d, copied %zu/%u bytes)\n",
+				       req->iovcnt, copied, dlen);
 		}
 	}
 

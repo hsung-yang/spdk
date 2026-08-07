@@ -780,6 +780,16 @@ nvmf_transport_req_free(struct spdk_nvmf_request *req)
 int
 nvmf_transport_req_complete(struct spdk_nvmf_request *req)
 {
+	/* Track fabric bytes sent to host. req->length is the data length of
+	 * the response (e.g. bytes sent back for a read, or the Execute Program
+	 * data buffer length for CPCS compute). Updated before dispatching to
+	 * the transport so the counter reflects all traffic leaving the target. */
+	if (req->length > 0) {
+		/* Use a relaxed atomic add — the counter is for analytics, not
+		 * synchronization. Per-core SPDK reactors already serialize
+		 * per-qpair access, so a simple assignment is safe on x86. */
+		req->fabric_bytes_out += req->length;
+	}
 	return req->qpair->transport->ops->req_complete(req);
 }
 

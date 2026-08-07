@@ -2707,6 +2707,7 @@ nvmf_tcp_req_parse_sgl(struct spdk_nvmf_tcp_req *tcp_req,
 
 		/* fill request length and populate iovs */
 		req->length = length;
+		req->fabric_bytes_in = length;
 
 		SPDK_DEBUGLOG(nvmf_tcp, "Data requested length= 0x%x\n", length);
 
@@ -2797,6 +2798,7 @@ nvmf_tcp_req_parse_sgl(struct spdk_nvmf_tcp_req *tcp_req,
 		}
 
 		req->length = length;
+		req->fabric_bytes_in = length;
 		req->data_from_pool = false;
 
 		if (spdk_unlikely(req->dif_enabled)) {

@@ -130,8 +130,18 @@ struct spdk_nvmf_request {
 	uint64_t timeout_tsc;
 	uint32_t			orig_nsid;
 	STAILQ_ENTRY(spdk_nvmf_request)	reservation_link;
+
+	/* Fabric byte counters for measuring data transferred over NVMe-oF.
+	 * fabric_bytes_in  — total data bytes received from host (writes,
+	 *                    inline Execute buffers, etc.)
+	 * fabric_bytes_out — total data bytes sent to host (read responses,
+	 *                    inline Execute results, etc.)
+	 * Updated at req_complete by nvmf_transport_req_complete().
+	 */
+	uint64_t				fabric_bytes_in;
+	uint64_t				fabric_bytes_out;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 832, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 848, "Incorrect size");
 
 enum spdk_nvmf_qpair_state {
 	SPDK_NVMF_QPAIR_UNINITIALIZED = 0,
