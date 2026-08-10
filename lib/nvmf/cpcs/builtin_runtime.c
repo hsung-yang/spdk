@@ -88,6 +88,54 @@ struct cs_direct_ns_result {
 #define CS_DIRECT_NS_WORKLOAD_MIN         2
 #define CS_DIRECT_NS_WORKLOAD_FILTER_GT   3
 #define CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT 4
+/*
+ * Vector workloads share DOT_PRODUCT's [A|B] input layout and its single-double
+ * result, so they reuse the same hold-A / stream-B machinery. Anything needing a
+ * wider result (MULTI_AGG64: count+sum+min+max) or a bulk output (RLE_COMPRESS)
+ * does not fit cs_direct_ns_result and is deliberately absent.
+ */
+#define CS_DIRECT_NS_WORKLOAD_L2_DISTANCE_SQ    5
+#define CS_DIRECT_NS_WORKLOAD_COSINE_SIMILARITY 6
+
+static inline bool
+_cs_direct_ns_is_vector_workload(uint8_t w)
+{
+	return w == CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT ||
+	       w == CS_DIRECT_NS_WORKLOAD_L2_DISTANCE_SQ ||
+	       w == CS_DIRECT_NS_WORKLOAD_COSINE_SIMILARITY;
+}
+
+/* Fold one A/B element pair into the running vector accumulators. */
+static inline void
+_cs_direct_ns_vec_accum(uint8_t w, double a, double b,
+			double *dp, double *norm_a, double *norm_b)
+{
+	switch (w) {
+	case CS_DIRECT_NS_WORKLOAD_L2_DISTANCE_SQ:
+		*dp += (a - b) * (a - b);
+		break;
+	case CS_DIRECT_NS_WORKLOAD_COSINE_SIMILARITY:
+		*dp += a * b;
+		*norm_a += a * a;
+		*norm_b += b * b;
+		break;
+	default: /* DOT_PRODUCT */
+		*dp += a * b;
+		break;
+	}
+}
+
+/* Collapse the accumulators into the single double the result field carries. */
+static inline double
+_cs_direct_ns_vec_final(uint8_t w, double dp, double norm_a, double norm_b)
+{
+	if (w == CS_DIRECT_NS_WORKLOAD_COSINE_SIMILARITY) {
+		double denom = sqrt(norm_a) * sqrt(norm_b);
+
+		return denom == 0.0 ? 0.0 : dp / denom;
+	}
+	return dp;
+}
 
 struct cpcs_builtin_metadata_record {
 	uint64_t doc_id;
@@ -3811,15 +3859,19 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 
 		rc = bdev_slm_get_buffer_ptr_by_bdev(bdev, offset, total_bytes, &zc);
 		if (rc == 0 && zc != NULL) {
-			if (desc->workload == CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT) {
+			if (_cs_direct_ns_is_vector_workload(desc->workload)) {
 				const float *fvals = (const float *)zc;
-				double dp = 0.0;
+				double dp = 0.0, norm_a = 0.0, norm_b = 0.0, final;
 				size_t half = total_bytes / (2 * sizeof(float));
 
 				for (i = 0; i < half; i++) {
-					dp += (double)fvals[i] * (double)fvals[i + half];
+					_cs_direct_ns_vec_accum(desc->workload,
+								(double)fvals[i],
+								(double)fvals[i + half],
+								&dp, &norm_a, &norm_b);
 				}
-				memcpy(&agg, &dp, sizeof(double));
+				final = _cs_direct_ns_vec_final(desc->workload, dp, norm_a, norm_b);
+				memcpy(&agg, &final, sizeof(double));
 				count = half;
 				goto write_result;
 			}
@@ -3874,10 +3926,13 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	 * ~half_len + one chunk instead of the full total_bytes. (Reached only
 	 * on the non-pSLM fallback; pSLM computes in place via zero-copy above.)
 	 */
-	if (desc->workload == CS_DIRECT_NS_WORKLOAD_DOT_PRODUCT) {
+	if (_cs_direct_ns_is_vector_workload(desc->workload)) {
 		uint8_t *buf_a;
 		uint8_t *buf_b;
 		double dp = 0.0;
+		double norm_a = 0.0;
+		double norm_b = 0.0;
+		double final;
 		uint64_t half_bytes = total_bytes / 2;
 
 		buf_a = spdk_dma_malloc(half_bytes, 4096, NULL);
@@ -3953,7 +4008,9 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			fb = (const float *)buf_b;
 			nf = chunk / sizeof(float);
 			for (k = 0; k < nf; k++) {
-				dp += (double)fa[k] * (double)fb[k];
+				_cs_direct_ns_vec_accum(desc->workload,
+							(double)fa[k], (double)fb[k],
+							&dp, &norm_a, &norm_b);
 			}
 			processed += chunk;
 		}
@@ -3962,7 +4019,8 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		spdk_dma_free(buf_a);
 
 		/* Pack the full double bit-pattern into the uint64_t result field. */
-		memcpy(&agg, &dp, sizeof(double));
+		final = _cs_direct_ns_vec_final(desc->workload, dp, norm_a, norm_b);
+		memcpy(&agg, &final, sizeof(double));
 		count = half_bytes / sizeof(float);
 
 		goto write_result;
