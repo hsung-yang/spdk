@@ -5854,13 +5854,17 @@ vbdev_vslm_mem_get_buffer_ptr_by_bdev(struct spdk_bdev *bdev, uint64_t offset,
 		return 0;
 	}
 
-	if (vbdev_vslm_get_by_bdev(bdev) == NULL) {
+	struct vbdev_vslm *vslm = vbdev_vslm_get_by_bdev(bdev);
+	if (vslm == NULL) {
 		return -ENOTSUP;
 	}
 
-	(void)offset;
-	*ptr = NULL;
-	return -ENOTSUP;
+	if (offset + length > vslm->sram_size_bytes) {
+		return -ENOTSUP;
+	}
+
+	*ptr = (void *)(vslm->sram_buffer + offset);
+	return 0;
 }
 
 /*
