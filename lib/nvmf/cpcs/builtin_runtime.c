@@ -132,6 +132,16 @@ struct cpcs_builtin_filter_agg_async_ctx {
 	const struct spdk_cpcs_builtin_eval_filter_clause *clauses;
 	struct spdk_cpcs_builtin_filter_agg_result result;
 	struct cpcs_builtin_metadata_record meta;
+	/*
+	 * Metadata is read in batches rather than one record per SLM read.
+	 * A per-record read made the scan cost scale with record count instead
+	 * of bytes, which distorted every size-scaling curve measured through
+	 * this program (optimization-audit A3).
+	 */
+	uint8_t *batch;
+	uint32_t batch_capacity;   /* records the buffer can hold */
+	uint32_t batch_valid;      /* records currently in the buffer */
+	uint32_t batch_idx;        /* next record to consume from the buffer */
 	uint64_t aggregate_u64;
 	double aggregate_f64;
 	bool aggregate_initialized;
@@ -139,6 +149,9 @@ struct cpcs_builtin_filter_agg_async_ctx {
 	uint64_t start_ticks;
 	uint64_t ticks_hz;
 };
+
+/* Upper bound on a single metadata batch read. */
+#define CPCS_BUILTIN_META_BATCH_BYTES (64u * 1024u)
 
 struct cpcs_builtin_topk_async_ctx {
 	struct cpcs_builtin_extended_exec_ctx *worker_ctx;
@@ -151,6 +164,11 @@ struct cpcs_builtin_topk_async_ctx {
 	struct spdk_cpcs_builtin_filtered_topk_exact_result *out;
 	uint8_t *out_buf;
 	float *vector_buf;
+	/* Batched metadata scan -- see cpcs_builtin_filter_agg_async_ctx. */
+	uint8_t *batch;
+	uint32_t batch_capacity;
+	uint32_t batch_valid;
+	uint32_t batch_idx;
 	uint32_t entries_count;
 	uint32_t dim;
 	uint16_t filter_count;
@@ -4195,6 +4213,7 @@ _cpcs_builtin_filter_agg_async_finish(struct cpcs_builtin_filter_agg_async_ctx *
 	struct cpcs_builtin_extended_exec_ctx *worker_ctx;
 
 	worker_ctx = async_ctx->worker_ctx;
+	free(async_ctx->batch);
 	free(async_ctx);
 	_cpcs_builtin_extended_complete(worker_ctx, status, return_value);
 }
@@ -4218,7 +4237,6 @@ static void
 _cpcs_builtin_filter_agg_read_done(void *cb_arg, int status)
 {
 	struct cpcs_builtin_filter_agg_async_ctx *async_ctx = cb_arg;
-	int rc;
 
 	if (status != 0) {
 		_cpcs_builtin_filter_agg_async_finish(async_ctx,
@@ -4226,18 +4244,8 @@ _cpcs_builtin_filter_agg_read_done(void *cb_arg, int status)
 		return;
 	}
 
-	async_ctx->result.hdr.stats.media_read_bytes += sizeof(async_ctx->meta);
-	async_ctx->result.hdr.stats.metadata_records_scanned++;
-
-	rc = _cpcs_builtin_filter_agg_apply_record(async_ctx->req, async_ctx->clauses,
-			&async_ctx->meta, &async_ctx->result, &async_ctx->aggregate_u64,
-			&async_ctx->aggregate_f64, &async_ctx->aggregate_initialized);
-	if (rc != 0) {
-		_cpcs_builtin_filter_agg_async_finish(async_ctx, rc, 0);
-		return;
-	}
-
-	async_ctx->record_idx++;
+	/* Batch landed; the step function drains it before reading again. */
+	async_ctx->batch_idx = 0;
 	_cpcs_builtin_filter_agg_async_step(async_ctx);
 }
 
@@ -4246,16 +4254,54 @@ _cpcs_builtin_filter_agg_async_step(struct cpcs_builtin_filter_agg_async_ctx *as
 {
 	uint64_t record_count;
 	uint64_t metadata_off;
+	uint32_t stride;
+	uint32_t batch_records;
+	uint64_t remaining;
 	int rc;
 
 	record_count = from_le64(&async_ctx->req->record_count);
+	stride = from_le32(&async_ctx->req->metadata_stride);
+
+	/* Drain what is already resident before issuing another read. */
+	while (async_ctx->batch_idx < async_ctx->batch_valid) {
+		const struct cpcs_builtin_metadata_record *meta;
+
+		meta = (const struct cpcs_builtin_metadata_record *)
+		       (async_ctx->batch + ((size_t)async_ctx->batch_idx * stride));
+
+		async_ctx->result.hdr.stats.metadata_records_scanned++;
+
+		rc = _cpcs_builtin_filter_agg_apply_record(async_ctx->req, async_ctx->clauses,
+				meta, &async_ctx->result, &async_ctx->aggregate_u64,
+				&async_ctx->aggregate_f64, &async_ctx->aggregate_initialized);
+		if (rc != 0) {
+			_cpcs_builtin_filter_agg_async_finish(async_ctx, rc, 0);
+			return;
+		}
+
+		async_ctx->batch_idx++;
+		async_ctx->record_idx++;
+	}
+
 	if (async_ctx->record_idx < record_count) {
+		remaining = record_count - async_ctx->record_idx;
+		batch_records = async_ctx->batch_capacity;
+		if ((uint64_t)batch_records > remaining) {
+			batch_records = (uint32_t)remaining;
+		}
+
 		metadata_off = from_le64(&async_ctx->req->metadata_offset) +
-			       (async_ctx->record_idx * from_le32(&async_ctx->req->metadata_stride));
+			       (async_ctx->record_idx * stride);
+
+		async_ctx->batch_valid = batch_records;
+		async_ctx->result.hdr.stats.media_read_bytes +=
+			(uint64_t)batch_records * stride;
+
 		rc = _cpcs_exec_read_range_async(async_ctx->exec_ctx,
 						 from_le64(&async_ctx->req->metadata_mr_id),
-						 metadata_off, sizeof(async_ctx->meta),
-						 &async_ctx->meta,
+						 metadata_off,
+						 (uint64_t)batch_records * stride,
+						 async_ctx->batch,
 						 _cpcs_builtin_filter_agg_read_done, async_ctx);
 		if (rc != 0) {
 			_cpcs_builtin_filter_agg_async_finish(async_ctx, rc, 0);
@@ -4327,6 +4373,23 @@ _cpcs_builtin_exec_filter_agg_async(struct cpcs_builtin_extended_exec_ctx *worke
 	async_ctx->clauses = clauses;
 	async_ctx->start_ticks = spdk_get_ticks();
 	async_ctx->ticks_hz = spdk_get_ticks_hz();
+
+	/*
+	 * Metadata is scanned in batches. Stride was validated above to be at
+	 * least one record, so capacity is always >= 1.
+	 */
+	async_ctx->batch_capacity =
+		CPCS_BUILTIN_META_BATCH_BYTES / from_le32(&req->metadata_stride);
+	if (async_ctx->batch_capacity == 0) {
+		async_ctx->batch_capacity = 1;
+	}
+	async_ctx->batch = calloc(async_ctx->batch_capacity,
+				  from_le32(&req->metadata_stride));
+	if (async_ctx->batch == NULL) {
+		free(async_ctx);
+		return -ENOMEM;
+	}
+
 	_cpcs_builtin_fill_common_stats(ctx, &async_ctx->result.hdr.stats);
 	async_ctx->result.hdr.version = SPDK_CPCS_BUILTIN_EVAL_ABI_VERSION;
 	async_ctx->result.hdr.opcode = SPDK_CPCS_BUILTIN_OP_FILTER_AGG;
@@ -4350,6 +4413,7 @@ _cpcs_builtin_topk_async_finish(struct cpcs_builtin_topk_async_ctx *async_ctx,
 	free(async_ctx->entries);
 	free(async_ctx->vector_buf);
 	free(async_ctx->out_buf);
+	free(async_ctx->batch);
 	free(async_ctx);
 	_cpcs_builtin_extended_complete(worker_ctx, status, return_value);
 }
@@ -4430,7 +4494,7 @@ _cpcs_builtin_topk_vector_read_done(void *cb_arg, int status)
 		return;
 	}
 
-	async_ctx->record_idx++;
+	/* record_idx was already advanced by the drain loop that issued this read. */
 	_cpcs_builtin_topk_async_step(async_ctx);
 }
 
@@ -4438,43 +4502,15 @@ static void
 _cpcs_builtin_topk_metadata_read_done(void *cb_arg, int status)
 {
 	struct cpcs_builtin_topk_async_ctx *async_ctx = cb_arg;
-	uint64_t vector_index;
-	uint64_t vector_off;
-	bool matched;
-	int rc;
 
 	if (status != 0) {
 		_cpcs_builtin_topk_async_finish(async_ctx, cpcs_builtin_map_slm_status(status), 0);
 		return;
 	}
 
-	async_ctx->out->hdr.stats.media_read_bytes += sizeof(async_ctx->meta);
-	async_ctx->out->hdr.stats.metadata_records_scanned++;
-
-	rc = _cpcs_builtin_filter_match_all(&async_ctx->meta, async_ctx->clauses,
-					    async_ctx->filter_count, &matched);
-	if (rc != 0) {
-		_cpcs_builtin_topk_async_finish(async_ctx, rc, 0);
-		return;
-	}
-	if (!matched) {
-		async_ctx->record_idx++;
-		_cpcs_builtin_topk_async_step(async_ctx);
-		return;
-	}
-
-	async_ctx->out->hdr.matched_count++;
-	vector_index = from_le32(&async_ctx->meta.vector_index);
-	vector_off = from_le64(&async_ctx->req->vector_offset) +
-		     (vector_index * from_le32(&async_ctx->req->vector_stride));
-	rc = _cpcs_exec_read_range_async(async_ctx->exec_ctx,
-					 from_le64(&async_ctx->req->vector_mr_id),
-					 vector_off, async_ctx->dim * sizeof(float),
-					 async_ctx->vector_buf,
-					 _cpcs_builtin_topk_vector_read_done, async_ctx);
-	if (rc != 0) {
-		_cpcs_builtin_topk_async_finish(async_ctx, rc, 0);
-	}
+	/* Batch landed; matching happens in the step function's drain loop. */
+	async_ctx->batch_idx = 0;
+	_cpcs_builtin_topk_async_step(async_ctx);
 }
 
 static void
@@ -4482,18 +4518,85 @@ _cpcs_builtin_topk_async_step(struct cpcs_builtin_topk_async_ctx *async_ctx)
 {
 	uint64_t record_count;
 	uint64_t metadata_off;
+	uint64_t vector_off;
+	uint64_t vector_index;
+	uint32_t stride;
+	uint32_t batch_records;
+	uint64_t remaining;
 	uint64_t i;
 	int rc;
 
 	record_count = from_le64(&async_ctx->req->record_count);
+	stride = from_le32(&async_ctx->req->metadata_stride);
+
+	/*
+	 * Drain the resident batch. A matching record needs its vector fetched,
+	 * so the loop returns there and resumes from the next batch slot when
+	 * the vector read completes.
+	 */
+	while (async_ctx->batch_idx < async_ctx->batch_valid) {
+		const struct cpcs_builtin_metadata_record *meta;
+		bool matched;
+
+		meta = (const struct cpcs_builtin_metadata_record *)
+		       (async_ctx->batch + ((size_t)async_ctx->batch_idx * stride));
+
+		async_ctx->out->hdr.stats.metadata_records_scanned++;
+
+		rc = _cpcs_builtin_filter_match_all(meta, async_ctx->clauses,
+						    async_ctx->filter_count, &matched);
+		if (rc != 0) {
+			_cpcs_builtin_topk_async_finish(async_ctx, rc, 0);
+			return;
+		}
+
+		/*
+		 * Scoring reads doc_id/vector_index from async_ctx->meta, and the
+		 * batch buffer is overwritten by the next read, so keep a copy.
+		 */
+		memcpy(&async_ctx->meta, meta, sizeof(async_ctx->meta));
+
+		async_ctx->batch_idx++;
+		async_ctx->record_idx++;
+
+		if (!matched) {
+			continue;
+		}
+
+		async_ctx->out->hdr.matched_count++;
+		vector_index = from_le32(&async_ctx->meta.vector_index);
+		vector_off = from_le64(&async_ctx->req->vector_offset) +
+			     (vector_index * from_le32(&async_ctx->req->vector_stride));
+		rc = _cpcs_exec_read_range_async(async_ctx->exec_ctx,
+						 from_le64(&async_ctx->req->vector_mr_id),
+						 vector_off, async_ctx->dim * sizeof(float),
+						 async_ctx->vector_buf,
+						 _cpcs_builtin_topk_vector_read_done, async_ctx);
+		if (rc != 0) {
+			_cpcs_builtin_topk_async_finish(async_ctx, rc, 0);
+		}
+		return;
+	}
+
 	if (async_ctx->record_idx < record_count) {
+		remaining = record_count - async_ctx->record_idx;
+		batch_records = async_ctx->batch_capacity;
+		if ((uint64_t)batch_records > remaining) {
+			batch_records = (uint32_t)remaining;
+		}
+
 		metadata_off = from_le64(&async_ctx->req->metadata_offset) +
-			       (async_ctx->record_idx *
-				from_le32(&async_ctx->req->metadata_stride));
+			       (async_ctx->record_idx * stride);
+
+		async_ctx->batch_valid = batch_records;
+		async_ctx->out->hdr.stats.media_read_bytes +=
+			(uint64_t)batch_records * stride;
+
 		rc = _cpcs_exec_read_range_async(async_ctx->exec_ctx,
 						 from_le64(&async_ctx->req->metadata_mr_id),
-						 metadata_off, sizeof(async_ctx->meta),
-						 &async_ctx->meta,
+						 metadata_off,
+						 (uint64_t)batch_records * stride,
+						 async_ctx->batch,
 						 _cpcs_builtin_topk_metadata_read_done,
 						 async_ctx);
 		if (rc != 0) {
@@ -4593,11 +4696,22 @@ _cpcs_builtin_exec_filtered_topk_exact_async(struct cpcs_builtin_extended_exec_c
 	output_len = sizeof(*async_ctx->out) +
 		     ((uint32_t)k * sizeof(struct spdk_cpcs_builtin_topk_record));
 	async_ctx->out_buf = calloc(1, output_len);
+
+	/* Batched metadata scan; stride was validated to hold a full record. */
+	async_ctx->batch_capacity =
+		CPCS_BUILTIN_META_BATCH_BYTES / from_le32(&req->metadata_stride);
+	if (async_ctx->batch_capacity == 0) {
+		async_ctx->batch_capacity = 1;
+	}
+	async_ctx->batch = calloc(async_ctx->batch_capacity,
+				  from_le32(&req->metadata_stride));
+
 	if (async_ctx->entries == NULL || async_ctx->vector_buf == NULL ||
-	    async_ctx->out_buf == NULL) {
+	    async_ctx->out_buf == NULL || async_ctx->batch == NULL) {
 		free(async_ctx->entries);
 		free(async_ctx->vector_buf);
 		free(async_ctx->out_buf);
+		free(async_ctx->batch);
 		free(async_ctx);
 		return -ENOMEM;
 	}
