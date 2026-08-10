@@ -5143,12 +5143,12 @@ _cpcs_builtin_reduce_apply_sg(struct cpcs_builtin_async_exec_ctx *ctx,
 /*
  * Zero-copy fast-path reducer for SUM64/MAX64/MIN64: reduces the whole
  * uint64 array in one pass over a direct SLM pointer, no SG pin/unpin and
- * no chunk loop. SUM64 uses 4 independent accumulators to hide add latency
- * (same rationale as the AVX2 helpers above, :285-289) -- unsigned 64-bit
- * addition wraps modulo 2^64, which is associative/commutative, so the
- * split-accumulator result is bit-identical to the single-accumulator
- * chunked path regardless of grouping. MAX64/MIN64 are order-independent
- * for the same reason. Caller guarantees n >= 1.
+ * no chunk loop. SUM64/MAX64/MIN64 all use 4 independent accumulators to hide
+ * operation latency (same rationale as the AVX2 helpers above, :285-289) --
+ * unsigned 64-bit addition wraps modulo 2^64 (associative/commutative), and
+ * max/min are order-independent. The split-accumulator result is bit-identical
+ * to the single-accumulator chunked path regardless of grouping. Caller
+ * guarantees n >= 1.
  */
 static void
 _cpcs_builtin_reduce_apply_direct(uint16_t pind, const uint64_t *vals, size_t n,
@@ -5172,27 +5172,39 @@ _cpcs_builtin_reduce_apply_direct(uint16_t pind, const uint64_t *vals, size_t n,
 		break;
 	}
 	case CPCS_BUILTIN_PIND_MAX64: {
-		uint64_t max_v = vals[0];
+		uint64_t max0 = vals[0], max1 = vals[0], max2 = vals[0], max3 = vals[0];
 		size_t i;
 
-		for (i = 1; i < n; i++) {
-			if (vals[i] > max_v) {
-				max_v = vals[i];
-			}
+		for (i = 1; i + 3 < n; i += 4) {
+			if (vals[i]     > max0) max0 = vals[i];
+			if (vals[i + 1] > max1) max1 = vals[i + 1];
+			if (vals[i + 2] > max2) max2 = vals[i + 2];
+			if (vals[i + 3] > max3) max3 = vals[i + 3];
 		}
-		*out_value = max_v;
+		for (; i < n; i++) {
+			if (vals[i] > max0) max0 = vals[i];
+		}
+		max1 = max1 > max2 ? max1 : max2;
+		max3 = max3 > max0 ? max3 : max0;
+		*out_value = max1 > max3 ? max1 : max3;
 		break;
 	}
 	case CPCS_BUILTIN_PIND_MIN64: {
-		uint64_t min_v = vals[0];
+		uint64_t min0 = vals[0], min1 = vals[0], min2 = vals[0], min3 = vals[0];
 		size_t i;
 
-		for (i = 1; i < n; i++) {
-			if (vals[i] < min_v) {
-				min_v = vals[i];
-			}
+		for (i = 1; i + 3 < n; i += 4) {
+			if (vals[i]     < min0) min0 = vals[i];
+			if (vals[i + 1] < min1) min1 = vals[i + 1];
+			if (vals[i + 2] < min2) min2 = vals[i + 2];
+			if (vals[i + 3] < min3) min3 = vals[i + 3];
 		}
-		*out_value = min_v;
+		for (; i < n; i++) {
+			if (vals[i] < min0) min0 = vals[i];
+		}
+		min1 = min1 < min2 ? min1 : min2;
+		min3 = min3 < min0 ? min3 : min0;
+		*out_value = min1 < min3 ? min1 : min3;
 		break;
 	}
 	default:
