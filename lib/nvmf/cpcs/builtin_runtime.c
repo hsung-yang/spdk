@@ -68,9 +68,19 @@ struct cs_direct_ns_desc {
 	uint32_t nsid;        /* NVMe namespace ID to read from */
 	uint32_t n_uint64;     /* number of uint64 elements to process */
 	uint64_t lba_offset;  /* starting byte offset into the namespace */
-	uint8_t  workload;    /* 0=SUM, 1=MAX, 2=MIN, 3=FILTER_GT, 4=DOT_PRODUCT */
+	uint8_t  workload;    /* 0=SUM 1=MAX 2=MIN 3=FILTER_GT 4=DOT 5=L2_SQ
+			       * 6=COSINE 7=MULTI_AGG64 8=RLE_COMPRESS */
 	uint8_t  pad[7];      /* reserved, must be zero */
 	uint64_t threshold;   /* FILTER_GT comparison value; zero otherwise */
+	/*
+	 * Output memory range, filled in by the host library. The Execute data
+	 * buffer is host->controller only, so results are written here instead.
+	 * Must stay byte-identical to cs_direct_ns_desc in libcs/include/cs_api.h.
+	 */
+	uint64_t output_mr_id;
+	uint64_t output_offset;
+	uint32_t output_length;
+	uint32_t pad2;
 };
 
 /*
@@ -96,6 +106,16 @@ struct cs_direct_ns_result {
  */
 #define CS_DIRECT_NS_WORKLOAD_L2_DISTANCE_SQ    5
 #define CS_DIRECT_NS_WORKLOAD_COSINE_SIMILARITY 6
+#define CS_DIRECT_NS_WORKLOAD_MULTI_AGG64       7
+#define CS_DIRECT_NS_WORKLOAD_RLE_COMPRESS      8
+
+/* Output for MULTI_AGG64 (32 bytes) -- four aggregates in one pass. */
+struct cs_direct_ns_multi_result {
+	uint64_t count;
+	uint64_t sum;
+	uint64_t min;
+	uint64_t max;
+};
 
 static inline bool
 _cs_direct_ns_is_vector_workload(uint8_t w)
@@ -3818,6 +3838,17 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	uint64_t agg = 0;
 	uint64_t count = 0;
 	bool initialized = false;
+	/* MULTI_AGG64 state (sum lands in agg). */
+	uint64_t multi_min = 0;
+	uint64_t multi_max = 0;
+	/* RLE_COMPRESS state: runs carry across streamed chunks. */
+	uint8_t *rle_out = NULL;
+	uint64_t rle_cap = 0;
+	uint64_t rle_used = 0;
+	uint64_t rle_run_val = 0;
+	uint64_t rle_run_len = 0;
+	bool rle_have_run = false;
+	bool rle_overflow = false;
 	size_t i;
 	size_t n;
 	int rc;
@@ -3858,7 +3889,12 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		void *zc = NULL;
 
 		rc = bdev_slm_get_buffer_ptr_by_bdev(bdev, offset, total_bytes, &zc);
-		if (rc == 0 && zc != NULL) {
+		/*
+		 * RLE emits a byte stream rather than a scalar, and its runs carry
+		 * across chunk boundaries, so it is handled solely by the streaming
+		 * loop below instead of being duplicated here.
+		 */
+		if (rc == 0 && zc != NULL && desc->workload != CS_DIRECT_NS_WORKLOAD_RLE_COMPRESS) {
 			if (_cs_direct_ns_is_vector_workload(desc->workload)) {
 				const float *fvals = (const float *)zc;
 				double dp = 0.0, norm_a = 0.0, norm_b = 0.0, final;
@@ -3910,6 +3946,18 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 				}
 				break;
 			}
+			case CS_DIRECT_NS_WORKLOAD_MULTI_AGG64:
+				for (i = 0; i < n; i++) {
+					agg += p[i];
+					if (!initialized || p[i] < multi_min) {
+						multi_min = p[i];
+					}
+					if (!initialized || p[i] > multi_max) {
+						multi_max = p[i];
+					}
+					initialized = true;
+				}
+				break;
 			default:
 				return -SPDK_NVME_SC_INVALID_FIELD;
 			}
@@ -4026,9 +4074,21 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		goto write_result;
 	}
 
+	if (desc->workload == CS_DIRECT_NS_WORKLOAD_RLE_COMPRESS) {
+		rle_cap = desc->output_length;
+		if (rle_cap < 16) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+		rle_out = calloc(1, rle_cap);
+		if (rle_out == NULL) {
+			return -ENOMEM;
+		}
+	}
+
 	/* DMA-safe: bdev_slm_read_by_bdev() may issue real backing-device I/O. */
 	buf = spdk_dma_malloc(CPCS_BUILTIN_EXT_IO_CHUNK, 4096, NULL);
 	if (buf == NULL) {
+		free(rle_out);
 		return -ENOMEM;
 	}
 
@@ -4051,6 +4111,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 					    desc->nsid, offset + processed, chunk, rc);
 			}
 			spdk_dma_free(buf);
+			free(rle_out);
 			if (rc == -ENOENT || rc == -ENOTSUP) {
 				return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
 			}
@@ -4095,8 +4156,53 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			}
 			break;
 		}
+		case CS_DIRECT_NS_WORKLOAD_MULTI_AGG64:
+			for (i = 0; i < n; i++) {
+				agg += p[i];
+				if (!initialized || p[i] < multi_min) {
+					multi_min = p[i];
+				}
+				if (!initialized || p[i] > multi_max) {
+					multi_max = p[i];
+				}
+				initialized = true;
+			}
+			break;
+		case CS_DIRECT_NS_WORKLOAD_RLE_COMPRESS:
+			/*
+			 * Runs are (length, value) uint64 pairs and may span chunk
+			 * boundaries, so the open run is carried in rle_run_* and only
+			 * flushed when the value changes or the input ends.
+			 */
+			for (i = 0; i < n; i++) {
+				if (rle_have_run && p[i] == rle_run_val) {
+					rle_run_len++;
+					continue;
+				}
+				if (rle_have_run) {
+					if (rle_used + 16 > rle_cap) {
+						rle_overflow = true;
+						break;
+					}
+					memcpy(rle_out + rle_used, &rle_run_len, 8);
+					memcpy(rle_out + rle_used + 8, &rle_run_val, 8);
+					rle_used += 16;
+				}
+				rle_run_val = p[i];
+				rle_run_len = 1;
+				rle_have_run = true;
+			}
+			if (rle_overflow) {
+				spdk_dma_free(buf);
+				free(rle_out);
+				SPDK_ERRLOG("DIRECT_NS_AGG: RLE output range too small (%" PRIu64 " bytes)\n",
+					    rle_cap);
+				return -SPDK_NVME_SC_INVALID_FIELD;
+			}
+			break;
 		default:
 			spdk_dma_free(buf);
+			free(rle_out);
 			return -SPDK_NVME_SC_INVALID_FIELD;
 		}
 
@@ -4107,19 +4213,66 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	spdk_dma_free(buf);
 
 write_result:
+	/*
+	 * The Execute data buffer is host->controller only (the xNVMe SPDK
+	 * backend builds a unidirectional SGL for xnvme_cmd_pass()), so results
+	 * are written to the output memory range the host supplied. cdw0/cdw1
+	 * still carries the scalar so existing callers keep working, but it is
+	 * only 64 bits wide -- MULTI_AGG64 and RLE_COMPRESS exist because of the
+	 * range, not in spite of it.
+	 */
+	if (desc->workload == CS_DIRECT_NS_WORKLOAD_RLE_COMPRESS) {
+		/* Flush the final open run. */
+		if (rle_have_run) {
+			if (rle_used + 16 > rle_cap) {
+				free(rle_out);
+				SPDK_ERRLOG("DIRECT_NS_AGG: RLE output range too small\n");
+				return -SPDK_NVME_SC_INVALID_FIELD;
+			}
+			memcpy(rle_out + rle_used, &rle_run_len, 8);
+			memcpy(rle_out + rle_used + 8, &rle_run_val, 8);
+			rle_used += 16;
+		}
+		rc = _cpcs_exec_write_range_sync(ctx, desc->output_mr_id,
+						 desc->output_offset, rle_used, rle_out);
+		free(rle_out);
+		if (rc != 0) {
+			return rc;
+		}
+		SPDK_DEBUGLOG(nvmf_cpcs, "DIRECT_NS_AGG RLE: %" PRIu64 " -> %" PRIu64 " bytes\n",
+			      total_bytes, rle_used);
+		*return_value = rle_used;
+		return 0;
+	}
+
+	if (desc->workload == CS_DIRECT_NS_WORKLOAD_MULTI_AGG64) {
+		struct cs_direct_ns_multi_result multi;
+
+		multi.count = count;
+		multi.sum   = agg;
+		multi.min   = initialized ? multi_min : 0;
+		multi.max   = initialized ? multi_max : 0;
+		rc = _cpcs_exec_write_range_sync(ctx, desc->output_mr_id,
+						 desc->output_offset, sizeof(multi), &multi);
+		if (rc != 0) {
+			return rc;
+		}
+		*return_value = agg;
+		return 0;
+	}
+
 	result.result = agg;
 	result.count  = count;
 
 	SPDK_DEBUGLOG(nvmf_cpcs, "DIRECT_NS_AGG complete: result=%" PRIu64 " count=%" PRIu64 "\n",
 		      result.result, result.count);
 
-	/*
-	 * Return the aggregation result via *return_value (cdw0/cdw1 in the
-	 * completion queue entry) rather than writing it back to the data
-	 * buffer. The xNVMe SPDK backend sets up a unidirectional SGL for
-	 * xnvme_cmd_pass(), so device->host writes to the data buffer are
-	 * silently dropped. cdw0/cdw1 is always delivered reliably.
-	 */
+	rc = _cpcs_exec_write_range_sync(ctx, desc->output_mr_id,
+					 desc->output_offset, sizeof(result), &result);
+	if (rc != 0) {
+		return rc;
+	}
+
 	*return_value = result.result;
 	return 0;
 }
