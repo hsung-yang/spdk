@@ -951,6 +951,52 @@ _cpcs_exec_read_range_sync(const struct cpcs_exec_context *ctx,
 }
 
 /*
+ * DIRECT_NS_AGG's streaming read loop already has a resolved struct
+ * spdk_bdev * (via _cpcs_find_bdev_by_nsid(), not an MRS mr_id), so it cannot
+ * go through _cpcs_exec_resolve_range()/_cpcs_exec_read_range_sync() above.
+ * It still needs the same "poll this SPDK thread until the async SLM read
+ * completes" pattern though: the plain bdev_slm_read_by_bdev() blocks on a
+ * cross-thread condvar that nothing can ever signal from the very reactor
+ * thread that would be running this code, so vbdev_slm.c's sync guard
+ * rejects it outright (SPDK_WARNLOG "disallowed on SPDK thread", rc=-11/
+ * -EWOULDBLOCK). Unlike _cpcs_exec_read_range_sync(), this helper hands back
+ * the raw provider errno (-ENOTSUP/-ENOENT/-EINVAL) rather than a
+ * cpcs_builtin_map_slm_status()-translated NVMe status code, because the
+ * DIRECT_NS_AGG callers already branch on those raw values for their own
+ * diagnostics/status mapping.
+ */
+static void
+_cpcs_direct_ns_read_done(void *cb_arg, int status)
+{
+	struct cpcs_builtin_sync_wait_ctx *wait_ctx = cb_arg;
+
+	wait_ctx->status = status;
+	wait_ctx->done = true;
+}
+
+static int
+_cpcs_direct_ns_read_sync(struct spdk_bdev *bdev, uint64_t offset, uint64_t len, void *buf)
+{
+	struct cpcs_builtin_sync_wait_ctx wait_ctx = {};
+	int rc;
+
+	if (len != 0 && buf == NULL) {
+		return -EINVAL;
+	}
+
+	if (spdk_get_thread() != NULL) {
+		rc = bdev_slm_exec_read_by_bdev_async(bdev, offset, len, buf,
+						      _cpcs_direct_ns_read_done, &wait_ctx);
+		if (rc != 0) {
+			return rc;
+		}
+		return _cpcs_builtin_sync_wait(&wait_ctx);
+	}
+
+	return bdev_slm_exec_read_by_bdev(bdev, offset, len, buf);
+}
+
+/*
  * Zero-copy hatch for the read-only extended builtins: resolve an MRS range to
  * a direct pointer into the memory-namespace backing store. pSLM is host-DRAM
  * backed and hands back a live pointer into its flat buffer, so the compute
@@ -3822,9 +3868,10 @@ rle_emit:
 /*
  * DIRECT_NS_AGG reads straight from a CSD-local NVMe namespace (identified
  * by nsid in the descriptor) rather than through an MRS/SLM range, so it
- * bypasses _cpcs_exec_read_range_sync entirely and calls bdev_slm_read_by_bdev
- * directly against the resolved bdev. Reuses the existing nsid->bdev lookup
- * helper (_cpcs_find_bdev_by_nsid) rather than duplicating it.
+ * bypasses _cpcs_exec_read_range_sync entirely and calls
+ * _cpcs_direct_ns_read_sync directly against the resolved bdev. Reuses the
+ * existing nsid->bdev lookup helper (_cpcs_find_bdev_by_nsid) rather than
+ * duplicating it.
  */
 static int
 _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *return_value)
@@ -3998,11 +4045,11 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
 				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 			}
-			rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf_a + processed);
+			rc = _cpcs_direct_ns_read_sync(bdev, offset + processed, chunk, buf_a + processed);
 			if (rc != 0) {
 				if (rc == -ENOTSUP) {
 					/*
-					 * bdev_slm_read_by_bdev() returns -ENOTSUP for bdevs with
+					 * _cpcs_direct_ns_read_sync() returns -ENOTSUP for bdevs with
 					 * no SLM backing (i.e. desc->nsid names a plain NVMe
 					 * namespace, not an SLM one) -- fail fast with a
 					 * diagnostic so the nsid mismatch is obvious.
@@ -4012,7 +4059,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 						    " not a plain NVMe namespace. Check host-side nsid argument.\n",
 						    spdk_bdev_get_name(bdev), desc->nsid);
 				} else {
-					SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+					SPDK_ERRLOG("DIRECT_NS_AGG: SLM read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
 						    desc->nsid, offset + processed, chunk, rc);
 				}
 				spdk_dma_free(buf_a);
@@ -4043,9 +4090,9 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 				chunk -= chunk % sizeof(float);
 			}
-			rc = bdev_slm_read_by_bdev(bdev, offset + half_bytes + processed, chunk, buf_b);
+			rc = _cpcs_direct_ns_read_sync(bdev, offset + half_bytes + processed, chunk, buf_b);
 			if (rc != 0) {
-				SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+				SPDK_ERRLOG("DIRECT_NS_AGG: SLM read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
 					    desc->nsid, offset + half_bytes + processed, chunk, rc);
 				spdk_dma_free(buf_b);
 				spdk_dma_free(buf_a);
@@ -4102,7 +4149,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		}
 		chunk -= chunk % sizeof(uint64_t);
 
-		rc = bdev_slm_read_by_bdev(bdev, offset + processed, chunk, buf);
+		rc = _cpcs_direct_ns_read_sync(bdev, offset + processed, chunk, buf);
 		if (rc != 0) {
 			if (rc == -ENOTSUP) {
 				SPDK_ERRLOG("DIRECT_NS_AGG: bdev=%s nsid=%u has no SLM backing."
@@ -4110,7 +4157,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 					    " not a plain NVMe namespace. Check host-side nsid argument.\n",
 					    spdk_bdev_get_name(bdev), desc->nsid);
 			} else {
-				SPDK_ERRLOG("DIRECT_NS_AGG: bdev_slm_read_by_bdev failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+				SPDK_ERRLOG("DIRECT_NS_AGG: SLM read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
 					    desc->nsid, offset + processed, chunk, rc);
 			}
 			spdk_dma_free(buf);
