@@ -85,7 +85,10 @@ struct cs_direct_ns_desc {
 
 /*
  * Direct namespace aggregation result (16 bytes).
- * Written back into the data buffer just past the descriptor.
+ * Delivered to the host via the output memory range named by
+ * cs_direct_ns_desc.output_mr_id/output_offset (SLM Memory Read), not
+ * written into the data buffer -- Execute's data buffer is host->controller
+ * only, so a device->host write there would be silently dropped.
  */
 struct cs_direct_ns_result {
 	uint64_t result; /* aggregation result (SUM/MAX/MIN value, FILTER_GT count, or DOT_PRODUCT double bit-pattern) */
@@ -3853,7 +3856,7 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 	size_t n;
 	int rc;
 
-	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc) + sizeof(result)) {
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
