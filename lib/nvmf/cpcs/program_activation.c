@@ -88,12 +88,14 @@ cpcs_program_activate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 			return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
 		}
 
-		rc = ops->init(prog);
-		if (rc != 0) {
-			pthread_mutex_lock(&ns->lock);
-			prog->state = CPCS_PROGRAM_STATE_LOADED;
-			pthread_mutex_unlock(&ns->lock);
-			return rc;
+		if (ops->init) {
+			rc = ops->init(prog);
+			if (rc != 0) {
+				pthread_mutex_lock(&ns->lock);
+				prog->state = CPCS_PROGRAM_STATE_LOADED;
+				pthread_mutex_unlock(&ns->lock);
+				return rc;
+			}
 		}
 	}
 

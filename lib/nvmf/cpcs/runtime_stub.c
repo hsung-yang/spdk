@@ -100,11 +100,20 @@ stub_execute(struct cpcs_program *prog,
 		return -EINVAL;
 	}
 
-	/* Stub: Return success with dummy value */
-	/* Real implementation would execute eBPF bytecode */
-	done_cb(cb_arg, 0, 0);
-
-	SPDK_DEBUGLOG(nvmf_cpcs, "Stub runtime executed program %u\n", prog->pind);
+	/*
+	 * This runtime is only ever reached as the wildcard (ptype=0xFF)
+	 * fallback for program types with no real runtime registered (see
+	 * g_stub_runtime below and cpcs_runtime_get()'s wildcard search) --
+	 * no legitimate program type is expected to execute here. Faking a
+	 * SUCCESS/0 completion would be indistinguishable from the device
+	 * having actually computed 0, which violates this project's
+	 * benchmark fairness rule. Fail with the CPCS "invalid program
+	 * type" status instead of fabricating a result.
+	 */
+	SPDK_ERRLOG("Stub runtime has no real implementation for program %u (type %u); "
+		    "refusing to fake a successful execution\n",
+		    prog->pind, rt_ctx->ptype);
+	done_cb(cb_arg, -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_TYPE, 0);
 	return 0;
 }
 

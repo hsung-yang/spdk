@@ -251,6 +251,7 @@ rpc_cpcs_program_list(struct spdk_jsonrpc_request *request,
 	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_array_begin(w);
 
+	pthread_mutex_lock(&ns->lock);
 	for (i = 0; i < ns->max_programs; i++) {
 		struct cpcs_program *prog = ns->programs[i];
 		if (prog && prog->peocc != SPDK_NVME_CPCS_PEOCC_EMPTY) {
@@ -265,6 +266,7 @@ rpc_cpcs_program_list(struct spdk_jsonrpc_request *request,
 			spdk_json_write_object_end(w);
 		}
 	}
+	pthread_mutex_unlock(&ns->lock);
 
 	spdk_json_write_array_end(w);
 	spdk_jsonrpc_end_result(request, w);
@@ -494,6 +496,7 @@ rpc_cpcs_mrs_list(struct spdk_jsonrpc_request *request,
 	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_array_begin(w);
 
+	pthread_mutex_lock(&ns->lock);
 	TAILQ_FOREACH(mrs, &ns->mrs_list, link) {
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "rsid", mrs->rsid);
@@ -501,6 +504,7 @@ rpc_cpcs_mrs_list(struct spdk_jsonrpc_request *request,
 		spdk_json_write_named_uint32(w, "ref_count", mrs->ref_count);
 		spdk_json_write_object_end(w);
 	}
+	pthread_mutex_unlock(&ns->lock);
 
 	spdk_json_write_array_end(w);
 	spdk_jsonrpc_end_result(request, w);

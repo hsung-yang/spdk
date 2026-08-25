@@ -2019,7 +2019,12 @@ _cpcs_builtin_kv_encode_lossless(const uint8_t *in, uint64_t in_len,
 		return -EINVAL;
 	}
 
-	max_runs = (in_len / UINT16_MAX) + 1;
+	/*
+	 * Worst case is one run per input byte (e.g. alternating zero/non-zero
+	 * bytes), not one run per 64 KiB: each byte can start a new 3-byte run
+	 * header, so max_runs must be bounded by in_len, not in_len/UINT16_MAX.
+	 */
+	max_runs = in_len;
 	if (max_runs > ((UINT64_MAX - sizeof(hdr)) / 3)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}

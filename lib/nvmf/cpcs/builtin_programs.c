@@ -120,14 +120,27 @@ _install_one_builtin(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 	prog->pit = SPDK_NVME_CPCS_PIT_PUID;
 	prog->puid = puid;
 	prog->peocc = SPDK_NVME_CPCS_PEOCC_DEVICE_DEFINED;
-	/* TODO: default activation state for device-defined programs is unspecified. */
-	prog->state = CPCS_PROGRAM_STATE_ACTIVATED;
-	prog->activated = true;
 	prog->ns = ns;
+
+	/* TODO: default activation state for device-defined programs is unspecified. */
+	if (ns->max_activated > 0 && ns->num_activated >= ns->max_activated) {
+		/* Namespace's max-activated limit is too low to activate every
+		 * built-in. Install it loaded-but-inactive rather than silently
+		 * exceeding the limit, so num_activated (and the maxact field
+		 * Identify reports) stay honest; the host can activate it later
+		 * if room frees up. */
+		SPDK_WARNLOG("Built-in program PIND %u installed but not activated: "
+			     "max_activated (%u) already reached\n", pind, ns->max_activated);
+		prog->state = CPCS_PROGRAM_STATE_LOADED;
+		prog->activated = false;
+	} else {
+		prog->state = CPCS_PROGRAM_STATE_ACTIVATED;
+		prog->activated = true;
+		ns->num_activated++;
+	}
 
 	ns->programs[pind] = prog;
 	ns->num_programs++;
-	ns->num_activated++;
 
 	return 0;
 }

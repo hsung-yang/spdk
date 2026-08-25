@@ -333,7 +333,12 @@ cpcs_program_validate(struct cpcs_program *prog)
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
 	}
 
-	if (!prog->data || prog->loaded_bytes != prog->total_size) {
+	/* Device-defined programs (built-ins, RPC-installed passthrough) are
+	 * compiled-in / identified purely by PIND and never carry host-loaded
+	 * data, so the data-presence check only applies to host-loaded
+	 * programs. */
+	if (prog->peocc != SPDK_NVME_CPCS_PEOCC_DEVICE_DEFINED &&
+	    (!prog->data || prog->loaded_bytes != prog->total_size)) {
 		return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
 	}
 
