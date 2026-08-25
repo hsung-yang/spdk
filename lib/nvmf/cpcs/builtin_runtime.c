@@ -1174,50 +1174,62 @@ _cpcs_builtin_meta_get_f32(const struct cpcs_builtin_metadata_record *meta,
 	return 0;
 }
 
-static bool
+static int
 _cpcs_builtin_filter_u32_match(uint8_t op, uint32_t value,
-			       const struct spdk_cpcs_builtin_eval_filter_clause *clause)
+			       const struct spdk_cpcs_builtin_eval_filter_clause *clause,
+			       bool *match_out)
 {
 	uint32_t i;
 
 	switch (op) {
 	case SPDK_CPCS_BUILTIN_FILTER_EQ_U32:
-		return value == from_le32(&clause->args[0]);
+		*match_out = value == from_le32(&clause->args[0]);
+		return 0;
 	case SPDK_CPCS_BUILTIN_FILTER_IN_SET_U32:
 		if (clause->in_count == 0 || clause->in_count > SPDK_COUNTOF(clause->args)) {
-			return false;
+			return -SPDK_NVME_SC_INVALID_FIELD;
 		}
 		for (i = 0; i < clause->in_count; i++) {
 			if (value == from_le32(&clause->args[i])) {
-				return true;
+				*match_out = true;
+				return 0;
 			}
 		}
-		return false;
+		*match_out = false;
+		return 0;
 	case SPDK_CPCS_BUILTIN_FILTER_BITMASK_ANY:
-		return (value & from_le32(&clause->args[0])) != 0;
+		*match_out = (value & from_le32(&clause->args[0])) != 0;
+		return 0;
 	case SPDK_CPCS_BUILTIN_FILTER_RANGE_U32: {
 		uint32_t min_v = from_le32(&clause->args[0]);
 		uint32_t max_v = from_le32(&clause->args[1]);
-		return value >= min_v && value <= max_v;
+		*match_out = value >= min_v && value <= max_v;
+		return 0;
 	}
 	default:
-		return false;
+		/* Unsupported op (including a float-only op like RANGE_F32 applied
+		 * to an integer field) is an invalid request, not "no match". */
+		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 }
 
-static bool
+static int
 _cpcs_builtin_filter_f32_match(uint8_t op, float value,
-			       const struct spdk_cpcs_builtin_eval_filter_clause *clause)
+			       const struct spdk_cpcs_builtin_eval_filter_clause *clause,
+			       bool *match_out)
 {
 	float min_v, max_v;
 
 	if (op != SPDK_CPCS_BUILTIN_FILTER_RANGE_F32) {
-		return false;
+		/* Only RANGE_F32 is defined for float fields; anything else
+		 * (including an int-only op) is an invalid request. */
+		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
 	min_v = _cpcs_f32_from_u32(from_le32(&clause->args[0]));
 	max_v = _cpcs_f32_from_u32(from_le32(&clause->args[1]));
-	return value >= min_v && value <= max_v;
+	*match_out = value >= min_v && value <= max_v;
+	return 0;
 }
 
 static int
@@ -1238,16 +1250,14 @@ _cpcs_builtin_filter_match_one(const struct cpcs_builtin_metadata_record *meta,
 		if (rc != 0) {
 			return rc;
 		}
-		*match_out = _cpcs_builtin_filter_f32_match(clause->op, f32_value, clause);
-		return 0;
+		return _cpcs_builtin_filter_f32_match(clause->op, f32_value, clause, match_out);
 	}
 
 	rc = _cpcs_builtin_meta_get_u32(meta, clause->field_id, &u32_value);
 	if (rc != 0) {
 		return rc;
 	}
-	*match_out = _cpcs_builtin_filter_u32_match(clause->op, u32_value, clause);
-	return 0;
+	return _cpcs_builtin_filter_u32_match(clause->op, u32_value, clause, match_out);
 }
 
 static int
@@ -1334,6 +1344,24 @@ _cpcs_builtin_score_l2(const float *query, const float *vector, uint32_t dim, bo
 static bool
 _cpcs_builtin_topk_better(float score_a, uint64_t doc_id_a, float score_b, uint64_t doc_id_b)
 {
+	bool nan_a = isnan(score_a);
+	bool nan_b = isnan(score_b);
+
+	/*
+	 * NaN scores are treated as the worst possible value (a total order,
+	 * not the IEEE 754 "unordered" relation) so the comparator stays
+	 * transitive for qsort and a NaN score can never survive in the top-K
+	 * over a legitimate score, nor become permanently un-evictable.
+	 */
+	if (nan_a && nan_b) {
+		return doc_id_a < doc_id_b;
+	}
+	if (nan_a) {
+		return false;
+	}
+	if (nan_b) {
+		return true;
+	}
 	if (score_a > score_b) {
 		return true;
 	}
@@ -4443,9 +4471,11 @@ _cpcs_builtin_filter_agg_apply_record(const struct spdk_cpcs_builtin_filter_agg_
 			if (rc != 0) {
 				return rc;
 			}
-			if (!*aggregate_initialized ||
-			    (req->agg_op == SPDK_CPCS_BUILTIN_AGG_MIN && field_f32 < *aggregate_f64) ||
-			    (req->agg_op == SPDK_CPCS_BUILTIN_AGG_MAX && field_f32 > *aggregate_f64)) {
+			/* A NaN field value cannot participate in MIN/MAX (skip, don't record it). */
+			if (!isnan(field_f32) &&
+			    (!*aggregate_initialized ||
+			     (req->agg_op == SPDK_CPCS_BUILTIN_AGG_MIN && field_f32 < *aggregate_f64) ||
+			     (req->agg_op == SPDK_CPCS_BUILTIN_AGG_MAX && field_f32 > *aggregate_f64))) {
 				*aggregate_f64 = field_f32;
 				*aggregate_initialized = true;
 			}

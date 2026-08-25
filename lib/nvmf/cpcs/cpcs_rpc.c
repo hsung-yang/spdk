@@ -86,6 +86,22 @@ rpc_cpcs_ns_create(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
+	/*
+	 * max_ranges_per_mrs (MAXMEMR) is a uint8_t on the wire (the NVMe CPCS
+	 * Identify Namespace Data structure defines it as a single byte,
+	 * nvme_cpcs_spec.h) and in spdk_nvmf_cpcs_ns_opts/spdk_nvmf_cpcs_ns.
+	 * The RPC parameter is decoded as uint16_t, so reject anything that
+	 * would silently truncate on assignment instead of letting it through.
+	 */
+	if (req.max_ranges_per_mrs > UINT8_MAX) {
+		SPDK_ERRLOG("max_ranges_per_mrs %u exceeds maximum %u\n",
+			    req.max_ranges_per_mrs, UINT8_MAX);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "max_ranges_per_mrs %u exceeds maximum %u",
+						     req.max_ranges_per_mrs, UINT8_MAX);
+		goto cleanup;
+	}
+
 	/* Initialize options with defaults */
 	spdk_nvmf_cpcs_ns_opts_init(&opts);
 	opts.nsid = req.nsid;
@@ -396,6 +412,14 @@ rpc_cpcs_program_install_passthrough(struct spdk_jsonrpc_request *request,
 		SPDK_ERRLOG("PIND %u exceeds max_programs\n", req.pind);
 		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						      "PIND %u exceeds max_programs", req.pind);
+		goto cleanup;
+	}
+
+	if (cpcs_program_index_is_builtin((uint16_t)req.pind)) {
+		SPDK_ERRLOG("PIND %u is reserved for a built-in program\n", req.pind);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						      "PIND %u is reserved for a built-in program",
+						      req.pind);
 		goto cleanup;
 	}
 

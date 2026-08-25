@@ -159,16 +159,14 @@ cpcs_program_deactivate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 		return -SPDK_NVME_CPCS_SC_PROGRAM_IN_USE;
 	}
 
-	pthread_mutex_unlock(&ns->lock);
-
-	/* Deactivate runtime */
-	ops = cpcs_runtime_get(prog->ptype);
-	if (ops && ops->deactivate) {
-		ops->deactivate(prog);
-	}
-
-	pthread_mutex_lock(&ns->lock);
-	prog->state = CPCS_PROGRAM_STATE_LOADED;
+	/*
+	 * Clear `activated` now, still under the lock, before dropping it to
+	 * call ops->deactivate() below. cpcs_execute_run() re-checks `activated`
+	 * under this same lock before admitting a new Execute and bumping
+	 * exec_count -- clearing it here (rather than after the unlocked
+	 * teardown completes) closes the window where a new Execute could be
+	 * admitted into a runtime that is concurrently being torn down.
+	 */
 	if (ns->num_activated == 0) {
 		/* Counter desync: recompute while prog is still marked activated so
 		 * the post-decrement below produces the correct count. */
@@ -179,6 +177,16 @@ cpcs_program_deactivate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 		ns->num_activated--;
 	}
 
+	pthread_mutex_unlock(&ns->lock);
+
+	/* Deactivate runtime */
+	ops = cpcs_runtime_get(prog->ptype);
+	if (ops && ops->deactivate) {
+		ops->deactivate(prog);
+	}
+
+	pthread_mutex_lock(&ns->lock);
+	prog->state = CPCS_PROGRAM_STATE_LOADED;
 	pthread_mutex_unlock(&ns->lock);
 
 	SPDK_NOTICELOG("Deactivated program %u (total activated: %u)\n",
