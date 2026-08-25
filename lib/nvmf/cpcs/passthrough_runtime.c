@@ -156,6 +156,58 @@ _passthrough_forward_chunk(const void *src, void *scratch, uint64_t len)
 	return 0;
 }
 
+struct cpcs_passthrough_read_wait_ctx {
+	bool done;
+	int status;
+};
+
+static void
+_passthrough_read_done(void *cb_arg, int status)
+{
+	struct cpcs_passthrough_read_wait_ctx *wait_ctx = cb_arg;
+
+	wait_ctx->status = status;
+	wait_ctx->done = true;
+}
+
+/*
+ * Sync-looking wrapper over the async SLM read API, mirroring
+ * _cpcs_direct_ns_read_sync() in builtin_runtime.c (added by commit
+ * 2171f9cb4 for the same class of bug). bdev_slm_read_by_bdev() blocks on a
+ * cross-thread condvar that nothing can ever signal when called from the
+ * very SPDK reactor thread that runs passthrough_execute_msg(), so
+ * vbdev_slm.c's sync guard rejects it outright (rc=-11/-EWOULDBLOCK), which
+ * cpcs_status_from_rc() then surfaces to the host as a bare
+ * INTERNAL_DEVICE_ERROR. Submit through the async API instead and
+ * cooperatively poll this thread until the completion callback fires.
+ */
+static int
+_passthrough_slm_read_sync(struct spdk_bdev *bdev, uint64_t offset, uint64_t len, void *buf)
+{
+	struct cpcs_passthrough_read_wait_ctx wait_ctx = {};
+	struct spdk_thread *thread;
+	int rc;
+
+	if (len != 0 && buf == NULL) {
+		return -EINVAL;
+	}
+
+	thread = spdk_get_thread();
+	if (thread != NULL) {
+		rc = bdev_slm_exec_read_by_bdev_async(bdev, offset, len, buf,
+						      _passthrough_read_done, &wait_ctx);
+		if (rc != 0) {
+			return rc;
+		}
+		while (!wait_ctx.done) {
+			spdk_thread_poll(thread, 0, 0);
+		}
+		return wait_ctx.status;
+	}
+
+	return bdev_slm_exec_read_by_bdev(bdev, offset, len, buf);
+}
+
 /*
  * Read from a resolved memory range.  Equivalent in spirit to
  * _cpcs_exec_read_range_sync() in builtin_runtime.c but accessible here
@@ -188,7 +240,7 @@ _passthrough_read_range(const struct cpcs_exec_context *ctx,
 	}
 
 	absolute_offset = mr->starting_byte + off;
-	return bdev_slm_read_by_bdev(mr->bdev, absolute_offset, len, buf);
+	return _passthrough_slm_read_sync(mr->bdev, absolute_offset, len, buf);
 }
 
 /* Descriptor layout matches builtin SUM64: {mr_id(u64), off(u64), len(u64)} */
