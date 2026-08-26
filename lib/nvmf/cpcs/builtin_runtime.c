@@ -3906,6 +3906,21 @@ rle_emit:
  * existing nsid->bdev lookup helper (_cpcs_find_bdev_by_nsid) rather than
  * duplicating it.
  */
+/*
+ * The scalar reduction loops below (SUM/MAX/MIN/FILTER_GT/MULTI_AGG64 over
+ * the zero-copy pSLM pointer) are the dominant cost of DIRECT_NS_AGG once
+ * data movement is removed by zero-copy -- see the ComputationalStorage repo's
+ * sdc/TODO.md, "P1 -- 공정성 감사 잔여 항목" (2026-08-26 addendum), for the
+ * -O2-vs-O3 asymmetry this addresses. The rest of this translation unit stays
+ * at the project-wide SPDK optimization level (-O2, see spdk/mk/spdk.common.mk);
+ * this function alone is compiled at -O3 with the tree vectorizer enabled so
+ * GCC can auto-vectorize these loops (AVX2; AVX-512 is disabled project-wide
+ * for Valgrind compatibility, unaffected by this attribute). Not a global
+ * flag change, so it can't destabilize anything else in the target.
+ */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("O3", "tree-vectorize")))
+#endif
 static int
 _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
