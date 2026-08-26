@@ -10,6 +10,25 @@
 #include "spdk/log.h"
 #include "spdk/nvme_spec.h"
 
+/*
+ * Minimal valid eBPF program: a single `exit 0` instruction (8 bytes).
+ *
+ * The CPCS spec requires a program payload to be present, and the RPC
+ * surface (cpcs_program_list) reports `loaded_bytes` / `total_size`.
+ * Built-in programs never actually execute bytecode -- the builtin
+ * runtime (builtin_runtime.c::g_builtin_runtime) dispatches by PIND
+ * directly to C functions like _builtin_execute_sum64(), with init/
+ * validate/activate all NULL -- so the stub is a formality that keeps
+ * the bookkeeping honest without forcing each builtin to carry a full
+ * bytecode blob.
+ *
+ * Wire format: opcode 0x95 (BPF_EXIT) | dst:src = 0 | offset = 0 | imm = 0.
+ */
+static const uint8_t cpcs_builtin_stub_bytecode[] = {
+	0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+#define CPCS_BUILTIN_STUB_SIZE sizeof(cpcs_builtin_stub_bytecode)
+
 static uint64_t
 _builtin_puid_for_pind(uint16_t pind)
 {
@@ -114,6 +133,26 @@ _install_one_builtin(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 		free(prog);
 		return -rc;
 	}
+
+	/*
+	 * Attach the stub bytecode payload. Cannot go through cpcs_program_load()
+	 * because that path rejects builtins via cpcs_program_index_downloadable()
+	 * (they are device-defined by design, not host-downloadable). The builtin
+	 * runtime never executes this payload -- it dispatches by PIND to C
+	 * functions in builtin_runtime.c -- but prog->data/total_size/loaded_bytes
+	 * must be consistent so cpcs_program_list reports a non-zero payload and
+	 * _cpcs_program_free()/used_program_bytes accounting stay correct.
+	 */
+	prog->data = malloc(CPCS_BUILTIN_STUB_SIZE);
+	if (prog->data == NULL) {
+		pthread_mutex_destroy(&prog->lock);
+		free(prog);
+		return -ENOMEM;
+	}
+	memcpy(prog->data, cpcs_builtin_stub_bytecode, CPCS_BUILTIN_STUB_SIZE);
+	prog->total_size = CPCS_BUILTIN_STUB_SIZE;
+	prog->loaded_bytes = CPCS_BUILTIN_STUB_SIZE;
+	ns->used_program_bytes += CPCS_BUILTIN_STUB_SIZE;
 
 	prog->pind = pind;
 	prog->ptype = SPDK_NVME_CPCS_PTYPE_DEVICE_DEFINED;
