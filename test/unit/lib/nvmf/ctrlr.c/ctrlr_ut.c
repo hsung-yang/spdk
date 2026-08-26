@@ -1237,7 +1237,9 @@ test_get_ns_id_desc_list(void)
 	CU_ASSERT(buf[1] == 8);
 	CU_ASSERT(buf[4] == 0x11);
 	CU_ASSERT(buf[11] == 0xFF);
-	CU_ASSERT(buf[13] == 0);
+	CU_ASSERT(buf[12] == SPDK_NVME_NIDT_CSI);
+	CU_ASSERT(buf[13] == 1);
+	CU_ASSERT(buf[17] == 0);
 
 	/* Valid NSID, only NGUID defined */
 	memset(ns.opts.eui64, 0, sizeof(ns.opts.eui64));
@@ -1251,7 +1253,9 @@ test_get_ns_id_desc_list(void)
 	CU_ASSERT(buf[1] == 16);
 	CU_ASSERT(buf[4] == 0x22);
 	CU_ASSERT(buf[19] == 0xEE);
-	CU_ASSERT(buf[21] == 0);
+	CU_ASSERT(buf[20] == SPDK_NVME_NIDT_CSI);
+	CU_ASSERT(buf[21] == 1);
+	CU_ASSERT(buf[25] == 0);
 
 	/* Valid NSID, both EUI64 and NGUID defined */
 	ns.opts.eui64[0] = 0x11;
@@ -1270,7 +1274,9 @@ test_get_ns_id_desc_list(void)
 	CU_ASSERT(buf[13] == 16);
 	CU_ASSERT(buf[16] == 0x22);
 	CU_ASSERT(buf[31] == 0xEE);
-	CU_ASSERT(buf[33] == 0);
+	CU_ASSERT(buf[32] == SPDK_NVME_NIDT_CSI);
+	CU_ASSERT(buf[33] == 1);
+	CU_ASSERT(buf[37] == 0);
 
 	/* Valid NSID, EUI64, NGUID, and UUID defined */
 	ns.opts.eui64[0] = 0x11;
@@ -1295,7 +1301,9 @@ test_get_ns_id_desc_list(void)
 	CU_ASSERT(buf[33] == 16);
 	CU_ASSERT(buf[36] == 0x33);
 	CU_ASSERT(buf[51] == 0xDD);
-	CU_ASSERT(buf[53] == 0);
+	CU_ASSERT(buf[52] == SPDK_NVME_NIDT_CSI);
+	CU_ASSERT(buf[53] == 1);
+	CU_ASSERT(buf[57] == 0);
 
 	spdk_bit_array_free(&ctrlr.visible_ns);
 }

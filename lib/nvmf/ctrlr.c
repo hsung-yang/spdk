@@ -3494,7 +3494,11 @@ nvmf_ctrlr_identify_ns_id_descriptor_list(
 	ADD_ID_DESC(SPDK_NVME_NIDT_EUI64, ns->opts.eui64, sizeof(ns->opts.eui64));
 	ADD_ID_DESC(SPDK_NVME_NIDT_NGUID, ns->opts.nguid, sizeof(ns->opts.nguid));
 	ADD_ID_DESC(SPDK_NVME_NIDT_UUID, &ns->opts.uuid, sizeof(ns->opts.uuid));
-	ADD_ID_DESC(SPDK_NVME_NIDT_CSI, &ns->csi, sizeof(uint8_t));
+	/* CSI must be reported even when it is 0 (NVM): with CAP.CSS=IOCS the Linux
+	 * host rejects any namespace whose CNS 0x03 list lacks NIDT_CSI
+	 * (drivers/nvme/host/core.c, nvme_identify_ns_descs). ADD_ID_DESC's
+	 * all-zero guard would suppress it for plain-NVM namespaces. */
+	_add_ns_id_desc(&buf_ptr, &buf_remain, SPDK_NVME_NIDT_CSI, &ns->csi, sizeof(uint8_t));
 
 	/*
 	 * The list is automatically 0-terminated, both in the temporary buffer
