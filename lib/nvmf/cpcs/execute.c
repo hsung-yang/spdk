@@ -521,9 +521,19 @@ cpcs_execute_run(struct cpcs_exec_context *ctx)
 	}
 
 	ctx->runtime_pending = true;
-	pthread_mutex_lock(&ctx->program->lock);
+	/*
+	 * Cache the program pointer before the call: if execute_async's
+	 * completion (cpcs_execute_runtime_done, which owns ctx) runs
+	 * synchronously to completion before execute_async returns, ctx (and
+	 * anything reached only through it) may already be freed by the time
+	 * control comes back here. Reading ctx->program for the unlock below
+	 * would then be a use-after-free; prog was captured while ctx was
+	 * still guaranteed live.
+	 */
+	struct cpcs_program *prog = ctx->program;
+	pthread_mutex_lock(&prog->lock);
 	rc = runtime->execute_async(ctx->program, ctx, cpcs_execute_runtime_done, ctx);
-	pthread_mutex_unlock(&ctx->program->lock);
+	pthread_mutex_unlock(&prog->lock);
 	if (rc != 0) {
 		ctx->runtime_pending = false;
 		SPDK_ERRLOG("Program %u async submission failed: %d\n", ctx->program->pind, rc);

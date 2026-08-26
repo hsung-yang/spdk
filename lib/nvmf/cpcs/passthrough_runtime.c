@@ -356,14 +356,36 @@ _passthrough_execute_sum64(struct cpcs_exec_context *ctx, uint64_t *return_value
 	return 0;
 }
 
+/*
+ * Marker-only context: this runtime carries no real per-program state, but
+ * prog->runtime must be non-NULL once initialized. program.c's
+ * cpcs_program_validate() re-runs runtime->init() every time it sees
+ * prog->runtime == NULL (its idempotency guard), and _cpcs_program_free()
+ * only calls runtime->fini() when prog->runtime != NULL — leaving it NULL
+ * here meant init ran on every validate and fini never ran on free. Matches
+ * runtime_stub.c's stub_init()/stub_fini() pattern (also opaque-cast through
+ * struct cpcs_runtime_ctx *) rather than inventing a new idiom.
+ */
+struct cpcs_passthrough_runtime_ctx {
+	uint16_t pind;
+};
+
 static int
 passthrough_init(struct cpcs_program *prog)
 {
+	struct cpcs_passthrough_runtime_ctx *ctx;
+
 	if (prog == NULL) {
 		return -EINVAL;
 	}
-	/* No per-program state for the PoC; runtime context stays NULL. */
-	prog->runtime = NULL;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	ctx->pind = prog->pind;
+
+	prog->runtime = (struct cpcs_runtime_ctx *)ctx;
 	SPDK_DEBUGLOG(nvmf_cpcs, "Passthrough runtime initialized for program %u\n", prog->pind);
 	return 0;
 }
@@ -488,9 +510,13 @@ passthrough_deactivate(struct cpcs_program *prog)
 static void
 passthrough_fini(struct cpcs_program *prog)
 {
+	struct cpcs_passthrough_runtime_ctx *ctx;
+
 	if (prog == NULL) {
 		return;
 	}
+	ctx = (struct cpcs_passthrough_runtime_ctx *)prog->runtime;
+	free(ctx);
 	prog->runtime = NULL;
 	SPDK_DEBUGLOG(nvmf_cpcs, "Passthrough runtime cleaned up program %u\n", prog->pind);
 }

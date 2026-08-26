@@ -213,28 +213,6 @@ cpcs_mrs_delete_all(struct spdk_nvmf_cpcs_ns *ns)
 }
 
 struct cpcs_memory_range_set *
-cpcs_mrs_get(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
-{
-	struct cpcs_memory_range_set *mrs;
-
-	if (!ns) {
-		return NULL;
-	}
-
-	pthread_mutex_lock(&ns->lock);
-
-	TAILQ_FOREACH(mrs, &ns->mrs_list, link) {
-		if (mrs->rsid == rsid) {
-			pthread_mutex_unlock(&ns->lock);
-			return mrs;
-		}
-	}
-
-	pthread_mutex_unlock(&ns->lock);
-	return NULL;
-}
-
-struct cpcs_memory_range_set *
 cpcs_mrs_get_and_acquire(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid)
 {
 	struct cpcs_memory_range_set *mrs;

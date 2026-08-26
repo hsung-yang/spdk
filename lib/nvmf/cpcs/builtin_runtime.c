@@ -4168,8 +4168,11 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		}
 	}
 
-	/* DMA-safe: bdev_slm_read_by_bdev() may issue real backing-device I/O. */
-	buf = spdk_dma_malloc(CPCS_BUILTIN_EXT_IO_CHUNK, 4096, NULL);
+	/* DMA-safe: bdev_slm_read_by_bdev() may issue real backing-device I/O.
+	 * Sized to what this Execute actually needs, not a flat 16 MiB —
+	 * the loop below caps each chunk at CPCS_BUILTIN_EXT_IO_CHUNK, so
+	 * this is always >= every chunk it will be asked to hold. */
+	buf = spdk_dma_malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(total_bytes), 4096, NULL);
 	if (buf == NULL) {
 		free(rle_out);
 		return -ENOMEM;
