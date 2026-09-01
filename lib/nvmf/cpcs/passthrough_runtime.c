@@ -36,6 +36,7 @@ struct cpcs_passthrough_state {
 	struct spdk_bdev                 *backing_bdev;
 	const struct spdk_vbdev_slm_ops  *backing_ops;
 	uint64_t                          backing_capacity;
+	uint64_t                          io_offset;
 };
 
 static struct cpcs_passthrough_state g_passthrough_state;
@@ -131,10 +132,16 @@ _passthrough_forward_chunk(const void *src, void *scratch, uint64_t len)
 
 	pthread_mutex_lock(&g_passthrough_io_lock);
 
+	uint64_t offset = g_passthrough_state.io_offset;
+	if (len > g_passthrough_state.backing_capacity - offset) {
+		offset = 0;
+	}
+	g_passthrough_state.io_offset = offset + len;
+
 	if (ops != NULL) {
-		rc = ops->write_by_bdev(bdev, 0, len, src);
+		rc = ops->write_by_bdev(bdev, offset, len, src);
 	} else {
-		rc = bdev_slm_write_by_bdev(bdev, 0, len, src);
+		rc = bdev_slm_write_by_bdev(bdev, offset, len, src);
 	}
 	if (rc != 0) {
 		pthread_mutex_unlock(&g_passthrough_io_lock);
@@ -143,9 +150,9 @@ _passthrough_forward_chunk(const void *src, void *scratch, uint64_t len)
 	}
 
 	if (ops != NULL) {
-		rc = ops->read_by_bdev(bdev, 0, len, scratch);
+		rc = ops->read_by_bdev(bdev, offset, len, scratch);
 	} else {
-		rc = bdev_slm_read_by_bdev(bdev, 0, len, scratch);
+		rc = bdev_slm_read_by_bdev(bdev, offset, len, scratch);
 	}
 	pthread_mutex_unlock(&g_passthrough_io_lock);
 	if (rc != 0) {
