@@ -382,39 +382,44 @@ struct cpcs_builtin_kv_async_ctx {
 static inline float
 _avx2_dot_product(const float *a, const float *b, size_t n)
 {
-	__m256 sum0 = _mm256_setzero_ps();
-	__m256 sum1 = _mm256_setzero_ps();
-	__m256 sum2 = _mm256_setzero_ps();
-	__m256 sum3 = _mm256_setzero_ps();
+	__m256d sum0 = _mm256_setzero_pd();
+	__m256d sum1 = _mm256_setzero_pd();
+	__m256d sum2 = _mm256_setzero_pd();
+	__m256d sum3 = _mm256_setzero_pd();
 	size_t i = 0;
 
-	for (; i + 31 < n; i += 32) {
-		sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      sum0);
-		sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  sum1);
-		sum2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), sum2);
-		sum3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), sum3);
+	for (; i + 15 < n; i += 16) {
+		__m128 fa0 = _mm_loadu_ps(a + i);
+		__m128 fb0 = _mm_loadu_ps(b + i);
+		__m128 fa1 = _mm_loadu_ps(a + i + 4);
+		__m128 fb1 = _mm_loadu_ps(b + i + 4);
+		__m128 fa2 = _mm_loadu_ps(a + i + 8);
+		__m128 fb2 = _mm_loadu_ps(b + i + 8);
+		__m128 fa3 = _mm_loadu_ps(a + i + 12);
+		__m128 fb3 = _mm_loadu_ps(b + i + 12);
+		sum0 = _mm256_fmadd_pd(_mm256_cvtps_pd(fa0), _mm256_cvtps_pd(fb0), sum0);
+		sum1 = _mm256_fmadd_pd(_mm256_cvtps_pd(fa1), _mm256_cvtps_pd(fb1), sum1);
+		sum2 = _mm256_fmadd_pd(_mm256_cvtps_pd(fa2), _mm256_cvtps_pd(fb2), sum2);
+		sum3 = _mm256_fmadd_pd(_mm256_cvtps_pd(fa3), _mm256_cvtps_pd(fb3), sum3);
 	}
-	for (; i + 7 < n; i += 8) {
-		sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), sum0);
+	for (; i + 3 < n; i += 4) {
+		__m128 va = _mm_loadu_ps(a + i);
+		__m128 vb = _mm_loadu_ps(b + i);
+		sum0 = _mm256_fmadd_pd(_mm256_cvtps_pd(va), _mm256_cvtps_pd(vb), sum0);
 	}
 
-	sum0 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
-	/* Horizontal sum of 8 floats */
+	sum0 = _mm256_add_pd(_mm256_add_pd(sum0, sum1), _mm256_add_pd(sum2, sum3));
 	{
-		__m128 hi = _mm256_extractf128_ps(sum0, 1);
-		__m128 lo = _mm256_castps256_ps128(sum0);
-		__m128 s = _mm_add_ps(lo, hi);
-		float result;
+		__m128d hi = _mm256_extractf128_pd(sum0, 1);
+		__m128d lo = _mm256_castpd256_pd128(sum0);
+		__m128d s = _mm_add_pd(lo, hi);
+		s = _mm_hadd_pd(s, s);
+		double result = _mm_cvtsd_f64(s);
 
-		s = _mm_hadd_ps(s, s);
-		s = _mm_hadd_ps(s, s);
-		result = _mm_cvtss_f32(s);
-
-		/* Scalar tail */
 		for (; i < n; i++) {
-			result += a[i] * b[i];
+			result += (double)a[i] * (double)b[i];
 		}
-		return result;
+		return (float)result;
 	}
 }
 
@@ -422,64 +427,68 @@ static inline void
 _avx2_cosine_accum(const float *a, const float *b, size_t n,
 		   float *out_dot, float *out_norm_a, float *out_norm_b)
 {
-	__m256 dot0 = _mm256_setzero_ps(), dot1 = _mm256_setzero_ps();
-	__m256 na0  = _mm256_setzero_ps(), na1  = _mm256_setzero_ps();
-	__m256 nb0  = _mm256_setzero_ps(), nb1  = _mm256_setzero_ps();
-	__m128 d_hi, d_lo, d, a_hi, a_lo, na, b_hi, b_lo, nb;
-	float dot_s, na_s, nb_s;
+	__m256d dot0 = _mm256_setzero_pd(), dot1 = _mm256_setzero_pd();
+	__m256d na0  = _mm256_setzero_pd(), na1  = _mm256_setzero_pd();
+	__m256d nb0  = _mm256_setzero_pd(), nb1  = _mm256_setzero_pd();
 	size_t i = 0;
 
-	for (; i + 15 < n; i += 16) {
-		__m256 va0 = _mm256_loadu_ps(a + i);
-		__m256 vb0 = _mm256_loadu_ps(b + i);
-		__m256 va1 = _mm256_loadu_ps(a + i + 8);
-		__m256 vb1 = _mm256_loadu_ps(b + i + 8);
-		dot0 = _mm256_fmadd_ps(va0, vb0, dot0);
-		dot1 = _mm256_fmadd_ps(va1, vb1, dot1);
-		na0  = _mm256_fmadd_ps(va0, va0, na0);
-		na1  = _mm256_fmadd_ps(va1, va1, na1);
-		nb0  = _mm256_fmadd_ps(vb0, vb0, nb0);
-		nb1  = _mm256_fmadd_ps(vb1, vb1, nb1);
-	}
 	for (; i + 7 < n; i += 8) {
-		__m256 va = _mm256_loadu_ps(a + i);
-		__m256 vb = _mm256_loadu_ps(b + i);
-		dot0 = _mm256_fmadd_ps(va, vb, dot0);
-		na0  = _mm256_fmadd_ps(va, va, na0);
-		nb0  = _mm256_fmadd_ps(vb, vb, nb0);
+		__m128 fa0 = _mm_loadu_ps(a + i);
+		__m128 fb0 = _mm_loadu_ps(b + i);
+		__m128 fa1 = _mm_loadu_ps(a + i + 4);
+		__m128 fb1 = _mm_loadu_ps(b + i + 4);
+		__m256d da0 = _mm256_cvtps_pd(fa0), db0 = _mm256_cvtps_pd(fb0);
+		__m256d da1 = _mm256_cvtps_pd(fa1), db1 = _mm256_cvtps_pd(fb1);
+		dot0 = _mm256_fmadd_pd(da0, db0, dot0);
+		dot1 = _mm256_fmadd_pd(da1, db1, dot1);
+		na0  = _mm256_fmadd_pd(da0, da0, na0);
+		na1  = _mm256_fmadd_pd(da1, da1, na1);
+		nb0  = _mm256_fmadd_pd(db0, db0, nb0);
+		nb1  = _mm256_fmadd_pd(db1, db1, nb1);
+	}
+	for (; i + 3 < n; i += 4) {
+		__m128 va = _mm_loadu_ps(a + i);
+		__m128 vb = _mm_loadu_ps(b + i);
+		__m256d da = _mm256_cvtps_pd(va), db = _mm256_cvtps_pd(vb);
+		dot0 = _mm256_fmadd_pd(da, db, dot0);
+		na0  = _mm256_fmadd_pd(da, da, na0);
+		nb0  = _mm256_fmadd_pd(db, db, nb0);
 	}
 
-	/* Reduce each to scalar */
-	dot0 = _mm256_add_ps(dot0, dot1);
-	na0  = _mm256_add_ps(na0, na1);
-	nb0  = _mm256_add_ps(nb0, nb1);
+	dot0 = _mm256_add_pd(dot0, dot1);
+	na0  = _mm256_add_pd(na0, na1);
+	nb0  = _mm256_add_pd(nb0, nb1);
 
-	d_hi = _mm256_extractf128_ps(dot0, 1);
-	d_lo = _mm256_castps256_ps128(dot0);
-	d = _mm_add_ps(d_lo, d_hi); d = _mm_hadd_ps(d, d); d = _mm_hadd_ps(d, d);
+	{
+		__m128d d_hi = _mm256_extractf128_pd(dot0, 1);
+		__m128d d_lo = _mm256_castpd256_pd128(dot0);
+		__m128d d_s = _mm_add_pd(d_lo, d_hi);
+		d_s = _mm_hadd_pd(d_s, d_s);
+		double dot_val = _mm_cvtsd_f64(d_s);
 
-	a_hi = _mm256_extractf128_ps(na0, 1);
-	a_lo = _mm256_castps256_ps128(na0);
-	na = _mm_add_ps(a_lo, a_hi); na = _mm_hadd_ps(na, na); na = _mm_hadd_ps(na, na);
+		__m128d a_hi = _mm256_extractf128_pd(na0, 1);
+		__m128d a_lo = _mm256_castpd256_pd128(na0);
+		__m128d a_s = _mm_add_pd(a_lo, a_hi);
+		a_s = _mm_hadd_pd(a_s, a_s);
+		double na_val = _mm_cvtsd_f64(a_s);
 
-	b_hi = _mm256_extractf128_ps(nb0, 1);
-	b_lo = _mm256_castps256_ps128(nb0);
-	nb = _mm_add_ps(b_lo, b_hi); nb = _mm_hadd_ps(nb, nb); nb = _mm_hadd_ps(nb, nb);
+		__m128d b_hi = _mm256_extractf128_pd(nb0, 1);
+		__m128d b_lo = _mm256_castpd256_pd128(nb0);
+		__m128d b_s = _mm_add_pd(b_lo, b_hi);
+		b_s = _mm_hadd_pd(b_s, b_s);
+		double nb_val = _mm_cvtsd_f64(b_s);
 
-	dot_s = _mm_cvtss_f32(d);
-	na_s  = _mm_cvtss_f32(na);
-	nb_s  = _mm_cvtss_f32(nb);
+		for (; i < n; i++) {
+			double ai = (double)a[i], bi = (double)b[i];
+			dot_val += ai * bi;
+			na_val  += ai * ai;
+			nb_val  += bi * bi;
+		}
 
-	/* Scalar tail */
-	for (; i < n; i++) {
-		dot_s += a[i] * b[i];
-		na_s  += a[i] * a[i];
-		nb_s  += b[i] * b[i];
+		*out_dot    = (float)dot_val;
+		*out_norm_a = (float)na_val;
+		*out_norm_b = (float)nb_val;
 	}
-
-	*out_dot    = dot_s;
-	*out_norm_a = na_s;
-	*out_norm_b = nb_s;
 }
 
 static inline void
@@ -556,43 +565,45 @@ _avx2_multi_agg64(const double *vals, size_t n, double *out_sum,
 static inline float
 _avx2_l2_distance_sq(const float *a, const float *b, size_t n)
 {
-	__m256 sum0 = _mm256_setzero_ps();
-	__m256 sum1 = _mm256_setzero_ps();
-	__m256 sum2 = _mm256_setzero_ps();
-	__m256 sum3 = _mm256_setzero_ps();
+	__m256d sum0 = _mm256_setzero_pd();
+	__m256d sum1 = _mm256_setzero_pd();
+	__m256d sum2 = _mm256_setzero_pd();
+	__m256d sum3 = _mm256_setzero_pd();
 	size_t i = 0;
 
-	for (; i + 31 < n; i += 32) {
-		__m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i));
-		__m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8));
-		__m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
-		__m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24));
-		sum0 = _mm256_fmadd_ps(d0, d0, sum0);
-		sum1 = _mm256_fmadd_ps(d1, d1, sum1);
-		sum2 = _mm256_fmadd_ps(d2, d2, sum2);
-		sum3 = _mm256_fmadd_ps(d3, d3, sum3);
+	for (; i + 15 < n; i += 16) {
+		__m128 fa0 = _mm_loadu_ps(a + i),     fb0 = _mm_loadu_ps(b + i);
+		__m128 fa1 = _mm_loadu_ps(a + i + 4), fb1 = _mm_loadu_ps(b + i + 4);
+		__m128 fa2 = _mm_loadu_ps(a + i + 8), fb2 = _mm_loadu_ps(b + i + 8);
+		__m128 fa3 = _mm_loadu_ps(a + i + 12), fb3 = _mm_loadu_ps(b + i + 12);
+		__m256d d0 = _mm256_cvtps_pd(_mm_sub_ps(fa0, fb0));
+		__m256d d1 = _mm256_cvtps_pd(_mm_sub_ps(fa1, fb1));
+		__m256d d2 = _mm256_cvtps_pd(_mm_sub_ps(fa2, fb2));
+		__m256d d3 = _mm256_cvtps_pd(_mm_sub_ps(fa3, fb3));
+		sum0 = _mm256_fmadd_pd(d0, d0, sum0);
+		sum1 = _mm256_fmadd_pd(d1, d1, sum1);
+		sum2 = _mm256_fmadd_pd(d2, d2, sum2);
+		sum3 = _mm256_fmadd_pd(d3, d3, sum3);
 	}
-	for (; i + 7 < n; i += 8) {
-		__m256 d = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
-		sum0 = _mm256_fmadd_ps(d, d, sum0);
+	for (; i + 3 < n; i += 4) {
+		__m128 d_f = _mm_sub_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i));
+		__m256d d = _mm256_cvtps_pd(d_f);
+		sum0 = _mm256_fmadd_pd(d, d, sum0);
 	}
 
-	sum0 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
+	sum0 = _mm256_add_pd(_mm256_add_pd(sum0, sum1), _mm256_add_pd(sum2, sum3));
 	{
-		__m128 hi = _mm256_extractf128_ps(sum0, 1);
-		__m128 lo = _mm256_castps256_ps128(sum0);
-		__m128 s = _mm_add_ps(lo, hi);
-		float result;
-
-		s = _mm_hadd_ps(s, s);
-		s = _mm_hadd_ps(s, s);
-		result = _mm_cvtss_f32(s);
+		__m128d hi = _mm256_extractf128_pd(sum0, 1);
+		__m128d lo = _mm256_castpd256_pd128(sum0);
+		__m128d s = _mm_add_pd(lo, hi);
+		s = _mm_hadd_pd(s, s);
+		double result = _mm_cvtsd_f64(s);
 
 		for (; i < n; i++) {
-			float d = a[i] - b[i];
+			double d = (double)a[i] - (double)b[i];
 			result += d * d;
 		}
-		return result;
+		return (float)result;
 	}
 }
 
