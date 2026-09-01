@@ -139,7 +139,7 @@ spdk_nvmf_cpcs_ns_create(struct spdk_nvmf_subsystem *subsystem,
 	ns->reach_group = NULL; /* Will be set by reachability manager */
 
 	/* Initialize downloadable program limits */
-	ns->max_program_bytes = opts->max_program_bytes * 1024 * 1024; /* MiB to bytes */
+	ns->max_program_bytes = (uint64_t)opts->max_program_bytes * 1024 * 1024; /* MiB to bytes */
 	ns->used_program_bytes = 0;
 	ns->load_program_gran = opts->load_program_gran;
 
