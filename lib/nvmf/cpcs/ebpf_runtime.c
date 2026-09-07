@@ -209,8 +209,8 @@ ebpf_resolve_exec_range(struct cpcs_exec_context *exec_ctx, uint64_t mr_id, uint
  * uint64_t slm_read(uint64_t mr_id, uint64_t offset, uint64_t len, uint64_t buf_ptr)
  */
 static uint64_t
-helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
-		uint64_t len, uint64_t buf_ptr)
+helper_slm_read(uint64_t mr_id, uint64_t offset,
+		uint64_t len, uint64_t buf_ptr, uint64_t unused)
 {
 	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
 	struct cpcs_exec_context *exec_ctx;
@@ -221,7 +221,7 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
 	uint32_t data_len;
 	int rc;
 
-	(void)ctx; /* Guest-supplied; never trusted as a host pointer. */
+	(void)unused;
 
 	if (scope == NULL || scope->exec_ctx == NULL) {
 		return (uint64_t) -1;
@@ -274,8 +274,8 @@ helper_slm_read(void *ctx, uint64_t mr_id, uint64_t offset,
  * uint64_t slm_write(uint64_t mr_id, uint64_t offset, uint64_t len, uint64_t buf_ptr)
  */
 static uint64_t
-helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
-		 uint64_t len, uint64_t buf_ptr)
+helper_slm_write(uint64_t mr_id, uint64_t offset,
+		 uint64_t len, uint64_t buf_ptr, uint64_t unused)
 {
 	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
 	struct cpcs_exec_context *exec_ctx;
@@ -285,7 +285,7 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
 	void *src;
 	int rc;
 
-	(void)ctx; /* Guest-supplied; never trusted as a host pointer. */
+	(void)unused;
 
 	if (scope == NULL || scope->exec_ctx == NULL) {
 		return (uint64_t) -1;
@@ -332,13 +332,16 @@ helper_slm_write(void *ctx, uint64_t mr_id, uint64_t offset,
  * uint64_t get_param(uint64_t param_id)
  */
 static uint64_t
-helper_get_param(void *ctx, uint64_t param_id, uint64_t unused1,
-		 uint64_t unused2, uint64_t unused3)
+helper_get_param(uint64_t param_id, uint64_t unused1,
+		 uint64_t unused2, uint64_t unused3, uint64_t unused4)
 {
 	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
 	struct cpcs_exec_context *exec_ctx;
 
-	(void)ctx; /* Guest-supplied; never trusted as a host pointer. */
+	(void)unused1;
+	(void)unused2;
+	(void)unused3;
+	(void)unused4;
 
 	if (scope == NULL || scope->exec_ctx == NULL) {
 		return 0;
@@ -362,16 +365,16 @@ helper_get_param(void *ctx, uint64_t param_id, uint64_t unused1,
  * uint64_t log(uint64_t level, uint64_t msg_ptr, uint64_t msg_len)
  */
 static uint64_t
-helper_log(void *ctx, uint64_t level, uint64_t msg_ptr,
-	   uint64_t msg_len, uint64_t unused)
+helper_log(uint64_t level, uint64_t msg_ptr,
+	   uint64_t msg_len, uint64_t unused1, uint64_t unused2)
 {
 	struct cpcs_ebpf_exec_scope *scope = g_ebpf_active_scope;
 	char msg[256];
 	size_t copy_len = msg_len < sizeof(msg) - 1 ? msg_len : sizeof(msg) - 1;
 	void *src;
 
-	(void)ctx;    /* Guest-supplied; never trusted as a host pointer. */
-	(void)unused;
+	(void)unused1;
+	(void)unused2;
 
 	/* msg_ptr is an offset into the sandbox VM memory, never a host pointer. */
 	src = ebpf_guest_buf(scope, msg_ptr, copy_len);
