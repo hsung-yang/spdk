@@ -147,6 +147,25 @@ cpcs_program_deactivate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 		return -SPDK_NVME_CPCS_SC_NO_PROGRAM;
 	}
 
+	/*
+	 * Block a concurrent unload (cpcs_program_unload() /
+	 * cpcs_program_unload_all(), via _cpcs_program_unload_locked()) or a
+	 * second deactivate of the same pind while one is already mid-flight.
+	 * This function drops ns->lock below (around ops->deactivate()) after
+	 * clearing `activated`, so without this guard a second caller that
+	 * lands here while state == DEACTIVATING would see !activated and
+	 * (falsely) report success, or -- worse, in _cpcs_program_unload_locked()
+	 * -- sail through every other guard and free `prog` out from under the
+	 * in-flight caller here, which would then resume into a UAF and finally
+	 * a write-after-free when it sets state = LOADED below. Mirrors the
+	 * check _cpcs_program_unload_locked() makes for the same reason.
+	 */
+	if (prog->state == CPCS_PROGRAM_STATE_ACTIVATING ||
+	    prog->state == CPCS_PROGRAM_STATE_DEACTIVATING) {
+		pthread_mutex_unlock(&ns->lock);
+		return -SPDK_NVME_CPCS_SC_PROGRAM_IN_USE;
+	}
+
 	/* Check if already deactivated */
 	if (!prog->activated) {
 		pthread_mutex_unlock(&ns->lock);
@@ -166,6 +185,13 @@ cpcs_program_deactivate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 	 * exec_count -- clearing it here (rather than after the unlocked
 	 * teardown completes) closes the window where a new Execute could be
 	 * admitted into a runtime that is concurrently being torn down.
+	 *
+	 * Also set state = DEACTIVATING *before* dropping the lock. This is
+	 * exactly what the entry guard above checks, and is what
+	 * _cpcs_program_unload_locked() checks too -- without it, a concurrent
+	 * unload of this pind would see activated == false and exec_count == 0
+	 * (every other guard clear) and race ahead to free `prog` while we
+	 * still hold an unlocked pointer to it below.
 	 */
 	if (ns->num_activated == 0) {
 		/* Counter desync: recompute while prog is still marked activated so
@@ -173,6 +199,7 @@ cpcs_program_deactivate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 		ns->num_activated = cpcs_program_count_activated(ns);
 	}
 	prog->activated = false;
+	prog->state = CPCS_PROGRAM_STATE_DEACTIVATING;
 	if (ns->num_activated > 0) {
 		ns->num_activated--;
 	}
@@ -185,6 +212,9 @@ cpcs_program_deactivate(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind)
 		ops->deactivate(prog);
 	}
 
+	/* Rewrites the DEACTIVATING value set above back to LOADED, closing the
+	 * transitional window and clearing the entry guard for any unload or
+	 * deactivate call for this pind that was blocked waiting on ns->lock. */
 	pthread_mutex_lock(&ns->lock);
 	prog->state = CPCS_PROGRAM_STATE_LOADED;
 	pthread_mutex_unlock(&ns->lock);

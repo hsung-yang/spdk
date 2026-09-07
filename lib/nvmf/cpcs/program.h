@@ -31,6 +31,14 @@ enum cpcs_program_state {
 	CPCS_PROGRAM_STATE_ACTIVATING,
 	CPCS_PROGRAM_STATE_ACTIVATED,
 	CPCS_PROGRAM_STATE_EXECUTING,
+	/* Transitional state for _cpcs_program_unload_locked(): set before
+	 * ns->lock is dropped to call ops->deactivate() unlocked, so a second,
+	 * concurrent unload of the same pind (via cpcs_program_unload() or the
+	 * cpcs_program_unload_all() loop) can be rejected instead of racing
+	 * ahead to free the program out from under the in-flight caller. Mirrors
+	 * how CPCS_PROGRAM_STATE_ACTIVATING guards the equivalent window on the
+	 * activate path. */
+	CPCS_PROGRAM_STATE_DEACTIVATING,
 };
 
 /**

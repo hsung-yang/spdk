@@ -79,16 +79,6 @@ int cpcs_mrs_delete(struct spdk_nvmf_cpcs_ns *ns, uint16_t rsid);
 int cpcs_mrs_delete_all(struct spdk_nvmf_cpcs_ns *ns);
 
 /**
- * Get Memory Range Set by ID
- *
- * \param ns Compute namespace
- * \param rsid Memory Range Set ID
- * \return Pointer to MRS or NULL if not found
- */
-struct cpcs_memory_range_set *cpcs_mrs_get(struct spdk_nvmf_cpcs_ns *ns,
-		uint16_t rsid);
-
-/**
  * Get Memory Range Set by ID and acquire a reference atomically
  *
  * Looks up the MRS and increments its reference count while holding ns->lock,

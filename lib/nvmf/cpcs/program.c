@@ -273,6 +273,8 @@ static int
 _cpcs_program_unload_locked(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind,
 			    struct cpcs_program *prog, bool allow_device_defined)
 {
+	bool was_loaded_or_activated;
+
 	if (prog == NULL) {
 		return -SPDK_NVME_CPCS_SC_NO_PROGRAM;
 	}
@@ -281,12 +283,27 @@ _cpcs_program_unload_locked(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind,
 		return -SPDK_NVME_CPCS_SC_PROGRAM_INDEX_NOT_DOWNLOADABLE;
 	}
 
-	/* Block unload while activation is in flight: cpcs_program_activate
+	/*
+	 * Block unload while activation is in flight: cpcs_program_activate
 	 * drops the namespace lock around runtime init/activate, leaving a
 	 * window where activated=false and exec_count=0 -- without this guard
 	 * the unloader could free prog while the activator still holds a
-	 * pointer to it. */
-	if (prog->state == CPCS_PROGRAM_STATE_ACTIVATING) {
+	 * pointer to it.
+	 *
+	 * Also block a second, concurrent unload of the *same* pind: this
+	 * function drops ns->lock below (around ops->deactivate()) after
+	 * already clearing `activated`, so a caller that lands here while
+	 * state == DEACTIVATING must be rejected too -- otherwise it would
+	 * sail through every other guard (activated already false, exec_count
+	 * == 0) and free `prog` out from under the first, still in-flight
+	 * caller. This is the choke point for that check: both
+	 * cpcs_program_unload() and the cpcs_program_unload_all() loop call
+	 * into this function while holding ns->lock, so whichever of them set
+	 * DEACTIVATING is guaranteed to be observed here by anyone else that
+	 * subsequently acquires the lock for this pind.
+	 */
+	if (prog->state == CPCS_PROGRAM_STATE_ACTIVATING ||
+	    prog->state == CPCS_PROGRAM_STATE_DEACTIVATING) {
 		return -SPDK_NVME_CPCS_SC_PROGRAM_IN_USE;
 	}
 
@@ -294,15 +311,48 @@ _cpcs_program_unload_locked(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind,
 		return -SPDK_NVME_CPCS_SC_PROGRAM_IN_USE;
 	}
 
+	/* Capture the byte-accounting decision before state is (possibly)
+	 * overwritten with DEACTIVATING below -- prog->state is only ever
+	 * LOADED or ACTIVATED at this point, since ACTIVATING/DEACTIVATING
+	 * were already rejected above. */
+	was_loaded_or_activated = (prog->state == CPCS_PROGRAM_STATE_LOADED ||
+				    prog->state == CPCS_PROGRAM_STATE_ACTIVATED);
+
 	if (prog->activated) {
+		const struct cpcs_runtime_ops *ops;
+
+		/*
+		 * Mirror cpcs_program_deactivate() (program_activation.c): clear
+		 * `activated` and the counter before dropping ns->lock to call
+		 * ops->deactivate(), so a concurrent Execute admission check
+		 * (which re-checks `activated` under this same lock) can't race
+		 * with the teardown below. The exec_count > 0 check above already
+		 * rejects programs that are mid-execution, so deactivate's own
+		 * precondition holds here too.
+		 *
+		 * Also set state = DEACTIVATING *before* dropping the lock,
+		 * mirroring cpcs_program_activate()'s use of ACTIVATING for the
+		 * same purpose on the activate path. This is exactly what the
+		 * entry guard above checks; without it, a second concurrent
+		 * unload call for this pind would see activated == false and
+		 * exec_count == 0 (every other guard clear) and race ahead to
+		 * free `prog` while we still hold an unlocked pointer to it.
+		 */
 		if (ns->num_activated > 0) {
 			ns->num_activated--;
 		}
 		prog->activated = false;
+		prog->state = CPCS_PROGRAM_STATE_DEACTIVATING;
+
+		ops = cpcs_runtime_get(prog->ptype);
+		if (ops && ops->deactivate) {
+			pthread_mutex_unlock(&ns->lock);
+			ops->deactivate(prog);
+			pthread_mutex_lock(&ns->lock);
+		}
 	}
 
-	if (prog->state == CPCS_PROGRAM_STATE_LOADED ||
-	    prog->state == CPCS_PROGRAM_STATE_ACTIVATED) {
+	if (was_loaded_or_activated) {
 		if (ns->used_program_bytes < prog->total_size) {
 			SPDK_ERRLOG("Program byte accounting underflow: used=%" PRIu64 " size=%u\n",
 				    ns->used_program_bytes, prog->total_size);
@@ -316,6 +366,9 @@ _cpcs_program_unload_locked(struct spdk_nvmf_cpcs_ns *ns, uint16_t pind,
 		ns->num_programs--;
 	}
 
+	/* prog (and its ->state, currently DEACTIVATING if we took the
+	 * activated branch above) is freed immediately below, so there is no
+	 * separate state to restore first. */
 	return _cpcs_program_free(ns, pind, prog);
 }
 
