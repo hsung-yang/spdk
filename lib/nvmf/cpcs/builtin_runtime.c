@@ -338,6 +338,7 @@ struct cpcs_builtin_kv_async_ctx {
 	struct cpcs_builtin_extended_exec_ctx *worker_ctx;
 	struct cpcs_builtin_kv_output_target target;
 	uint8_t *owned_buf;
+	uint8_t *slm_read_buf;
 	const uint8_t *result_buf;
 	uint64_t result_len;
 	uint64_t return_value;
@@ -2513,10 +2514,73 @@ _cpcs_builtin_kv_prepare_result(const struct cpcs_exec_context *ctx, uint16_t pi
 		return -EINVAL;
 	}
 
-	rc = _cpcs_builtin_kv_parse_request(ctx, pind, &view);
+	/*
+	 * Staged path: when the inline data is NOT a KV request header (no
+	 * "CPCSREQ1" magic), interpret it as a cpcs_builtin_sum64_desc
+	 * {mr_id, off, len} pointing at the full KV request in SLM.
+	 * Read the KV request from SLM and parse it from there.
+	 */
+	bool staged = false;
+	struct cpcs_exec_context local_ctx;
+	const struct cpcs_builtin_sum64_desc *desc;
+	void *slm_ptr = NULL;
+
+	if (ctx->data_buffer != NULL && ctx->data_len >= 8 &&
+	    memcmp(ctx->data_buffer, CPCS_BUILTIN_KV_MAGIC, 8) != 0) {
+		/* Staged path: data_buffer is a descriptor pointing to SLM */
+		if (ctx->data_len < sizeof(struct cpcs_builtin_sum64_desc)) {
+			return -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_DATA;
+		}
+
+		desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+		uint64_t mr_id, off, len;
+		memcpy(&mr_id, &desc->mr_id, 8);
+		memcpy(&off, &desc->off, 8);
+		memcpy(&len, &desc->len, 8);
+
+		if (len > UINT32_MAX) {
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		}
+
+		/* Try zero-copy first (pSLM/DRAM-backed bdevs) */
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &slm_ptr);
+		if (rc == 0) {
+			/* Zero-copy: parse directly from SLM pointer */
+			local_ctx = *ctx;
+			local_ctx.data_buffer = slm_ptr;
+			local_ctx.data_len = (uint32_t)len;
+			rc = _cpcs_builtin_kv_parse_request(&local_ctx, pind, &view);
+		} else {
+			/* Fallback: read SLM into heap buffer */
+			slm_ptr = malloc((size_t)len);
+			if (slm_ptr == NULL) {
+				return -ENOMEM;
+			}
+			rc = _cpcs_exec_read_range_sync(ctx, mr_id, off, len, slm_ptr);
+			if (rc != 0) {
+				free(slm_ptr);
+				return rc;
+			}
+			kv_ctx->slm_read_buf = slm_ptr;
+			local_ctx = *ctx;
+			local_ctx.data_buffer = slm_ptr;
+			local_ctx.data_len = (uint32_t)len;
+			rc = _cpcs_builtin_kv_parse_request(&local_ctx, pind, &view);
+		}
+		staged = true;
+	} else {
+		/* Inline path: KV request in data_buffer (existing behavior) */
+		rc = _cpcs_builtin_kv_parse_request(ctx, pind, &view);
+	}
+
 	if (rc != 0) {
+		if (kv_ctx->slm_read_buf) {
+			free(kv_ctx->slm_read_buf);
+			kv_ctx->slm_read_buf = NULL;
+		}
 		return rc;
 	}
+	(void)staged;
 
 	result_buf = view.payload;
 	result_len = view.payload_len;
@@ -2709,6 +2773,7 @@ _cpcs_builtin_kv_async_finish(struct cpcs_builtin_kv_async_ctx *kv_ctx,
 	struct cpcs_builtin_extended_exec_ctx *worker_ctx;
 
 	worker_ctx = kv_ctx->worker_ctx;
+	free(kv_ctx->slm_read_buf);
 	free(kv_ctx->owned_buf);
 	free(kv_ctx);
 	_cpcs_builtin_extended_complete(worker_ctx, status, return_value);
