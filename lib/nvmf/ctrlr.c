@@ -4836,6 +4836,11 @@ spdk_nvmf_request_zcopy_end(struct spdk_nvmf_request *req, bool commit)
 	nvmf_bdev_ctrlr_zcopy_end(req, commit);
 }
 
+/* Chunk size for parallel NVM reads during SLM_COPY_LBA staging.
+ * PM174X measured sweet spot: 1 MB at QD=16 achieves ~10 GB/s (99% of peak).
+ * See docs/2026-09-08-staging-bw-bottleneck-analysis.md */
+#define SLM_COPY_PARALLEL_CHUNK_SIZE	(1U << 20)	/* 1 MB */
+
 struct nvmf_ctrlr_slm_copy_lba_ctx;
 
 struct nvmf_ctrlr_slm_copy_lba_read_ctx {
@@ -5072,12 +5077,12 @@ static int
 nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 {
 	struct nvmf_slm_copy_lba_range *range;
-	uint8_t *dst;
 	void *stage_base;
 	uint64_t dest_start;
 	uint64_t src_start;
 	uint64_t src_block_size;
 	uint32_t i;
+	uint32_t read_idx = 0;
 	bool mapping_done = false;
 	int rc;
 
@@ -5133,11 +5138,18 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 					}
 				}
 
-				ctx->read_ctxs = calloc(ctx->range_count, sizeof(*ctx->read_ctxs));
+				{
+				uint32_t total_chunks = 0;
+				for (uint32_t j = 0; j < ctx->range_count; j++) {
+					total_chunks += spdk_divide_round_up(
+						ctx->ranges[j].nbytes, SLM_COPY_PARALLEL_CHUNK_SIZE);
+				}
+				ctx->read_ctxs = calloc(total_chunks, sizeof(*ctx->read_ctxs));
 				if (ctx->read_ctxs == NULL) {
 					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
 								     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
 					break;
+				}
 				}
 			}
 
@@ -5145,21 +5157,38 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 			assert(range->dest_offset <= ctx->coalesced_len);
 			assert(range->nbytes <= ctx->coalesced_len - range->dest_offset);
 			stage_base = ctx->direct_buf != NULL ? ctx->direct_buf : ctx->coalesced_buf;
-			dst = (uint8_t *)stage_base + range->dest_offset;
 
-			ctx->read_ctxs[i].ctx = ctx;
-			ctx->read_ctxs[i].iov.iov_base = dst;
-			ctx->read_ctxs[i].iov.iov_len = range->nbytes;
+			src_block_size = spdk_bdev_get_block_size(range->src_bdev);
+			uint64_t remaining = range->nbytes;
+			uint64_t chunk_off = 0;
+			uint64_t cur_slba = range->slba;
 
-			ctx->inflight_reads++;
-			rc = spdk_bdev_readv_blocks(range->desc, range->ch, &ctx->read_ctxs[i].iov, 1,
-						    range->slba, range->nlb + 1,
-						    nvmf_ctrlr_slm_copy_lba_read_complete,
-						    &ctx->read_ctxs[i]);
-			if (rc != 0) {
-				ctx->inflight_reads--;
-				nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
-							     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+			while (remaining > 0 && !ctx->failed) {
+				uint64_t chunk_bytes = spdk_min(remaining, SLM_COPY_PARALLEL_CHUNK_SIZE);
+				uint32_t chunk_blocks = (uint32_t)(chunk_bytes / src_block_size);
+
+				ctx->read_ctxs[read_idx].ctx = ctx;
+				ctx->read_ctxs[read_idx].iov.iov_base =
+					(uint8_t *)stage_base + range->dest_offset + chunk_off;
+				ctx->read_ctxs[read_idx].iov.iov_len = chunk_bytes;
+
+				ctx->inflight_reads++;
+				rc = spdk_bdev_readv_blocks(range->desc, range->ch,
+							   &ctx->read_ctxs[read_idx].iov, 1,
+							   cur_slba, chunk_blocks,
+							   nvmf_ctrlr_slm_copy_lba_read_complete,
+							   &ctx->read_ctxs[read_idx]);
+				if (rc != 0) {
+					ctx->inflight_reads--;
+					nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
+								     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+					break;
+				}
+
+				read_idx++;
+				chunk_off += chunk_bytes;
+				cur_slba += chunk_blocks;
+				remaining -= chunk_bytes;
 			}
 			break;
 		case SPDK_NVME_SLM_COPY_DESC_FMT_4H:
