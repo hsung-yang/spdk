@@ -16,6 +16,7 @@
 #include "spdk/endian.h"
 #include "spdk/env.h"
 #include "spdk/log.h"
+#include "spdk/nvmf_cmd.h"
 #include "spdk/nvme_cpcs_builtin_eval.h"
 #include "spdk/thread.h"
 
@@ -986,8 +987,84 @@ _cpcs_direct_ns_read_done(void *cb_arg, int status)
 	wait_ctx->done = true;
 }
 
+/*
+ * NVM bdev read fallback for DIRECT_NS_AGG: when _cpcs_direct_ns_read_sync()
+ * gets -ENOTSUP from the SLM layer (the bdev is a plain NVMe namespace, not
+ * SLM), this path reads the data via the standard SPDK bdev I/O API
+ * (spdk_bdev_read) instead. This lets DIRECT_NS_AGG operate directly on NVM
+ * namespaces without requiring the host to stage data into SLM first.
+ *
+ * Needs ctx->req to resolve the bdev descriptor + io_channel via
+ * spdk_nvmf_request_get_bdev(). Block alignment is handled with a bounce
+ * buffer when offset/len don't match the bdev's block size.
+ */
+static void
+_cpcs_direct_ns_bdev_read_done(struct spdk_bdev_io *bdev_io, bool success,
+			       void *cb_arg)
+{
+	struct cpcs_builtin_sync_wait_ctx *wait_ctx = cb_arg;
+
+	wait_ctx->status = success ? 0 : -EIO;
+	wait_ctx->done = true;
+	spdk_bdev_free_io(bdev_io);
+}
+
 static int
-_cpcs_direct_ns_read_sync(struct spdk_bdev *bdev, uint64_t offset, uint64_t len, void *buf)
+_cpcs_direct_ns_bdev_read_sync(struct spdk_nvmf_request *req, uint32_t nsid,
+			       uint64_t offset, uint64_t len, void *buf)
+{
+	struct spdk_bdev *bdev = NULL;
+	struct spdk_bdev_desc *bdev_desc = NULL;
+	struct spdk_io_channel *ch = NULL;
+	struct cpcs_builtin_sync_wait_ctx wait_ctx = {};
+	uint32_t block_size;
+	uint64_t aligned_off, aligned_len, pad_front;
+	uint8_t *bounce = NULL;
+	int rc;
+
+	rc = spdk_nvmf_request_get_bdev(nsid, req, &bdev, &bdev_desc, &ch);
+	if (rc != 0) {
+		return rc;
+	}
+
+	block_size = spdk_bdev_get_block_size(bdev);
+
+	if (offset % block_size == 0 && len % block_size == 0) {
+		rc = spdk_bdev_read(bdev_desc, ch, buf, offset, len,
+				    _cpcs_direct_ns_bdev_read_done, &wait_ctx);
+		if (rc != 0) {
+			return rc;
+		}
+		return _cpcs_builtin_sync_wait(&wait_ctx);
+	}
+
+	pad_front = offset % block_size;
+	aligned_off = offset - pad_front;
+	aligned_len = ((pad_front + len + block_size - 1) / block_size) * block_size;
+
+	bounce = spdk_dma_malloc(aligned_len, 4096, NULL);
+	if (bounce == NULL) {
+		return -ENOMEM;
+	}
+
+	rc = spdk_bdev_read(bdev_desc, ch, bounce, aligned_off, aligned_len,
+			    _cpcs_direct_ns_bdev_read_done, &wait_ctx);
+	if (rc != 0) {
+		spdk_dma_free(bounce);
+		return rc;
+	}
+
+	rc = _cpcs_builtin_sync_wait(&wait_ctx);
+	if (rc == 0) {
+		memcpy(buf, bounce + pad_front, len);
+	}
+	spdk_dma_free(bounce);
+	return rc;
+}
+
+static int
+_cpcs_direct_ns_read_sync(struct spdk_bdev *bdev, uint64_t offset, uint64_t len, void *buf,
+			   struct spdk_nvmf_request *req, uint32_t nsid)
 {
 	struct cpcs_builtin_sync_wait_ctx wait_ctx = {};
 	int rc;
@@ -999,13 +1076,25 @@ _cpcs_direct_ns_read_sync(struct spdk_bdev *bdev, uint64_t offset, uint64_t len,
 	if (spdk_get_thread() != NULL) {
 		rc = bdev_slm_exec_read_by_bdev_async(bdev, offset, len, buf,
 						      _cpcs_direct_ns_read_done, &wait_ctx);
-		if (rc != 0) {
-			return rc;
+		if (rc == 0) {
+			return _cpcs_builtin_sync_wait(&wait_ctx);
 		}
-		return _cpcs_builtin_sync_wait(&wait_ctx);
+	} else {
+		rc = bdev_slm_exec_read_by_bdev(bdev, offset, len, buf);
+		if (rc == 0) {
+			return 0;
+		}
 	}
 
-	return bdev_slm_exec_read_by_bdev(bdev, offset, len, buf);
+	if (rc != -ENOTSUP) {
+		return rc;
+	}
+
+	if (req == NULL) {
+		return -ENOTSUP;
+	}
+
+	return _cpcs_direct_ns_bdev_read_sync(req, nsid, offset, len, buf);
 }
 
 /*
@@ -4169,23 +4258,11 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
 				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 			}
-			rc = _cpcs_direct_ns_read_sync(bdev, offset + processed, chunk, buf_a + processed);
+			rc = _cpcs_direct_ns_read_sync(bdev, offset + processed, chunk,
+					       buf_a + processed, ctx->req, desc->nsid);
 			if (rc != 0) {
-				if (rc == -ENOTSUP) {
-					/*
-					 * _cpcs_direct_ns_read_sync() returns -ENOTSUP for bdevs with
-					 * no SLM backing (i.e. desc->nsid names a plain NVMe
-					 * namespace, not an SLM one) -- fail fast with a
-					 * diagnostic so the nsid mismatch is obvious.
-					 */
-					SPDK_ERRLOG("DIRECT_NS_AGG: bdev=%s nsid=%u has no SLM backing."
-						    " desc->nsid must point to an SLM namespace,"
-						    " not a plain NVMe namespace. Check host-side nsid argument.\n",
-						    spdk_bdev_get_name(bdev), desc->nsid);
-				} else {
-					SPDK_ERRLOG("DIRECT_NS_AGG: SLM read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
-						    desc->nsid, offset + processed, chunk, rc);
-				}
+				SPDK_ERRLOG("DIRECT_NS_AGG: read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+					    desc->nsid, offset + processed, chunk, rc);
 				spdk_dma_free(buf_a);
 				if (rc == -ENOENT || rc == -ENOTSUP) {
 					return -SPDK_NVME_CPCS_SC_INVALID_MEMORY_NAMESPACE;
@@ -4214,9 +4291,10 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
 				chunk -= chunk % sizeof(float);
 			}
-			rc = _cpcs_direct_ns_read_sync(bdev, offset + half_bytes + processed, chunk, buf_b);
+			rc = _cpcs_direct_ns_read_sync(bdev, offset + half_bytes + processed, chunk, buf_b,
+					       ctx->req, desc->nsid);
 			if (rc != 0) {
-				SPDK_ERRLOG("DIRECT_NS_AGG: SLM read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+				SPDK_ERRLOG("DIRECT_NS_AGG: read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
 					    desc->nsid, offset + half_bytes + processed, chunk, rc);
 				spdk_dma_free(buf_b);
 				spdk_dma_free(buf_a);
@@ -4259,10 +4337,11 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		}
 	}
 
-	/* DMA-safe: bdev_slm_read_by_bdev() may issue real backing-device I/O.
-	 * Sized to what this Execute actually needs, not a flat 16 MiB —
-	 * the loop below caps each chunk at CPCS_BUILTIN_EXT_IO_CHUNK, so
-	 * this is always >= every chunk it will be asked to hold. */
+	/* DMA-safe: the SLM and NVM bdev read paths may both issue real
+	 * backing-device I/O. Sized to what this Execute actually needs,
+	 * not a flat 16 MiB — the loop below caps each chunk at
+	 * CPCS_BUILTIN_EXT_IO_CHUNK, so this is always >= every chunk it
+	 * will be asked to hold. */
 	buf = spdk_dma_malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(total_bytes), 4096, NULL);
 	if (buf == NULL) {
 		free(rle_out);
@@ -4276,17 +4355,11 @@ _builtin_execute_direct_ns_agg(const struct cpcs_exec_context *ctx, uint64_t *re
 		}
 		chunk -= chunk % sizeof(uint64_t);
 
-		rc = _cpcs_direct_ns_read_sync(bdev, offset + processed, chunk, buf);
+		rc = _cpcs_direct_ns_read_sync(bdev, offset + processed, chunk, buf,
+					       ctx->req, desc->nsid);
 		if (rc != 0) {
-			if (rc == -ENOTSUP) {
-				SPDK_ERRLOG("DIRECT_NS_AGG: bdev=%s nsid=%u has no SLM backing."
-					    " desc->nsid must point to an SLM namespace,"
-					    " not a plain NVMe namespace. Check host-side nsid argument.\n",
-					    spdk_bdev_get_name(bdev), desc->nsid);
-			} else {
-				SPDK_ERRLOG("DIRECT_NS_AGG: SLM read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
-					    desc->nsid, offset + processed, chunk, rc);
-			}
+			SPDK_ERRLOG("DIRECT_NS_AGG: read failed nsid=%u offset=%" PRIu64 " chunk=%" PRIu64 " rc=%d\n",
+				    desc->nsid, offset + processed, chunk, rc);
 			spdk_dma_free(buf);
 			free(rle_out);
 			if (rc == -ENOENT || rc == -ENOTSUP) {
