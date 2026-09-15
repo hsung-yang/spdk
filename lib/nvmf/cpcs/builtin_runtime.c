@@ -4527,6 +4527,113 @@ write_result:
 	return 0;
 }
 
+static void _cpcs_builtin_reduce_apply_direct(uint16_t pind, const uint64_t *vals,
+					       size_t n, uint64_t *out_value);
+
+/*
+ * Synchronous SUM64/MAX64/MIN64 execute for the extended path.
+ * Mirrors the zero-copy + chunked logic from the async state machine
+ * (builtin_async_step, :5742-5815) but runs in one shot on the compute
+ * thread, avoiding the calloc/malloc/spdk_thread_send_msg/free overhead
+ * that dominates at small data sizes.
+ */
+static int
+_builtin_execute_reduce64(const struct cpcs_exec_context *ctx,
+			   uint16_t pind, uint64_t *return_value)
+{
+	const struct cpcs_builtin_sum64_desc *desc;
+	uint8_t *buf = NULL;
+	uint64_t mr_id, off, len;
+	uint64_t processed = 0, chunk;
+	int rc;
+
+	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+	len = from_le64(&desc->len);
+	if (len == 0 || (len % sizeof(uint64_t)) != 0) {
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	}
+
+	mr_id = from_le64(&desc->mr_id);
+	off = from_le64(&desc->off);
+
+	/* Zero-copy fast path (pSLM) */
+	{
+		void *zc = NULL;
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+		if (rc == 0 && zc != NULL) {
+			_cpcs_builtin_reduce_apply_direct(pind, (const uint64_t *)zc,
+							  len / sizeof(uint64_t),
+							  return_value);
+			return 0;
+		}
+	}
+
+	/* Chunked read path (vSLM / non-contiguous) */
+	buf = malloc(CPCS_BUILTIN_EXT_ALLOC_CHUNK(len));
+	if (buf == NULL) {
+		return -ENOMEM;
+	}
+
+	uint64_t acc = 0;
+	bool initialized = false;
+	uint64_t cur_min = 0, cur_max = 0;
+
+	while (processed < len) {
+		chunk = len - processed;
+		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
+			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+			chunk -= chunk % sizeof(uint64_t);
+		}
+
+		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, buf);
+		if (rc != 0) {
+			free(buf);
+			return rc;
+		}
+
+		const uint64_t *vals = (const uint64_t *)buf;
+		size_t n = chunk / sizeof(uint64_t);
+		if (n > 0) {
+			switch (pind) {
+			case CPCS_BUILTIN_PIND_SUM64: {
+				uint64_t s = 0;
+				for (size_t i = 0; i < n; i++) s += vals[i];
+				acc += s;
+				break;
+			}
+			case CPCS_BUILTIN_PIND_MAX64: {
+				for (size_t i = 0; i < n; i++) {
+					if (!initialized || vals[i] > cur_max) { cur_max = vals[i]; initialized = true; }
+				}
+				break;
+			}
+			case CPCS_BUILTIN_PIND_MIN64: {
+				for (size_t i = 0; i < n; i++) {
+					if (!initialized || vals[i] < cur_min) { cur_min = vals[i]; initialized = true; }
+				}
+				break;
+			}
+			}
+		}
+		processed += chunk;
+	}
+
+	free(buf);
+
+	switch (pind) {
+	case CPCS_BUILTIN_PIND_SUM64:  *return_value = acc; break;
+	case CPCS_BUILTIN_PIND_MAX64:  *return_value = cur_max; break;
+	case CPCS_BUILTIN_PIND_MIN64:  *return_value = cur_min; break;
+	default: *return_value = 0; break;
+	}
+
+	return 0;
+}
+
 static void
 _cpcs_builtin_extended_msg(void *arg)
 {
@@ -4557,6 +4664,15 @@ _cpcs_builtin_extended_msg(void *arg)
 			}
 			_cpcs_builtin_extended_complete(ctx, status, 0);
 			return;
+		case CPCS_BUILTIN_PIND_SUM64:
+			status = _builtin_execute_reduce64(ctx->exec_ctx, CPCS_BUILTIN_PIND_SUM64, &return_value);
+			break;
+		case CPCS_BUILTIN_PIND_MAX64:
+			status = _builtin_execute_reduce64(ctx->exec_ctx, CPCS_BUILTIN_PIND_MAX64, &return_value);
+			break;
+		case CPCS_BUILTIN_PIND_MIN64:
+			status = _builtin_execute_reduce64(ctx->exec_ctx, CPCS_BUILTIN_PIND_MIN64, &return_value);
+			break;
 		case CPCS_BUILTIN_PIND_DOT_PRODUCT:
 			status = _builtin_execute_dot_product(ctx->exec_ctx, &return_value);
 			break;
@@ -5926,7 +6042,10 @@ builtin_execute_async(struct cpcs_program *prog,
 		return _cpcs_builtin_execute_extended(prog, ctx, done_cb, cb_arg);
 	}
 
-	if (prog->pind == CPCS_BUILTIN_PIND_DOT_PRODUCT ||
+	if (prog->pind == CPCS_BUILTIN_PIND_SUM64 ||
+	    prog->pind == CPCS_BUILTIN_PIND_MAX64 ||
+	    prog->pind == CPCS_BUILTIN_PIND_MIN64 ||
+	    prog->pind == CPCS_BUILTIN_PIND_DOT_PRODUCT ||
 	    prog->pind == CPCS_BUILTIN_PIND_FILTER_GT ||
 	    prog->pind == CPCS_BUILTIN_PIND_MEMCPY_INLINE ||
 	    prog->pind == CPCS_BUILTIN_PIND_RLE_COMPRESS ||
