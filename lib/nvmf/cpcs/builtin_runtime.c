@@ -2944,6 +2944,10 @@ _cpcs_builtin_kv_exec_async(struct cpcs_builtin_extended_exec_ctx *worker_ctx)
  * Result = A[0]*B[0] + A[1]*B[1] + ... + A[n-1]*B[n-1], returned as
  * a float bit-pattern in the lower 32 bits of return_value.
  */
+static bool _builtin_has_direct_data(const struct cpcs_exec_context *ctx);
+static int _builtin_execute_vector_float_direct(const struct cpcs_exec_context *ctx,
+		uint16_t pind, uint64_t *return_value);
+
 static int
 _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *return_value)
 {
@@ -2960,6 +2964,10 @@ _builtin_execute_dot_product(const struct cpcs_exec_context *ctx, uint64_t *retu
 	uint32_t sum_bits = 0;
 	uint8_t *buf_a = NULL;
 	int rc;
+
+	if (_builtin_has_direct_data(ctx)) {
+		return _builtin_execute_vector_float_direct(ctx, CPCS_BUILTIN_PIND_DOT_PRODUCT, return_value);
+	}
 
 	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
@@ -3105,7 +3113,9 @@ _builtin_execute_vector_float_direct(const struct cpcs_exec_context *ctx, uint16
 	count = ctx->data_len / sizeof(float);
 	half = count / 2;
 
-	if (pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ) {
+	if (pind == CPCS_BUILTIN_PIND_DOT_PRODUCT) {
+		result = _avx2_dot_product(vals, vals + half, half);
+	} else if (pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ) {
 		result = _avx2_l2_distance_sq(vals, vals + half, half);
 	} else if (pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY) {
 		float f_dot, f_na, f_nb;
