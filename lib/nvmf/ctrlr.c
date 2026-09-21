@@ -4882,6 +4882,8 @@ nvmf_ctrlr_slm_copy_lba_free_ctx(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 		return;
 	}
 
+	SPDK_NOTICELOG("SLM copy: free_ctx coalesced_buf=%p direct_buf=%p inflight=%u\n",
+		       ctx->coalesced_buf, ctx->direct_buf, ctx->inflight_reads);
 	spdk_dma_free(ctx->coalesced_buf);
 	free(ctx->read_ctxs);
 	free(ctx->ranges);
@@ -4944,6 +4946,11 @@ nvmf_ctrlr_slm_copy_lba_maybe_finish(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 	if (ctx->completed || !ctx->read_submit_done || ctx->inflight_reads != 0) {
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
 	}
+
+	SPDK_NOTICELOG("SLM copy: maybe_finish inflight=0 submit_done=%d failed=%d "
+		       "coalesced_buf=%p coalesced_write_submitted=%d\n",
+		       ctx->read_submit_done, ctx->failed,
+		       ctx->coalesced_buf, ctx->coalesced_write_submitted);
 
 	/*
 	 * Only the coalesced staging path owes the memory namespace a write-out.
@@ -5012,6 +5019,7 @@ nvmf_ctrlr_slm_copy_lba_read_complete(struct spdk_bdev_io *bdev_io, bool success
 	spdk_bdev_free_io(bdev_io);
 
 	if (!success) {
+		SPDK_ERRLOG("SLM copy: read_complete FAILED, inflight=%u\n", ctx->inflight_reads);
 		nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
 					     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
 	}
@@ -5022,7 +5030,10 @@ nvmf_ctrlr_slm_copy_lba_read_complete(struct spdk_bdev_io *bdev_io, bool success
 	if (ctx->inflight_reads == 0 && ctx->read_submit_done) {
 		thread = spdk_get_thread();
 		assert(thread != NULL);
-		spdk_thread_send_msg(thread, nvmf_ctrlr_slm_copy_lba_maybe_finish_msg, ctx);
+		if (spdk_thread_send_msg(thread, nvmf_ctrlr_slm_copy_lba_maybe_finish_msg, ctx) != 0) {
+			SPDK_ERRLOG("SLM copy: spdk_thread_send_msg failed, calling maybe_finish directly\n");
+			nvmf_ctrlr_slm_copy_lba_maybe_finish(ctx);
+		}
 		return;
 	}
 
@@ -5076,6 +5087,8 @@ nvmf_ctrlr_slm_copy_lba_resolve_direct(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 static int
 nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 {
+	static uint64_t slm_copy_seq = 0;
+	uint64_t my_seq = __atomic_add_fetch(&slm_copy_seq, 1, __ATOMIC_RELAXED);
 	struct nvmf_slm_copy_lba_range *range;
 	void *stage_base;
 	uint64_t dest_start;
@@ -5085,6 +5098,10 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 	uint32_t read_idx = 0;
 	bool mapping_done = false;
 	int rc;
+
+	SPDK_NOTICELOG("SLM copy #%lu: start coalesced_len=%lu ranges=%u desc_fmt=%u\n",
+		       (unsigned long)my_seq, (unsigned long)ctx->coalesced_len,
+		       ctx->range_count, ctx->desc_fmt);
 
 	for (i = 0; i < ctx->range_count && !ctx->failed; i++) {
 		range = &ctx->ranges[i];
@@ -5132,10 +5149,19 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 				if (ctx->direct_buf == NULL) {
 					ctx->coalesced_buf = spdk_dma_malloc(ctx->coalesced_len, 0x1000, NULL);
 					if (ctx->coalesced_buf == NULL) {
+						SPDK_ERRLOG("SLM copy #%lu: spdk_dma_malloc(%lu) FAILED\n",
+							    (unsigned long)my_seq,
+							    (unsigned long)ctx->coalesced_len);
 						nvmf_ctrlr_slm_copy_lba_fail(ctx, SPDK_NVME_SCT_GENERIC,
 									     SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
 						break;
 					}
+					SPDK_NOTICELOG("SLM copy #%lu: coalesced path, buf=%p len=%lu\n",
+						       (unsigned long)my_seq, ctx->coalesced_buf,
+						       (unsigned long)ctx->coalesced_len);
+				} else {
+					SPDK_NOTICELOG("SLM copy #%lu: direct path, buf=%p\n",
+						       (unsigned long)my_seq, ctx->direct_buf);
 				}
 
 				{
@@ -5209,6 +5235,8 @@ nvmf_ctrlr_slm_copy_lba_submit_reads(struct nvmf_ctrlr_slm_copy_lba_ctx *ctx)
 	}
 
 	ctx->read_submit_done = true;
+	SPDK_NOTICELOG("SLM copy #%lu: reads submitted=%u inflight=%u failed=%d\n",
+		       (unsigned long)my_seq, read_idx, ctx->inflight_reads, ctx->failed);
 	return nvmf_ctrlr_slm_copy_lba_maybe_finish(ctx);
 }
 
