@@ -3755,12 +3755,18 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 				size_t nf = len / sizeof(float);
 				size_t j;
 
-				for (j = 0; j < nf; j++) {
-					if (p[j] > thr) {
-						if (survivors != NULL && out_count < sv_cap_f) {
-							survivors[out_count] = p[j];
+				if (survivors == NULL) {
+					for (j = 0; j < nf; j++) {
+						out_count += (p[j] > thr);
+					}
+				} else {
+					for (j = 0; j < nf; j++) {
+						if (p[j] > thr) {
+							if (out_count < sv_cap_f) {
+								survivors[out_count] = p[j];
+							}
+							out_count++;
 						}
-						out_count++;
 					}
 				}
 				goto filter_emit;
@@ -3793,12 +3799,18 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 				size_t nf = chunk / sizeof(float);
 				size_t j;
 
-				for (j = 0; j < nf; j++) {
-					if (p[j] > thr) {
-						if (survivors != NULL && out_count < sv_cap_f) {
-							survivors[out_count] = p[j];
+				if (survivors == NULL) {
+					for (j = 0; j < nf; j++) {
+						out_count += (p[j] > thr);
+					}
+				} else {
+					for (j = 0; j < nf; j++) {
+						if (p[j] > thr) {
+							if (out_count < sv_cap_f) {
+								survivors[out_count] = p[j];
+							}
+							out_count++;
 						}
-						out_count++;
 					}
 				}
 			}
