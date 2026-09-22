@@ -4755,7 +4755,7 @@ _cpcs_builtin_extended_msg(void *arg)
 		case CPCS_BUILTIN_PIND_MEMCPY_INLINE:
 			status = _builtin_execute_memcpy_inline(ctx->exec_ctx, &return_value);
 			break;
-		case CPCS_BUILTIN_PIND_RLE_COMPRESS:
+	case CPCS_BUILTIN_PIND_RLE_COMPRESS:
 			status = _builtin_execute_rle_compress(ctx->exec_ctx, &return_value);
 			break;
 		case CPCS_BUILTIN_PIND_MULTI_AGG64:
@@ -5408,6 +5408,7 @@ _cpcs_builtin_can_parallelize(uint16_t pind)
 	case CPCS_BUILTIN_PIND_COSINE_SIMILARITY:
 	case CPCS_BUILTIN_PIND_MULTI_AGG64:
 	case CPCS_BUILTIN_PIND_FILTER_GT:
+	case CPCS_BUILTIN_PIND_RLE_COMPRESS:
 		return true;
 	default:
 		return false;
@@ -5443,6 +5444,8 @@ _cpcs_builtin_parallel_parse(const struct cpcs_exec_context *ctx, uint16_t pind,
 		    pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ ||
 		    pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY)
 			*elem_size = sizeof(float);
+		else if (pind == CPCS_BUILTIN_PIND_RLE_COMPRESS)
+			*elem_size = 1;
 		else
 			*elem_size = sizeof(uint64_t);
 	}
@@ -5450,7 +5453,6 @@ _cpcs_builtin_parallel_parse(const struct cpcs_exec_context *ctx, uint16_t pind,
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	return 0;
 }
-
 static void
 _cpcs_builtin_parallel_merge(struct cpcs_builtin_parallel_ctx *pctx)
 {
@@ -5540,6 +5542,17 @@ _cpcs_builtin_parallel_merge(struct cpcs_builtin_parallel_ctx *pctx)
 		uint64_t total_count = __atomic_load_n(&pctx->total_sv_count,
 						       __ATOMIC_ACQUIRE);
 		return_value = total_count;
+		break;
+	}
+	case CPCS_BUILTIN_PIND_RLE_COMPRESS: {
+		if (pctx->out_zc_ptr != NULL) {
+			return_value = __atomic_load_n(&pctx->total_sv_count,
+						       __ATOMIC_ACQUIRE);
+		} else {
+			uint64_t s = 0;
+			for (i = 0; i < n; i++) s += pctx->shards[i].u64;
+			return_value = s;
+		}
 		break;
 	}
 		default:
@@ -5635,6 +5648,33 @@ _cpcs_builtin_parallel_shard_msg(void *arg)
 		}
 		break;
 	}
+	case CPCS_BUILTIN_PIND_RLE_COMPRESS: {
+		uint64_t rle_len = n;
+		uint8_t *tmp = malloc(rle_len * 2 + 16);
+		if (tmp == NULL) { status = -ENOMEM; break; }
+		size_t out = 0;
+		uint64_t si = 0;
+		while (si < rle_len) {
+			uint8_t val = base[si];
+			uint64_t run = 1;
+			while (si + run < rle_len && base[si + run] == val && run < 255)
+				run++;
+			if (out + 2 > rle_len * 2 + 16) break;
+			tmp[out++] = val;
+			tmp[out++] = (uint8_t)run;
+			si += run;
+		}
+		s->u64 = (uint64_t)out;
+		if (pctx->out_zc_ptr != NULL && out > 0) {
+			uint64_t my_off = __atomic_fetch_add(
+				&pctx->total_sv_count, out, __ATOMIC_ACQ_REL);
+			if (my_off + out <= pctx->sv_cap_f) {
+				memcpy((uint8_t *)pctx->out_zc_ptr + my_off, tmp, out);
+			}
+		}
+		free(tmp);
+		break;
+	}
 	default:
 		status = -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
 		break;
@@ -5689,6 +5729,19 @@ _cpcs_builtin_parallel_dispatch(struct cpcs_builtin_extended_exec_ctx *worker_ct
 				&out_mr_id, &out_off, &out_cap);
 		if (want_output) {
 			pctx->sv_cap_f = out_cap / sizeof(float);
+			rc = _cpcs_exec_get_range_ptr(ctx, out_mr_id, out_off,
+						      out_cap, &pctx->out_zc_ptr);
+			if (rc != 0) pctx->out_zc_ptr = NULL;
+		}
+	}
+	 else if (pind == CPCS_BUILTIN_PIND_RLE_COMPRESS) {
+		uint64_t out_mr_id, out_off;
+		uint32_t out_cap;
+		bool want_output = _cpcs_builtin_parse_output(ctx,
+				sizeof(struct cpcs_builtin_sum64_desc),
+				&out_mr_id, &out_off, &out_cap);
+		if (want_output) {
+			pctx->sv_cap_f = out_cap;
 			rc = _cpcs_exec_get_range_ptr(ctx, out_mr_id, out_off,
 						      out_cap, &pctx->out_zc_ptr);
 			if (rc != 0) pctx->out_zc_ptr = NULL;
