@@ -256,6 +256,44 @@ struct cpcs_builtin_compute_thread {
 	uint32_t lcore;
 };
 
+/* ---- Parallel execution infrastructure ----
+ * Single Execute command → N compute threads → 1 merged callback.
+ * Zero-copy only: SLM pointer resolved once, shared across threads.
+ * Falls back to sequential path if zero-copy unavailable or data too small.
+ */
+
+#define CPCS_PARALLEL_MIN_BYTES	(1U << 20)	/* 1 MB threshold */
+
+struct cpcs_builtin_parallel_shard {
+	int	status;
+	uint64_t byte_off;	/* offset into SLM range */
+	uint64_t n_elems;	/* element count for this shard */
+	uint64_t u64;		/* reduce64 partial, filter_gt count */
+	double   d[3];		/* dot/l2: [0]=partial. cosine: [0]=dot [1]=na² [2]=nb² */
+	uint64_t count;		/* multi_agg64 element count */
+	/* FILTER_GT survivor mode: atomic offset into out_zc_ptr */
+	uint64_t sv_offset;	/* assigned via atomic after count pass */
+	uint64_t sv_count;	/* survivors found in this shard */
+};
+
+struct cpcs_builtin_parallel_ctx {
+	struct cpcs_builtin_extended_exec_ctx *worker_ctx;
+	uint16_t pind;
+	void    *slm_ptr;		/* shared SLM pointer (read-only) */
+	uint64_t total_len;		/* total byte range */
+	uint64_t half_len;		/* for vector builtins: len/2 */
+	uint32_t elem_size;		/* 4 (float) or 8 (uint64/double) */
+	uint32_t n_shards;		/* actual shard count */
+	uint32_t completion_count;	/* atomic counter */
+	/* builtin-specific params */
+	float    threshold;		/* filter_gt */
+	/* FILTER_GT survivor output */
+	void    *out_zc_ptr;		/* zero-copy output SLM pointer (NULL if none) */
+	uint64_t sv_cap_f;		/* max floats in output */
+	uint64_t total_sv_count;	/* atomic accumulator for survivor offset alloc */
+	struct cpcs_builtin_parallel_shard shards[SPDK_CPUSET_SIZE];
+};
+
 struct cpcs_builtin_async_exec_ctx {
 	struct cpcs_program *prog;
 	struct cpcs_exec_context *exec_ctx;
@@ -3281,14 +3319,16 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 		return _builtin_execute_multi_agg64_direct(ctx, return_value);
 	}
 
-	/* MRS path: read double array from SLM, compute count/sum/min/max */
+	/* MRS path: read uint64_t array from SLM, compute count/sum/min/max.
+	 * Data staged from NVM is uint64_t; the result struct uses uint64_t
+	 * fields to match the host's cs_direct_ns_multi_result. */
 	const struct cpcs_builtin_sum64_desc *desc;
-	struct cpcs_builtin_multi_agg64_result result;
+	struct cs_direct_ns_multi_result result;
 	uint8_t *buf;
 	uint64_t mr_id, off, len;
 	uint64_t processed = 0, chunk;
-	const double *vals;
-	size_t n;
+	const uint64_t *vals;
+	size_t n, i;
 	bool initialized = false;
 	int rc;
 
@@ -3298,7 +3338,7 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 
 	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
 	len = from_le64(&desc->len);
-	if (len == 0 || (len % sizeof(double)) != 0) {
+	if (len == 0 || (len % sizeof(uint64_t)) != 0) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
@@ -3306,8 +3346,8 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 	off = from_le64(&desc->off);
 
 	/*
-	 * Zero-copy fast path (pSLM): the whole double array is contiguous in
-	 * the SLM buffer, so reduce it in place with no staging copy.
+	 * Zero-copy fast path (pSLM): the whole uint64_t array is contiguous
+	 * in the SLM buffer, so reduce it in place with no staging copy.
 	 * vSLM/non-SLM fall through to the read-into-buffer path below.
 	 */
 	{
@@ -3315,11 +3355,21 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 
 		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
 		if (rc == 0 && zc != NULL) {
-			result.count = len / sizeof(double);
-			_avx2_multi_agg64((const double *)zc, result.count,
-					  &result.sum, &result.min, &result.max);
+			const uint64_t *p = (const uint64_t *)zc;
+			size_t cnt = len / sizeof(uint64_t);
 
-			return _multi_agg64_emit(ctx, &result, mr_id, off, len, return_value);
+			result.count = cnt;
+			result.sum = 0;
+			result.min = 0;
+			result.max = 0;
+			for (i = 0; i < cnt; i++) {
+				result.sum += p[i];
+				if (!initialized || p[i] < result.min) result.min = p[i];
+				if (!initialized || p[i] > result.max) result.max = p[i];
+				initialized = true;
+			}
+		*return_value = result.sum;
+		return 0;
 		}
 	}
 
@@ -3329,15 +3379,15 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 	}
 
 	result.count = 0;
-	result.sum = 0.0;
-	result.min = 0.0;
-	result.max = 0.0;
+	result.sum = 0;
+	result.min = 0;
+	result.max = 0;
 
 	while (processed < len) {
 		chunk = len - processed;
 		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
 			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
-			chunk -= chunk % sizeof(double);
+			chunk -= chunk % sizeof(uint64_t);
 		}
 
 		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, buf);
@@ -3346,25 +3396,13 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 			return rc;
 		}
 
-		vals = (const double *)buf;
-		n = chunk / sizeof(double);
-		if (n > 0) {
-			double chunk_sum, chunk_min, chunk_max;
-
-			_avx2_multi_agg64(vals, n, &chunk_sum, &chunk_min, &chunk_max);
-			result.sum += chunk_sum;
-			if (!initialized) {
-				result.min = chunk_min;
-				result.max = chunk_max;
-				initialized = true;
-			} else {
-				if (chunk_min < result.min) {
-					result.min = chunk_min;
-				}
-				if (chunk_max > result.max) {
-					result.max = chunk_max;
-				}
-			}
+		vals = (const uint64_t *)buf;
+		n = chunk / sizeof(uint64_t);
+		for (i = 0; i < n; i++) {
+			result.sum += vals[i];
+			if (!initialized || vals[i] < result.min) result.min = vals[i];
+			if (!initialized || vals[i] > result.max) result.max = vals[i];
+			initialized = true;
 		}
 		result.count += n;
 		processed += chunk;
@@ -3372,7 +3410,8 @@ _builtin_execute_multi_agg64(const struct cpcs_exec_context *ctx, uint64_t *retu
 
 	free(buf);
 
-	return _multi_agg64_emit(ctx, &result, mr_id, off, len, return_value);
+	*return_value = result.sum;
+	return 0;
 }
 
 static int
@@ -3700,13 +3739,13 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		uint64_t chunk;
 		uint8_t *chunk_buf = NULL;
 		uint32_t tbits;
-		float thr;
+		uint64_t thr;
 		int rc;
 		uint64_t out_mr_id = 0, out_off = 0;
 		uint32_t out_cap = 0;
 		bool want_output = false;
-		float *survivors = NULL;
-		size_t sv_cap_f = 0;
+		uint64_t *survivors = NULL;
+		size_t sv_cap = 0;
 		size_t stored;
 		int wrc = 0;
 
@@ -3716,44 +3755,45 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 
 		desc = (const struct cpcs_builtin_filter_gt_desc *)ctx->data_buffer;
 		len = from_le64(&desc->len);
-		if (len == 0 || (len % sizeof(float)) != 0) {
+		if (len == 0 || (len % sizeof(uint64_t)) != 0) {
 			return -SPDK_NVME_SC_INVALID_FIELD;
 		}
 
 		mr_id = from_le64(&desc->mr_id);
 		off = from_le64(&desc->off);
 		tbits = from_le32(&desc->threshold_bits);
-		memcpy(&thr, &tbits, sizeof(thr));
+		thr = (uint64_t)tbits;
 
-		/*
-		 * Optional output range: when the host reserves an SLM range for the
-		 * surviving elements, collect them into a staging buffer and write
-		 * them there so the host reads back the filtered rows instead of
-		 * recomputing. cdw0 still carries the survivor count; the host reads
-		 * count * sizeof(float) bytes.
-		 */
 		want_output = _cpcs_builtin_parse_output(ctx, sizeof(*desc),
 							 &out_mr_id, &out_off, &out_cap);
 		if (want_output) {
-			survivors = malloc(out_cap ? out_cap : 1);
-			if (survivors == NULL) {
-				return -ENOMEM;
-			}
-			sv_cap_f = out_cap / sizeof(float);
+			sv_cap = out_cap / sizeof(uint64_t);
 		}
 
-		/*
-		 * Zero-copy fast path (pSLM): scan the contiguous SLM range in place.
-		 * vSLM/non-SLM fall through to the streaming read path below.
-		 */
+		bool out_zc = false;
 		{
 			void *zc = NULL;
 
-			rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
-			if (rc == 0 && zc != NULL) {
-				const float *p = (const float *)zc;
-				size_t nf = len / sizeof(float);
+		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
+		if (rc == 0 && zc != NULL) {
+			const uint64_t *p = (const uint64_t *)zc;
+				size_t nf = len / sizeof(uint64_t);
 				size_t j;
+
+				if (want_output) {
+					void *out_zc_ptr = NULL;
+					rc = _cpcs_exec_get_range_ptr(ctx, out_mr_id, out_off,
+								      out_cap, &out_zc_ptr);
+					if (rc == 0 && out_zc_ptr != NULL) {
+						survivors = (uint64_t *)out_zc_ptr;
+						out_zc = true;
+					} else {
+						survivors = malloc(out_cap ? out_cap : 1);
+						if (survivors == NULL) {
+							return -ENOMEM;
+						}
+					}
+				}
 
 				if (survivors == NULL) {
 					for (j = 0; j < nf; j++) {
@@ -3762,7 +3802,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 				} else {
 					for (j = 0; j < nf; j++) {
 						if (p[j] > thr) {
-							if (out_count < sv_cap_f) {
+							if (out_count < sv_cap) {
 								survivors[out_count] = p[j];
 							}
 							out_count++;
@@ -3770,6 +3810,13 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 					}
 				}
 				goto filter_emit;
+			}
+		}
+
+		if (want_output) {
+			survivors = malloc(out_cap ? out_cap : 1);
+			if (survivors == NULL) {
+				return -ENOMEM;
 			}
 		}
 
@@ -3783,7 +3830,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 			chunk = len - processed;
 			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
 				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
-				chunk -= chunk % sizeof(float);
+				chunk -= chunk % sizeof(uint64_t);
 			}
 
 			rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk,
@@ -3795,8 +3842,8 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 			}
 
 			{
-				const float *p = (const float *)chunk_buf;
-				size_t nf = chunk / sizeof(float);
+				const uint64_t *p = (const uint64_t *)chunk_buf;
+				size_t nf = chunk / sizeof(uint64_t);
 				size_t j;
 
 				if (survivors == NULL) {
@@ -3806,7 +3853,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 				} else {
 					for (j = 0; j < nf; j++) {
 						if (p[j] > thr) {
-							if (out_count < sv_cap_f) {
+							if (out_count < sv_cap) {
 								survivors[out_count] = p[j];
 							}
 							out_count++;
@@ -3819,14 +3866,16 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 
 		free(chunk_buf);
 
-filter_emit:
+	filter_emit:
 		if (want_output) {
-			stored = (out_count < sv_cap_f) ? out_count : sv_cap_f;
-			if (stored > 0) {
+			stored = (out_count < sv_cap) ? out_count : sv_cap;
+			if (stored > 0 && !out_zc) {
 				wrc = _cpcs_exec_write_range_sync(ctx, out_mr_id, out_off,
-								  stored * sizeof(float), survivors);
+								  stored * sizeof(uint64_t), survivors);
 			}
-			free(survivors);
+			if (!out_zc) {
+				free(survivors);
+			}
 			if (wrc != 0) {
 				return wrc;
 			}
@@ -3930,11 +3979,12 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	}
 
 	/*
-	 * MRS path: read input from SLM and RLE-encode. When the host supplies an
-	 * output range, the compressed [run,value] pairs are written into that SLM
-	 * range for readback; otherwise only the compressed size is counted and
-	 * returned via cdw0 (legacy behaviour). cdw0 carries the compressed byte
-	 * length either way.
+	 * MRS path: read uint64_t array from SLM and RLE-encode at the
+	 * uint64_t granularity — (run_len, run_val) pairs of 16 bytes each,
+	 * matching the DIRECT_NS_AGG and host CPU paths.  When the host
+	 * supplies an output range, the encoded pairs are written into that
+	 * SLM range for readback; cdw0 carries the compressed byte length
+	 * either way.
 	 */
 	const struct cpcs_builtin_sum64_desc *desc;
 	uint8_t *src_buf = NULL;
@@ -3947,9 +3997,9 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	bool want_output = false;
 	uint8_t *rle_out = NULL;
 	int wrc = 0;
-	uint8_t prev_value = 0;
-	uint8_t prev_run = 0;
-	bool has_prev = false;
+	uint64_t rle_run_val = 0;
+	uint64_t rle_run_len = 0;
+	bool rle_have_run = false;
 
 	if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*desc)) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
@@ -3957,7 +4007,7 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 
 	desc = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
 	len = from_le64(&desc->len);
-	if (len == 0) {
+	if (len == 0 || (len % sizeof(uint64_t)) != 0) {
 		return -SPDK_NVME_SC_INVALID_FIELD;
 	}
 
@@ -3973,38 +4023,36 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 		}
 	}
 
-	/*
-	 * Zero-copy fast path (pSLM): run-length encode over the contiguous SLM
-	 * range in place, no staging copy. A single pass replaces the chunked
-	 * loop's cross-chunk run carry. vSLM/non-SLM fall through below.
-	 */
 	{
 		void *zc = NULL;
 
 		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
 		if (rc == 0 && zc != NULL) {
-			const uint8_t *s = (const uint8_t *)zc;
-			uint64_t i = 0;
+			const uint64_t *p = (const uint64_t *)zc;
+			uint64_t cnt = len / sizeof(uint64_t);
+			uint64_t i;
 
-			while (i < len) {
-				uint8_t value = s[i];
-				uint8_t run = 1;
-
-				while ((i + run) < len && s[i + run] == value && run < 255) {
-					run++;
+			for (i = 0; i < cnt; i++) {
+				if (rle_have_run && p[i] == rle_run_val) {
+					rle_run_len++;
+					continue;
 				}
+			if (rle_have_run) {
 				if (rle_out != NULL) {
-					if (out_pos + 2 > out_cap) {
+					if (out_pos + 16 > out_cap) {
 						free(rle_out);
 						return -SPDK_NVME_SC_INVALID_FIELD;
 					}
-					rle_out[out_pos] = run;
-					rle_out[out_pos + 1] = value;
+					memcpy(rle_out + out_pos, &rle_run_len, 8);
+					memcpy(rle_out + out_pos + 8, &rle_run_val, 8);
 				}
-				out_pos += 2;
-				i += run;
+				out_pos += 16;
 			}
-			goto rle_emit;
+			rle_run_val = p[i];
+			rle_run_len = 1;
+			rle_have_run = true;
+		}
+		goto rle_emit;
 		}
 	}
 
@@ -4015,11 +4063,13 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 	}
 
 	while (processed < len) {
-		size_t i;
+		const uint64_t *p;
+		size_t n, i;
 
 		chunk = len - processed;
 		if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
 			chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
+			chunk -= chunk % sizeof(uint64_t);
 		}
 
 		rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk, src_buf);
@@ -4029,48 +4079,49 @@ _builtin_execute_rle_compress(const struct cpcs_exec_context *ctx, uint64_t *ret
 			return rc;
 		}
 
-		for (i = 0; i < chunk; i++) {
-			uint8_t value = src_buf[i];
-
-			if (has_prev && value == prev_value && prev_run < 255) {
-				prev_run++;
-			} else {
-				if (has_prev) {
-					if (rle_out != NULL) {
-						if (out_pos + 2 > out_cap) {
-							free(src_buf);
-							free(rle_out);
-							return -SPDK_NVME_SC_INVALID_FIELD;
-						}
-						rle_out[out_pos] = prev_run;
-						rle_out[out_pos + 1] = prev_value;
-					}
-					out_pos += 2;
-				}
-				prev_value = value;
-				prev_run = 1;
-				has_prev = true;
+		p = (const uint64_t *)src_buf;
+		n = chunk / sizeof(uint64_t);
+		for (i = 0; i < n; i++) {
+			if (rle_have_run && p[i] == rle_run_val) {
+				rle_run_len++;
+				continue;
 			}
+			if (rle_have_run) {
+				if (rle_out != NULL) {
+					if (out_pos + 16 > out_cap) {
+						free(src_buf);
+						free(rle_out);
+						return -SPDK_NVME_SC_INVALID_FIELD;
+					}
+					memcpy(rle_out + out_pos, &rle_run_len, 8);
+					memcpy(rle_out + out_pos + 8, &rle_run_val, 8);
+				}
+				out_pos += 16;
+			}
+			rle_run_val = p[i];
+			rle_run_len = 1;
+			rle_have_run = true;
 		}
 		processed += chunk;
-	}
-
-	if (has_prev) {
-		if (rle_out != NULL) {
-			if (out_pos + 2 > out_cap) {
-				free(src_buf);
-				free(rle_out);
-				return -SPDK_NVME_SC_INVALID_FIELD;
-			}
-			rle_out[out_pos] = prev_run;
-			rle_out[out_pos + 1] = prev_value;
-		}
-		out_pos += 2;
 	}
 
 	free(src_buf);
 
 rle_emit:
+	if (rle_have_run) {
+		if (rle_out != NULL) {
+			if (out_pos + 16 > out_cap) {
+				free(rle_out);
+				return -SPDK_NVME_SC_INVALID_FIELD;
+			}
+			memcpy(rle_out + out_pos, &rle_run_len, 8);
+			memcpy(rle_out + out_pos + 8, &rle_run_val, 8);
+			out_pos += 16;
+		} else {
+			out_pos += 16;
+		}
+	}
+
 	if (want_output) {
 		if (out_pos > 0) {
 			wrc = _cpcs_exec_write_range_sync(ctx, out_mr_id, out_off,
@@ -5343,6 +5394,335 @@ _cpcs_builtin_exec_filtered_topk_exact_async(struct cpcs_builtin_extended_exec_c
 	return 0;
 }
 
+/* ---- Parallel dispatch ---- */
+
+static bool
+_cpcs_builtin_can_parallelize(uint16_t pind)
+{
+	switch (pind) {
+	case CPCS_BUILTIN_PIND_SUM64:
+	case CPCS_BUILTIN_PIND_MAX64:
+	case CPCS_BUILTIN_PIND_MIN64:
+	case CPCS_BUILTIN_PIND_DOT_PRODUCT:
+	case CPCS_BUILTIN_PIND_L2_DISTANCE_SQ:
+	case CPCS_BUILTIN_PIND_COSINE_SIMILARITY:
+	case CPCS_BUILTIN_PIND_MULTI_AGG64:
+	case CPCS_BUILTIN_PIND_FILTER_GT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int
+_cpcs_builtin_parallel_parse(const struct cpcs_exec_context *ctx, uint16_t pind,
+			      uint64_t *mr_id, uint64_t *off, uint64_t *len,
+			      uint32_t *elem_size, float *threshold)
+{
+	if (pind == CPCS_BUILTIN_PIND_FILTER_GT) {
+		const struct cpcs_builtin_filter_gt_desc *d;
+		if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*d))
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		d = (const struct cpcs_builtin_filter_gt_desc *)ctx->data_buffer;
+		*mr_id = from_le64(&d->mr_id);
+		*off   = from_le64(&d->off);
+		*len   = from_le64(&d->len);
+		uint32_t tbits = from_le32(&d->threshold_bits);
+		memcpy(threshold, &tbits, sizeof(*threshold));
+		*elem_size = sizeof(float);
+	} else {
+		const struct cpcs_builtin_sum64_desc *d;
+		if (ctx->data_buffer == NULL || ctx->data_len < sizeof(*d))
+			return -SPDK_NVME_SC_INVALID_FIELD;
+		d = (const struct cpcs_builtin_sum64_desc *)ctx->data_buffer;
+		*mr_id = from_le64(&d->mr_id);
+		*off   = from_le64(&d->off);
+		*len   = from_le64(&d->len);
+		*threshold = 0.0f;
+		if (pind == CPCS_BUILTIN_PIND_DOT_PRODUCT ||
+		    pind == CPCS_BUILTIN_PIND_L2_DISTANCE_SQ ||
+		    pind == CPCS_BUILTIN_PIND_COSINE_SIMILARITY)
+			*elem_size = sizeof(float);
+		else
+			*elem_size = sizeof(uint64_t);
+	}
+	if (*len == 0 || (*len % *elem_size) != 0)
+		return -SPDK_NVME_SC_INVALID_FIELD;
+	return 0;
+}
+
+static void
+_cpcs_builtin_parallel_merge(struct cpcs_builtin_parallel_ctx *pctx)
+{
+	uint64_t return_value = 0;
+	int status = 0;
+	uint32_t i, n = pctx->n_shards;
+
+	for (i = 0; i < n; i++) {
+		if (pctx->shards[i].status != 0) { status = pctx->shards[i].status; break; }
+	}
+
+	if (status == 0) {
+		switch (pctx->pind) {
+		case CPCS_BUILTIN_PIND_SUM64: {
+			uint64_t s = 0;
+			for (i = 0; i < n; i++) s += pctx->shards[i].u64;
+			return_value = s;
+			break;
+		}
+		case CPCS_BUILTIN_PIND_MAX64: {
+			uint64_t m = pctx->shards[0].u64;
+			for (i = 1; i < n; i++) if (pctx->shards[i].u64 > m) m = pctx->shards[i].u64;
+			return_value = m;
+			break;
+		}
+		case CPCS_BUILTIN_PIND_MIN64: {
+			uint64_t m = pctx->shards[0].u64;
+			for (i = 1; i < n; i++) if (pctx->shards[i].u64 < m) m = pctx->shards[i].u64;
+			return_value = m;
+			break;
+		}
+		case CPCS_BUILTIN_PIND_DOT_PRODUCT: {
+			double d = 0;
+			for (i = 0; i < n; i++) d += pctx->shards[i].d[0];
+			float f = (float)d;
+			uint32_t bits; memcpy(&bits, &f, 4);
+			return_value = (uint64_t)bits;
+			break;
+		}
+		case CPCS_BUILTIN_PIND_L2_DISTANCE_SQ: {
+			double d = 0;
+			for (i = 0; i < n; i++) d += pctx->shards[i].d[0];
+			float f = (float)d;
+			uint32_t bits; memcpy(&bits, &f, 4);
+			return_value = (uint64_t)bits;
+			break;
+		}
+		case CPCS_BUILTIN_PIND_COSINE_SIMILARITY: {
+			double dot = 0, na = 0, nb = 0;
+			for (i = 0; i < n; i++) {
+				dot += pctx->shards[i].d[0];
+				na  += pctx->shards[i].d[1];
+				nb  += pctx->shards[i].d[2];
+			}
+			double denom = sqrt(na * nb);
+			float f = (denom == 0.0) ? 0.0f : (float)(dot / denom);
+			if (f < -1.0f) f = -1.0f;
+			if (f >  1.0f) f =  1.0f;
+			uint32_t bits; memcpy(&bits, &f, 4);
+			return_value = (uint64_t)bits;
+			break;
+		}
+		case CPCS_BUILTIN_PIND_MULTI_AGG64: {
+			double sum = 0, mn = 0, mx = 0;
+			uint64_t cnt = 0;
+			bool init = false;
+			for (i = 0; i < n; i++) {
+				sum += pctx->shards[i].d[0];
+				if (!init || pctx->shards[i].d[1] < mn) mn = pctx->shards[i].d[1];
+				if (!init || pctx->shards[i].d[2] > mx) mx = pctx->shards[i].d[2];
+				cnt += pctx->shards[i].count;
+				init = true;
+			}
+			struct cpcs_builtin_multi_agg64_result result = {
+				.count = cnt, .sum = sum, .min = mn, .max = mx
+			};
+			uint64_t mr_id, off, len;
+			uint32_t es;
+			float th;
+			_cpcs_builtin_parallel_parse(pctx->worker_ctx->exec_ctx, pctx->pind,
+						     &mr_id, &off, &len, &es, &th);
+			_multi_agg64_emit(pctx->worker_ctx->exec_ctx, &result,
+					 mr_id, off, len, &return_value);
+			break;
+		}
+	case CPCS_BUILTIN_PIND_FILTER_GT: {
+		uint64_t total_count = __atomic_load_n(&pctx->total_sv_count,
+						       __ATOMIC_ACQUIRE);
+		return_value = total_count;
+		break;
+	}
+		default:
+			status = -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
+			break;
+		}
+	}
+
+	struct cpcs_builtin_extended_exec_ctx *worker_ctx = pctx->worker_ctx;
+	free(pctx);
+	_cpcs_builtin_extended_complete(worker_ctx, status, return_value);
+}
+
+static void
+_cpcs_builtin_parallel_shard_msg(void *arg)
+{
+	struct cpcs_builtin_parallel_ctx *pctx = arg;
+	struct spdk_thread *me = spdk_get_thread();
+	uint32_t shard_idx = 0;
+
+	for (uint32_t i = 0; i < pctx->n_shards; i++) {
+		if (g_compute_threads[i].thread == me) { shard_idx = i; break; }
+	}
+
+	struct cpcs_builtin_parallel_shard *s = &pctx->shards[shard_idx];
+	const uint8_t *base = (const uint8_t *)pctx->slm_ptr + s->byte_off;
+	uint64_t n = s->n_elems;
+	int status = 0;
+
+	switch (pctx->pind) {
+	case CPCS_BUILTIN_PIND_SUM64: {
+		_cpcs_builtin_reduce_apply_direct(CPCS_BUILTIN_PIND_SUM64,
+						  (const uint64_t *)base, n, &s->u64);
+		break;
+	}
+	case CPCS_BUILTIN_PIND_MAX64: {
+		_cpcs_builtin_reduce_apply_direct(CPCS_BUILTIN_PIND_MAX64,
+						  (const uint64_t *)base, n, &s->u64);
+		break;
+	}
+	case CPCS_BUILTIN_PIND_MIN64: {
+		_cpcs_builtin_reduce_apply_direct(CPCS_BUILTIN_PIND_MIN64,
+						  (const uint64_t *)base, n, &s->u64);
+		break;
+	}
+	case CPCS_BUILTIN_PIND_DOT_PRODUCT: {
+		const float *a = (const float *)base;
+		const float *b = (const float *)(pctx->slm_ptr) + pctx->half_len / sizeof(float) + s->byte_off / sizeof(float);
+		s->d[0] = _avx2_dot_product(a, b, n);
+		break;
+	}
+	case CPCS_BUILTIN_PIND_L2_DISTANCE_SQ: {
+		const float *a = (const float *)base;
+		const float *b = (const float *)(pctx->slm_ptr) + pctx->half_len / sizeof(float) + s->byte_off / sizeof(float);
+		s->d[0] = _avx2_l2_distance_sq(a, b, n);
+		break;
+	}
+	case CPCS_BUILTIN_PIND_COSINE_SIMILARITY: {
+		const float *a = (const float *)base;
+		const float *b = (const float *)(pctx->slm_ptr) + pctx->half_len / sizeof(float) + s->byte_off / sizeof(float);
+		float dot, na, nb;
+		_avx2_cosine_accum(a, b, n, &dot, &na, &nb);
+		s->d[0] = dot; s->d[1] = na; s->d[2] = nb;
+		break;
+	}
+	case CPCS_BUILTIN_PIND_MULTI_AGG64: {
+		_avx2_multi_agg64((const double *)base, n, &s->d[0], &s->d[1], &s->d[2]);
+		s->count = n;
+		break;
+	}
+	case CPCS_BUILTIN_PIND_FILTER_GT: {
+		const float *p = (const float *)base;
+		float thr = pctx->threshold;
+		uint64_t c = 0;
+		for (uint64_t j = 0; j < n; j++) {
+			c += (p[j] > thr);
+		}
+		s->sv_count = c;
+		s->u64 = c;
+		if (pctx->out_zc_ptr != NULL && c > 0) {
+			s->sv_offset = __atomic_fetch_add(&pctx->total_sv_count, c,
+							  __ATOMIC_ACQ_REL);
+			float *dst = (float *)pctx->out_zc_ptr;
+			uint64_t cap = pctx->sv_cap_f;
+			uint64_t off = s->sv_offset;
+			uint64_t w = 0;
+			for (uint64_t j = 0; j < n && off + w < cap; j++) {
+				if (p[j] > thr) {
+					dst[off + w] = p[j];
+					w++;
+				}
+			}
+		}
+		break;
+	}
+	default:
+		status = -SPDK_NVME_CPCS_SC_INVALID_PROGRAM_INDEX;
+		break;
+	}
+
+	s->status = status;
+
+	uint32_t done = __atomic_add_fetch(&pctx->completion_count, 1, __ATOMIC_ACQ_REL);
+	if (done == pctx->n_shards) {
+		_cpcs_builtin_parallel_merge(pctx);
+	}
+}
+
+static int
+_cpcs_builtin_parallel_dispatch(struct cpcs_builtin_extended_exec_ctx *worker_ctx,
+				 uint32_t nthreads)
+{
+	const struct cpcs_exec_context *ctx = worker_ctx->exec_ctx;
+	uint16_t pind = worker_ctx->prog->pind;
+	uint64_t mr_id, off, len;
+	uint32_t elem_size;
+	float threshold;
+	int rc;
+
+	rc = _cpcs_builtin_parallel_parse(ctx, pind, &mr_id, &off, &len, &elem_size, &threshold);
+	if (rc != 0) return rc;
+
+	if (len < CPCS_PARALLEL_MIN_BYTES)
+		return 1;
+
+	void *slm_ptr = NULL;
+	rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &slm_ptr);
+	if (rc != 0 || slm_ptr == NULL)
+		return 1;
+
+	struct cpcs_builtin_parallel_ctx *pctx = calloc(1, sizeof(*pctx));
+	if (pctx == NULL) return -ENOMEM;
+
+	pctx->worker_ctx = worker_ctx;
+	pctx->pind = pind;
+	pctx->slm_ptr = slm_ptr;
+	pctx->total_len = len;
+	pctx->half_len = len / 2;
+	pctx->elem_size = elem_size;
+	pctx->threshold = threshold;
+
+	if (pind == CPCS_BUILTIN_PIND_FILTER_GT) {
+		uint64_t out_mr_id, out_off;
+		uint32_t out_cap;
+		bool want_output = _cpcs_builtin_parse_output(ctx,
+				sizeof(struct cpcs_builtin_filter_gt_desc),
+				&out_mr_id, &out_off, &out_cap);
+		if (want_output) {
+			pctx->sv_cap_f = out_cap / sizeof(float);
+			rc = _cpcs_exec_get_range_ptr(ctx, out_mr_id, out_off,
+						      out_cap, &pctx->out_zc_ptr);
+			if (rc != 0) pctx->out_zc_ptr = NULL;
+		}
+	}
+
+	uint64_t total_elems = len / elem_size;
+	uint32_t n = (nthreads < total_elems) ? nthreads : (uint32_t)total_elems;
+	if (n < 2) { free(pctx); return 1; }
+	pctx->n_shards = n;
+
+	uint64_t per = total_elems / n;
+	uint64_t offset_elem = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		uint64_t this_elems = (i == n - 1)
+			? total_elems - per * (n - 1)
+			: per;
+		pctx->shards[i].byte_off = offset_elem * elem_size;
+		pctx->shards[i].n_elems = this_elems;
+		offset_elem += this_elems;
+	}
+
+	for (uint32_t i = 0; i < n; i++) {
+		rc = spdk_thread_send_msg(g_compute_threads[i].thread,
+					 _cpcs_builtin_parallel_shard_msg, pctx);
+		if (rc != 0) {
+			__atomic_store_n(&pctx->n_shards, 0, __ATOMIC_RELEASE);
+			free(pctx);
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int
 _cpcs_builtin_execute_extended(struct cpcs_program *prog, struct cpcs_exec_context *ctx,
 			       cpcs_runtime_execute_done_cb done_cb, void *cb_arg)
@@ -5367,6 +5747,13 @@ _cpcs_builtin_execute_extended(struct cpcs_program *prog, struct cpcs_exec_conte
 		return -SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 	worker_ctx->submit_thread = submit_thread;
+
+	uint32_t nthreads = __atomic_load_n(&g_compute_thread_count, __ATOMIC_ACQUIRE);
+	if (nthreads > 1 && _cpcs_builtin_can_parallelize(prog->pind)) {
+		rc = _cpcs_builtin_parallel_dispatch(worker_ctx, nthreads);
+		if (rc == 0) return 0;
+		if (rc < 0) { free(worker_ctx); return rc; }
+	}
 
 	thread = _cpcs_builtin_select_compute_thread();
 	if (thread == NULL) {
