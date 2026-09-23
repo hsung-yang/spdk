@@ -3739,12 +3739,12 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 		uint64_t chunk;
 		uint8_t *chunk_buf = NULL;
 		uint32_t tbits;
-		uint64_t thr;
+		float thr;
 		int rc;
 		uint64_t out_mr_id = 0, out_off = 0;
 		uint32_t out_cap = 0;
 		bool want_output = false;
-		uint64_t *survivors = NULL;
+		float *survivors = NULL;
 		size_t sv_cap = 0;
 		size_t stored;
 		int wrc = 0;
@@ -3755,19 +3755,19 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 
 		desc = (const struct cpcs_builtin_filter_gt_desc *)ctx->data_buffer;
 		len = from_le64(&desc->len);
-		if (len == 0 || (len % sizeof(uint64_t)) != 0) {
+		if (len == 0 || (len % sizeof(float)) != 0) {
 			return -SPDK_NVME_SC_INVALID_FIELD;
 		}
 
 		mr_id = from_le64(&desc->mr_id);
 		off = from_le64(&desc->off);
 		tbits = from_le32(&desc->threshold_bits);
-		thr = (uint64_t)tbits;
+		memcpy(&thr, &tbits, sizeof(thr));
 
 		want_output = _cpcs_builtin_parse_output(ctx, sizeof(*desc),
 							 &out_mr_id, &out_off, &out_cap);
 		if (want_output) {
-			sv_cap = out_cap / sizeof(uint64_t);
+			sv_cap = out_cap / sizeof(float);
 		}
 
 		bool out_zc = false;
@@ -3776,8 +3776,8 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 
 		rc = _cpcs_exec_get_range_ptr(ctx, mr_id, off, len, &zc);
 		if (rc == 0 && zc != NULL) {
-			const uint64_t *p = (const uint64_t *)zc;
-				size_t nf = len / sizeof(uint64_t);
+			const float *p = (const float *)zc;
+				size_t nf = len / sizeof(float);
 				size_t j;
 
 				if (want_output) {
@@ -3785,7 +3785,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 					rc = _cpcs_exec_get_range_ptr(ctx, out_mr_id, out_off,
 								      out_cap, &out_zc_ptr);
 					if (rc == 0 && out_zc_ptr != NULL) {
-						survivors = (uint64_t *)out_zc_ptr;
+						survivors = (float *)out_zc_ptr;
 						out_zc = true;
 					} else {
 						survivors = malloc(out_cap ? out_cap : 1);
@@ -3830,7 +3830,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 			chunk = len - processed;
 			if (chunk > CPCS_BUILTIN_EXT_IO_CHUNK) {
 				chunk = CPCS_BUILTIN_EXT_IO_CHUNK;
-				chunk -= chunk % sizeof(uint64_t);
+			chunk -= chunk % sizeof(float);
 			}
 
 			rc = _cpcs_exec_read_range_sync(ctx, mr_id, off + processed, chunk,
@@ -3842,8 +3842,8 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 			}
 
 			{
-				const uint64_t *p = (const uint64_t *)chunk_buf;
-				size_t nf = chunk / sizeof(uint64_t);
+				const float *p = (const float *)chunk_buf;
+				size_t nf = chunk / sizeof(float);
 				size_t j;
 
 				if (survivors == NULL) {
@@ -3871,7 +3871,7 @@ _builtin_execute_filter_gt(const struct cpcs_exec_context *ctx, uint64_t *return
 			stored = (out_count < sv_cap) ? out_count : sv_cap;
 			if (stored > 0 && !out_zc) {
 				wrc = _cpcs_exec_write_range_sync(ctx, out_mr_id, out_off,
-								  stored * sizeof(uint64_t), survivors);
+				stored * sizeof(float), survivors);
 			}
 			if (!out_zc) {
 				free(survivors);
